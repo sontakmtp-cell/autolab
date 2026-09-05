@@ -108,6 +108,13 @@ def test_train_spec_hyperparameter_bounds():
     assert TrainSpec(history_days=180).history_days == 180
     assert TrainSpec(history_days=365).history_days == 365
 
+    # Warmup ratio (PLAN 3.2: 0.0..0.10)
+    with pytest.raises(ValueError, match="warmup_ratio .* out of PLAN 3.2 bounds"):
+        TrainSpec(warmup_ratio=0.11)
+    with pytest.raises(ValueError, match="warmup_ratio .* out of PLAN 3.2 bounds"):
+        TrainSpec(warmup_ratio=-0.01)
+    assert TrainSpec(warmup_ratio=0.10).warmup_ratio == 0.10
+
     # Effective batch size
     spec_bs = TrainSpec(batch_size=2, gradient_accumulation_steps=8)
     assert spec_bs.effective_batch_size == 16
@@ -542,6 +549,36 @@ def test_adapter_store_manifest_tamper_detection():
         fresh_base = MockLinearModule()
         with pytest.raises(RuntimeError, match="SHA-256 integrity mismatch for 'paxg_manifest.json'"):
             store.load_adapter("manifest_tamper_adapter", fresh_base)
+
+
+def test_adapter_store_requires_checksums_file():
+    """Verifies that removing checksums.sha256 causes load_adapter to fail-fast with FileNotFoundError."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = AdapterStore(base_dir=tmpdir)
+        base_mod = MockLinearModule()
+        peft_cfg = LoraConfig(r=4, lora_alpha=8, target_modules=["query_proj", "value_proj"])
+        peft_model = get_peft_model(base_mod, peft_cfg)
+
+        manifest = AdapterManifest(
+            adapter_id="no_checksums_adapter",
+            timeframe="1h",
+            horizon=24,
+            context_len=256,
+            feature_set="B",
+            feature_columns=list(FEATURE_SPECS["B"].columns),
+            base_model_repo="mock_repo",
+            base_model_revision=MODEL_REVISION,
+        )
+        saved_dir = store.save_adapter(peft_model, manifest, smoke_test=False)
+
+        # Delete checksums.sha256
+        checksums_file = saved_dir / "checksums.sha256"
+        assert checksums_file.exists()
+        checksums_file.unlink()
+
+        fresh_base = MockLinearModule()
+        with pytest.raises(FileNotFoundError, match="Required sidecar checksum file 'checksums.sha256' missing"):
+            store.load_adapter("no_checksums_adapter", fresh_base)
 
 
 # ---------------------------------------------------------------------------

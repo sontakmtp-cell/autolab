@@ -246,51 +246,37 @@ class AdapterStore:
                 "Refusing to load unverified or corrupted adapter."
             )
 
-        # 1. SHA-256 integrity verification via sidecar checksums.sha256
+        # 1. SHA-256 integrity verification via sidecar checksums.sha256 (mandatory for P3 adapters)
         checksums_file = adapter_path / CHECKSUMS_FILENAME
-        if checksums_file.exists():
-            with open(checksums_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    parts = line.split(maxsplit=1)
-                    if len(parts) == 2:
-                        expected_hash, fname = parts[0].strip(), parts[1].strip()
-                        fpath = adapter_path / fname
-                        if not fpath.exists():
-                            raise FileNotFoundError(
-                                f"Integrity check failed: required file '{fname}' missing from {adapter_path}."
-                            )
-                        actual_hash = compute_file_sha256(fpath)
-                        if actual_hash != expected_hash:
-                            raise RuntimeError(
-                                f"SHA-256 integrity mismatch for '{fname}' in adapter '{adapter_path.name}':\n"
-                                f"  Expected: {expected_hash}\n"
-                                f"  Actual:   {actual_hash}\n"
-                                "Refusing to load potentially corrupted or modified files!"
-                            )
+        if not checksums_file.exists():
+            raise FileNotFoundError(
+                f"Required sidecar checksum file '{CHECKSUMS_FILENAME}' missing from {adapter_path}. "
+                "Refusing to load unverified or downgraded adapter without checksum manifest protection."
+            )
+
+        with open(checksums_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(maxsplit=1)
+                if len(parts) == 2:
+                    expected_hash, fname = parts[0].strip(), parts[1].strip()
+                    fpath = adapter_path / fname
+                    if not fpath.exists():
+                        raise FileNotFoundError(
+                            f"Integrity check failed: required file '{fname}' missing from {adapter_path}."
+                        )
+                    actual_hash = compute_file_sha256(fpath)
+                    if actual_hash != expected_hash:
+                        raise RuntimeError(
+                            f"SHA-256 integrity mismatch for '{fname}' in adapter '{adapter_path.name}':\n"
+                            f"  Expected: {expected_hash}\n"
+                            f"  Actual:   {actual_hash}\n"
+                            "Refusing to load potentially corrupted or modified files!"
+                        )
 
         manifest = AdapterManifest.load_json(manifest_file)
-
-        if not checksums_file.exists():
-            # Fallback to manifest.file_hashes for weights/config
-            for filename, expected_hash in manifest.file_hashes.items():
-                if filename == "paxg_manifest.json":
-                    continue
-                file_path = adapter_path / filename
-                if not file_path.exists():
-                    raise FileNotFoundError(
-                        f"Integrity check failed: required file '{filename}' missing from {adapter_path}."
-                    )
-                actual_hash = compute_file_sha256(file_path)
-                if actual_hash != expected_hash:
-                    raise RuntimeError(
-                        f"SHA-256 integrity mismatch for '{filename}' in adapter '{manifest.adapter_id}':\n"
-                        f"  Expected: {expected_hash}\n"
-                        f"  Actual:   {actual_hash}\n"
-                        "Refusing to load potentially corrupted or modified weights!"
-                    )
 
         # 2. Strict compatibility verification
         manifest.verify_compatibility(

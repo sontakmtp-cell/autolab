@@ -132,9 +132,9 @@ class TrainSpec:
         else:
             raise ValueError(f"Invalid history_days type: {type(self.history_days)}")
 
-        # 11. Warmup & Sampling
-        if not (0.0 <= self.warmup_ratio <= 0.5):
-            raise ValueError(f"warmup_ratio {self.warmup_ratio} out of bounds [0.0, 0.5].")
+        # 11. Warmup & Sampling (PLAN 3.2: warmup tối đa 10% số bước optimizer)
+        if not (0.0 <= self.warmup_ratio <= 0.10):
+            raise ValueError(f"warmup_ratio {self.warmup_ratio} out of PLAN 3.2 bounds [0.0, 0.10].")
         if self.max_samples_per_epoch <= 0:
             raise ValueError(f"max_samples_per_epoch must be > 0, got {self.max_samples_per_epoch}.")
 

@@ -85,29 +85,34 @@ Tài liệu này theo dõi tiến độ thực hiện 8 giai đoạn (P0 đến 
    - Bổ sung đầy đủ các breakdown phân tích theo PLAN: biến động < 2 tick, ngày thường vs cuối tuần, nhóm biến động thấp/cao, 87 khối dự báo độc lập 24h.
 
 ### Tại P3:
-1. **Huấn luyện LoRA thủ công & Khóa Horizon:**
-   - Lớp cấu hình `TrainSpec` xác thực và khóa cứng bắt buộc: `1h` $\rightarrow$ `horizon = 24`, `4h` $\rightarrow$ `horizon = 6`. Từ chối mọi cấu hình sai cặp hoặc ngoài dải cho phép.
+1. **Huấn luyện LoRA thủ công & Khóa Horizon chuẩn PLAN 3.2:**
+   - Lớp cấu hình `TrainSpec` xác thực và khóa cứng bắt buộc: `1h` $\rightarrow$ `horizon = 24`, `4h` $\rightarrow$ `horizon = 6` (tự động suy luận theo `timeframe` nếu không truyền). Từ chối mọi cấu hình sai cặp hoặc ngoài dải quy định PLAN 3.2: `learning_rate` trong `[1e-5, 3e-4]`, `warmup_ratio` khóa chặt trong `[0.0, 0.10]` (tối đa 10% số bước cập nhật optimizer), `max_epochs` trong `[1, 10]`, `batch_size` trong `(1, 2, 4)`.
    - Hàm loss kết hợp `combined_forecast_loss` trong `float32`: bằng trung bình sai số tuyệt đối của trung vị ($q_{50}$) cộng Pinball loss 9 phân vị, chuẩn hóa chia theo giá cuối ngữ cảnh $p_0$.
-   - Vòng huấn luyện `LoRATrainer` hỗ trợ đầy đủ tham số: rank (4), alpha (8), dropout (0.10), lr (5e-5), batch size (2), gradient accumulation (8, effective=16), linear warmup và gradient clipping (1.0).
+   - Vòng huấn luyện `LoRATrainer` hỗ trợ đầy đủ tham số: rank (4), alpha (8), dropout (0.10), lr (5e-5), batch size (2), gradient accumulation (8, effective=16), linear warmup theo bước optimizer thực tế và gradient clipping (1.0).
+   - Bảo vệ mô hình base sạch: `LoRATrainer` từ chối nhận base model đã chứa PEFT/LoRA.
    - Cơ chế dừng sớm (early stopping) giám sát trên đoạn dừng sớm 14 ngày, tự động chụp snapshot trọng số tốt nhất (`best_checkpoint`) và khôi phục vào mô hình khi hoàn tất.
 2. **Khắc phục triệt để bẫy Autograd Sqrt:**
    - Cố định hàm `update_running_stats` (`src/timesfm3/util.py`) và `linear_detrending` (`src/timesfm3/model.py`) bằng cách kẹp `torch.clamp_min(var, 1e-8)` trước các lệnh `torch.sqrt()`. Triệt tiêu hoàn toàn lỗi `SqrtBackward0 returned nan` do đạo hàm vô hạn tại 0.
-3. **Kho Adapter nguyên tử & Kháng gián đoạn:**
-   - `AdapterStore`: Lưu theo cơ chế nguyên tử 5 bước: `.tmp_{id}` $\rightarrow$ tính SHA-256 các file $\rightarrow$ ghi manifest $\rightarrow$ smoke test forward pass $\rightarrow$ đổi tên nguyên tử (`os.replace`) thành `{adapter_id}`.
+3. **Kho Adapter nguyên tử, Smoke Test & Kháng gián đoạn:**
+   - `AdapterStore`: Lưu theo cơ chế nguyên tử 5 bước: `.tmp_{id}` $\rightarrow$ tính SHA-256 các file $\rightarrow$ ghi manifest $\rightarrow$ smoke test forward pass thật trên device (kiểm tra shape `(1, num_features, horizon, 9)` và tính hữu hạn) $\rightarrow$ ghi `checksums.sha256` sidecar $\rightarrow$ đổi tên nguyên tử (`os.replace`) thành `{adapter_id}`.
    - Tiến trình bị ngắt đột ngột giữa lúc ghi không bao giờ làm hỏng các adapter cũ; cung cấp cơ chế `cleanup_stale_temp_dirs` dọn sạch thư mục rác an toàn.
-4. **Manifest provenance & Kiểm tra tương thích nghiêm ngặt:**
-   - `AdapterManifest` lưu cấu hình LoRA, phạm vi thời gian huấn luyện, snapshot hash, checkpoint tốt nhất, và bảng mã băm SHA-256 cho từng tệp.
-   - Từ chối nạp nếu sai mã băm (tamper detection), sai horizon, sai khung thời gian, sai ngữ cảnh hoặc sai revision base.
-   - `check_in_sample_overlap`: Nhận diện và phát ra cảnh báo rõ ràng `IN-SAMPLE OVERLAP DETECTED` kèm số giờ chồng lấn nếu phạm vi đánh giá giao cắt với tập dữ liệu huấn luyện.
-5. **Bảo toàn Base Model Invariant:**
+4. **Bắt buộc Sidecar Checksums & Kiểm tra tương thích nghiêm ngặt:**
+   - Bắt buộc tệp `checksums.sha256` sidecar bảo vệ toàn bộ tệp bao gồm cả `paxg_manifest.json`, fail-fast `FileNotFoundError` nếu thiếu (loại bỏ hoàn toàn rủi ro hạ cấp bảo mật ngầm).
+   - `TimesFM3Predictor.load_adapter()` từ chối adapter không có manifest; tách riêng `load_raw_adapter_unsafe()`.
+   - Kiểm tra tương thích chặt chẽ trước suy luận (`forecast_request`): kiểm tra độ dài ngữ cảnh, số lượng và thứ tự cột đặc trưng, revision của base model.
+5. **Tích hợp Overlap Detection vào Backtest P2 từng Fold:**
+   - `manifest.check_in_sample_overlap(fold_eval_start, fold_eval_end)` tích hợp trực tiếp vào vòng lặp đánh giá fold trong `BacktestEngine`.
+   - Phạm vi in-sample bao quát cả dải dừng sớm: `in_sample_start = min(train_start, val_start)` và `in_sample_end = max(train_end, val_end)`.
+   - Gắn cờ cảnh báo `is_in_sample=True` và `IN-SAMPLE OVERLAP DETECTED` cho fold bị trùng, tổng hợp trong `ScoreReport.metadata`.
+6. **Bảo toàn Base Model Invariant:**
    - Kiểm thử `test_base_restoration_invariant`: Chuỗi chuyển đổi $\text{Base} \rightarrow \text{Adapter A} \rightarrow \text{Adapter B} \rightarrow \text{Base}$ cho đầu ra trùng khớp tuyệt đối ($|F_0 - F_0'| = 0.00e+00$), các tensor trọng số gốc khớp từng bit, sạch 100% các khóa LoRA.
-6. **Bằng chứng thực nghiệm trên RTX 5060 Ti:**
+7. **Bằng chứng thực nghiệm trên RTX 5060 Ti:**
    - Kịch bản `scripts/run_p3_training.py` đã huấn luyện thành công 2 adapter thực tế:
-     - 1h (`horizon = 24`): `paxg_1h_r4_setB_seed42_20260905_164330` (`val_loss = 0.011693`, 89.9s).
-     - 4h (`horizon = 6`): `paxg_4h_r4_setB_seed42_20260905_164447` (`val_loss = 0.012624`, 71.2s).
+     - 1h (`horizon = 24`): `paxg_1h_r4_setB_seed42_20260905_171246` (`val_loss = 0.011693`, 95.1s).
+     - 4h (`horizon = 6`): `paxg_4h_r4_setB_seed42_20260905_171403` (`val_loss = 0.012610`, 70.5s).
    - Toàn bộ bằng chứng được lưu tại `docs/paxg-lab/phases/p3_lora_proof.json`.
-7. **Kiểm thử tự động:**
-   - **90 tests collected: 90 passed** (`pytest tests/paxg_lab/ src/timesfm3/ -v`), 100% pass rate.
+8. **Kiểm thử tự động:**
+   - **98 tests collected: 98 passed trên workstation có GPU/cache dữ liệu (96 passed, 2 skipped trên runner CI sạch không có raw DB/snapshot cache)** (`pytest tests/paxg_lab/ src/timesfm3/ -v`), 100% pass rate.
 
 ---
 
