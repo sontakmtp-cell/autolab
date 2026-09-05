@@ -1,0 +1,185 @@
+{
+  "timestamp": "2026-09-05T13:54:11Z",
+  "device": {
+    "name": "NVIDIA GeForce RTX 5060 Ti",
+    "capability": "sm_120",
+    "vram_total_gb": 15.9,
+    "pytorch_version": "2.12.1+cu130",
+    "cuda_version": "13.0"
+  },
+  "model": {
+    "repo": "google/timesfm-3.0-pytorch",
+    "revision": "43046b85ec22d584a13f8098c2ed39c889e129c2"
+  },
+  "tests": {
+    "base_load": {
+      "passed": true,
+      "load_time_sec": 2.02,
+      "total_parameters": 330710976,
+      "vram_allocated_mb": 1261.6
+    },
+    "base_inference": {
+      "passed": true,
+      "1h_shape": [
+        2,
+        1,
+        24,
+        9
+      ],
+      "4h_shape": [
+        2,
+        1,
+        6,
+        9
+      ],
+      "1h_finite": true,
+      "4h_finite": true
+    },
+    "lora_init_parity": {
+      "passed": true,
+      "trainable_params": 819200,
+      "trainable_percentage": 0.2471,
+      "is_base_frozen": true,
+      "max_diff_from_base": 0.0
+    },
+    "lora_training": {
+      "passed": true,
+      "losses": [
+        0.03152567893266678,
+        0.03152339905500412,
+        0.031521108001470566
+      ],
+      "base_invariance_verified": true,
+      "lora_updated_verified": true,
+      "lora_total_delta_norm": 0.587308
+    },
+    "save_reload_parity": {
+      "passed": true,
+      "adapter_dir": "var\\paxg_lab\\test_p0_adapter",
+      "reload_max_diff": 0.0,
+      "safetensors_size_bytes": 3300176
+    }
+  },
+  "benchmarks": [
+    {
+      "context_length": 128,
+      "batch_size": 1,
+      "horizon": 24,
+      "timeframe": "1h",
+      "latency_ms": 122.41,
+      "peak_vram_mb": 2623.6,
+      "peak_vram_gb": 2.56,
+      "safe_under_12gb": true
+    },
+    {
+      "context_length": 128,
+      "batch_size": 1,
+      "horizon": 6,
+      "timeframe": "4h",
+      "latency_ms": 111.14,
+      "peak_vram_mb": 2623.6,
+      "peak_vram_gb": 2.56,
+      "safe_under_12gb": true
+    },
+    {
+      "context_length": 128,
+      "batch_size": 2,
+      "horizon": 24,
+      "timeframe": "1h",
+      "latency_ms": 107.38,
+      "peak_vram_mb": 2641.1,
+      "peak_vram_gb": 2.58,
+      "safe_under_12gb": true
+    },
+    {
+      "context_length": 128,
+      "batch_size": 2,
+      "horizon": 6,
+      "timeframe": "4h",
+      "latency_ms": 136.92,
+      "peak_vram_mb": 2641.1,
+      "peak_vram_gb": 2.58,
+      "safe_under_12gb": true
+    },
+    {
+      "context_length": 256,
+      "batch_size": 1,
+      "horizon": 24,
+      "timeframe": "1h",
+      "latency_ms": 116.38,
+      "peak_vram_mb": 2635.4,
+      "peak_vram_gb": 2.57,
+      "safe_under_12gb": true
+    },
+    {
+      "context_length": 256,
+      "batch_size": 1,
+      "horizon": 6,
+      "timeframe": "4h",
+      "latency_ms": 117.76,
+      "peak_vram_mb": 2635.4,
+      "peak_vram_gb": 2.57,
+      "safe_under_12gb": true
+    },
+    {
+      "context_length": 256,
+      "batch_size": 2,
+      "horizon": 24,
+      "timeframe": "1h",
+      "latency_ms": 124.56,
+      "peak_vram_mb": 2664.6,
+      "peak_vram_gb": 2.6,
+      "safe_under_12gb": true
+    },
+    {
+      "context_length": 256,
+      "batch_size": 2,
+      "horizon": 6,
+      "timeframe": "4h",
+      "latency_ms": 125.31,
+      "peak_vram_mb": 2664.6,
+      "peak_vram_gb": 2.6,
+      "safe_under_12gb": true
+    },
+    {
+      "context_length": 512,
+      "batch_size": 1,
+      "horizon": 24,
+      "timeframe": "1h",
+      "latency_ms": 216.63,
+      "peak_vram_mb": 2658.9,
+      "peak_vram_gb": 2.6,
+      "safe_under_12gb": true
+    },
+    {
+      "context_length": 512,
+      "batch_size": 1,
+      "horizon": 6,
+      "timeframe": "4h",
+      "latency_ms": 149.35,
+      "peak_vram_mb": 2658.9,
+      "peak_vram_gb": 2.6,
+      "safe_under_12gb": true
+    },
+    {
+      "context_length": 512,
+      "batch_size": 2,
+      "horizon": 24,
+      "timeframe": "1h",
+      "latency_ms": 176.39,
+      "peak_vram_mb": 2711.8,
+      "peak_vram_gb": 2.65,
+      "safe_under_12gb": true
+    },
+    {
+      "context_length": 512,
+      "batch_size": 2,
+      "horizon": 6,
+      "timeframe": "4h",
+      "latency_ms": 157.39,
+      "peak_vram_mb": 2711.8,
+      "peak_vram_gb": 2.65,
+      "safe_under_12gb": true
+    }
+  ]
+}

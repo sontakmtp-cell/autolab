@@ -1,5 +1,7 @@
 # Python & Virtual Environments
 .venv/
+.venv-paxg/
+var/paxg_lab/
 dist/
 __pycache__/
 *.egg-info/

@@ -360,8 +360,7 @@ class TimesFM3Torch(
 
     return outputs
 
-  @torch.no_grad()
-  def decode(
+  def _decode_core(
     self,
     target: torch.Tensor,
     horizon: int = 0,
@@ -647,3 +646,58 @@ class TimesFM3Torch(
     if return_aux_outputs:
       return horizon_logits, forward_out
     return horizon_logits
+
+  @torch.no_grad()
+  def decode(
+    self,
+    target: torch.Tensor,
+    horizon: int = 0,
+    past_only_covariates: torch.Tensor | None = None,
+    past_future_covariates: torch.Tensor | None = None,
+    target_mask: torch.Tensor | None = None,
+    past_only_mask: torch.Tensor | None = None,
+    past_future_mask: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
+    return_aux_outputs: bool = False,
+  ) -> Any:
+    """Non-autoregressive single-pass decoding for TimesFM3 (inference mode)."""
+    return self._decode_core(
+      target=target,
+      horizon=horizon,
+      past_only_covariates=past_only_covariates,
+      past_future_covariates=past_future_covariates,
+      target_mask=target_mask,
+      past_only_mask=past_only_mask,
+      past_future_mask=past_future_mask,
+      mask=mask,
+      return_aux_outputs=return_aux_outputs,
+    )
+
+  def forward_decode(
+    self,
+    target: torch.Tensor,
+    horizon: int = 0,
+    past_only_covariates: torch.Tensor | None = None,
+    past_future_covariates: torch.Tensor | None = None,
+    target_mask: torch.Tensor | None = None,
+    past_only_mask: torch.Tensor | None = None,
+    past_future_mask: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
+    return_aux_outputs: bool = False,
+  ) -> Any:
+    """Computes forecast with autograd enabled for training and LoRA fine-tuning.
+
+    Shares the exact same preprocessing, detrending, CPM refinement, stitching,
+    and postprocessing pipeline as `decode()`.
+    """
+    return self._decode_core(
+      target=target,
+      horizon=horizon,
+      past_only_covariates=past_only_covariates,
+      past_future_covariates=past_future_covariates,
+      target_mask=target_mask,
+      past_only_mask=past_only_mask,
+      past_future_mask=past_future_mask,
+      mask=mask,
+      return_aux_outputs=return_aux_outputs,
+    )
