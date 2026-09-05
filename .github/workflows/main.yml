@@ -1,28 +1,31 @@
-name: Python package build
+name: CI
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "master", "feat/*", "codex/*" ]
   pull_request:
     branches: [ "master" ]
 
 jobs:
-  build:
+  build-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: '3.12'
       - name: Install uv
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - name: Create virtual environment
         run: uv venv
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
-          uv pip install build ".[torch,flax]"
+          uv pip install build pytest requests pandas peft einops ".[torch,flax]"
       - name: Build package
         run: uv run python -m build
+      - name: Run Tests (PAXG Lab & TimesFM3)
+        run: |
+          uv run pytest -v tests/paxg_lab/ src/timesfm3/
