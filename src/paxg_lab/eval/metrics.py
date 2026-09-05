@@ -284,6 +284,8 @@ def compute_fold_metrics(
     fold_id: int | str,
     base_weighted_mae: float | None = None,
     base_weighted_pinball: float | None = None,
+    is_in_sample: bool = False,
+    in_sample_warning: str | None = None,
 ) -> FoldMetrics:
     """Computes full suite of metrics for a single backtest evaluation fold."""
     num_windows = len(predictions)
@@ -303,7 +305,8 @@ def compute_fold_metrics(
             composite_loss=1.0,
             reference_valid=True,
             insufficient_information=False,
-            warning=None,
+            is_in_sample=is_in_sample,
+            warning=in_sample_warning,
         )
 
     weights = get_horizon_weights(timeframe)
@@ -341,6 +344,13 @@ def compute_fold_metrics(
         q_f = 1.0
         l_f = 1.0
 
+    warnings = []
+    if warning_msg:
+        warnings.append(warning_msg)
+    if in_sample_warning:
+        warnings.append(in_sample_warning)
+    final_warning = "; ".join(warnings) if warnings else None
+
     return FoldMetrics(
         fold_id=fold_id,
         num_windows=num_windows,
@@ -356,7 +366,8 @@ def compute_fold_metrics(
         composite_loss=l_f,
         reference_valid=reference_valid,
         insufficient_information=insufficient_information,
-        warning=warning_msg,
+        is_in_sample=is_in_sample,
+        warning=final_warning,
     )
 
 

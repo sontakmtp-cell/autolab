@@ -497,13 +497,13 @@ class TimesFM3Torch(
 
       mean_y = sum_y / torch.clamp_min(n_v, 1.0)
       sum_y2 = torch.where(valid, ctx_vals**2, 0.0).sum(dim=-1, keepdim=True)
-      var_orig = torch.clamp_min(sum_y2 / torch.clamp_min(n_v, 1.0) - mean_y**2, 0.0)
+      var_orig = torch.clamp_min(sum_y2 / torch.clamp_min(n_v, 1.0) - mean_y**2, 1e-8)
       std_orig = torch.sqrt(var_orig)
 
       sum_yd = torch.where(valid, ctx_vals_detrended, 0.0).sum(dim=-1, keepdim=True)
       mean_yd = sum_yd / torch.clamp_min(n_v, 1.0)
       sum_yd2 = torch.where(valid, ctx_vals_detrended**2, 0.0).sum(dim=-1, keepdim=True)
-      var_det = torch.clamp_min(sum_yd2 / torch.clamp_min(n_v, 1.0) - mean_yd**2, 0.0)
+      var_det = torch.clamp_min(sum_yd2 / torch.clamp_min(n_v, 1.0) - mean_yd**2, 1e-8)
       std_det = torch.sqrt(var_det)
 
       apply_detrend = std_det < self.linear_detrending_threshold * std_orig

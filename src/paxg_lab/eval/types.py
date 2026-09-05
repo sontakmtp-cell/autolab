@@ -19,6 +19,7 @@ class ForecastRequest:
     context_len: int = 256
     horizon: int = field(default=0)
     adapter_path: Path | str | None = None
+    columns: tuple[str, ...] | list[str] | None = None
 
     def __post_init__(self):
         expected_h = get_horizon_for_timeframe(self.timeframe)
@@ -28,6 +29,11 @@ class ForecastRequest:
             raise ValueError(
                 f"Invalid horizon {self.horizon} for timeframe {self.timeframe}. Expected {expected_h}."
             )
+        if self.columns is None:
+            from ..data.features import FEATURE_SPECS
+            if self.feature_set in FEATURE_SPECS:
+                object.__setattr__(self, "columns", FEATURE_SPECS[self.feature_set].columns)
+
 
 
 @dataclass(frozen=True)
@@ -70,6 +76,7 @@ class FoldMetrics:
     composite_loss: float = 1.0  # L_f = 0.70 A_f + 0.30 Q_f
     reference_valid: bool = True  # False if base error <= tick size
     insufficient_information: bool = False  # Flag per PLAN for near-zero error folds
+    is_in_sample: bool = False  # Flag per PLAN for in-sample / parameter-selection data overlap
     warning: str | None = None
 
 
