@@ -247,6 +247,28 @@ class BacktestEngine:
 
         logger.info("Running backtest for %s on %s (%d total candles)...", model_name, timeframe, len(features))
 
+        # Strict validation of base reference vs candidate requirements
+        if is_base_reference:
+            if feature_set != "A":
+                raise ValueError(
+                    f"Official base reference standard must use Feature Set 'A', got '{feature_set}'."
+                )
+            if context_len != 256:
+                raise ValueError(
+                    f"Official base reference standard must use context_len=256, got {context_len}."
+                )
+            if self.predictor is not None and getattr(self.predictor, "adapter_path", None) is not None:
+                raise ValueError(
+                    f"Official base reference cannot have an adapter loaded ({self.predictor.adapter_path})."
+                )
+        else:
+            # Candidate model evaluation: MUST provide base_reference_metrics
+            if base_reference_metrics is None:
+                raise ValueError(
+                    f"Candidate model '{model_name}' requires 'base_reference_metrics' to compute Score v1. "
+                    "Cannot evaluate candidate without a valid base reference report/dictionary."
+                )
+
         # 1. Evaluate on each evaluation fold
         fold_metrics_list = []
         all_eval_preds = []
@@ -254,23 +276,25 @@ class BacktestEngine:
         all_eval_origins = []
         all_eval_origins_ts = []
 
-        is_self_base = is_base_reference or (base_reference_metrics is None and model_name == "TimesFM3-Base")
-
         for fold in split_plan.eval_folds:
             logger.info("Evaluating fold %d [%d, %d)...", fold.fold_id, fold.eval_start, fold.eval_end)
 
             base_w_mae: float | None = None
             base_w_pinball: float | None = None
 
-            if not is_self_base and base_reference_metrics is not None:
+            if not is_base_reference:
+                assert base_reference_metrics is not None
                 if isinstance(base_reference_metrics, ScoreReport):
                     base_m = base_reference_metrics.get_fold_metric(fold.fold_id)
                 else:
                     base_m = base_reference_metrics.get(fold.fold_id)
 
-                if base_m is not None:
-                    base_w_mae = base_m.weighted_mae
-                    base_w_pinball = base_m.weighted_pinball
+                if base_m is None:
+                    raise KeyError(
+                        f"Missing base reference metric for fold {fold.fold_id} in base_reference_metrics."
+                    )
+                base_w_mae = base_m.weighted_mae
+                base_w_pinball = base_m.weighted_pinball
 
             f_metric, preds, _, tgts, orig_p, orig_ts = self.evaluate_fold(
                 features=features,
@@ -301,7 +325,7 @@ class BacktestEngine:
             logger.info("Evaluating locked test set [%d, %d)...", split_plan.test_start, split_plan.test_end)
             base_test_mae: float | None = None
             base_test_pinball: float | None = None
-            if not is_self_base and base_reference_metrics is not None:
+            if not is_base_reference and base_reference_metrics is not None:
                 if isinstance(base_reference_metrics, ScoreReport):
                     base_test_m = base_reference_metrics.test_metrics
                 else:
@@ -424,7 +448,7 @@ class BacktestEngine:
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "snapshot_id": snapshot.metadata.snapshot_id,
                 "snapshot_sha256": snapshot.metadata.sha256,
-                "is_base_reference": is_self_base,
+                "is_base_reference": is_base_reference,
                 "locked_test_evaluated": include_locked_test,
             },
         )

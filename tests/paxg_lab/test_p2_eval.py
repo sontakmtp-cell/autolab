@@ -349,6 +349,7 @@ def test_locked_test_isolated_by_default():
     # By default, include_locked_test is False
     rep = engine.run_full_backtest(
         snapshot=snapshot,
+        is_base_reference=True,
         custom_predictor_fn=dummy_pred_fn,
     )
     assert rep.test_metrics is None, "Locked test must not be evaluated during standard backtest."
@@ -361,6 +362,61 @@ def test_locked_test_isolated_by_default():
     )
     assert locked_metric.fold_id == "test_locked"
     assert locked_metric.num_windows > 0
+
+
+def test_candidate_without_base_reference_raises_error():
+    """Verifies that candidate model evaluation fails fast if base_reference_metrics is missing,
+
+    and that base reference enforces Feature Set A and context_len 256.
+    """
+    snapshot = _make_synthetic_snapshot(n_candles=5500, timeframe="1h")
+    engine = BacktestEngine(predictor=None)
+
+    def dummy_pred_fn(ctx_windows: np.ndarray, horizon: int) -> tuple[np.ndarray, np.ndarray]:
+        n = len(ctx_windows)
+        pts = np.zeros((n, horizon), dtype=np.float32) + 2500.0
+        q = np.zeros((n, horizon, 9), dtype=np.float32) + 2500.0
+        return pts, q
+
+    # 1. Candidate without base_reference_metrics must raise ValueError
+    with pytest.raises(ValueError, match="requires 'base_reference_metrics'"):
+        engine.run_full_backtest(
+            snapshot=snapshot,
+            model_name="LoRA-Candidate-Rank4",
+            is_base_reference=False,
+            base_reference_metrics=None,
+            custom_predictor_fn=dummy_pred_fn,
+        )
+
+    # 2. Base reference with wrong feature set (not 'A') must raise ValueError
+    with pytest.raises(ValueError, match="Official base reference standard must use Feature Set 'A'"):
+        engine.run_full_backtest(
+            snapshot=snapshot,
+            feature_set="B",
+            is_base_reference=True,
+            custom_predictor_fn=dummy_pred_fn,
+        )
+
+    # 3. Base reference with wrong context_len (not 256) must raise ValueError
+    with pytest.raises(ValueError, match="Official base reference standard must use context_len=256"):
+        engine.run_full_backtest(
+            snapshot=snapshot,
+            feature_set="A",
+            context_len=128,
+            is_base_reference=True,
+            custom_predictor_fn=dummy_pred_fn,
+        )
+
+    # 4. Candidate with missing fold in base_reference_metrics must raise KeyError
+    incomplete_base_dict = {}  # Empty dict, missing fold 1, 2, 3
+    with pytest.raises(KeyError, match="Missing base reference metric for fold"):
+        engine.run_full_backtest(
+            snapshot=snapshot,
+            model_name="LoRA-Candidate",
+            is_base_reference=False,
+            base_reference_metrics=incomplete_base_dict,
+            custom_predictor_fn=dummy_pred_fn,
+        )
 
 
 def test_forecast_request_adapter_mismatch_raises_error():
@@ -434,7 +490,11 @@ def test_score_report_breakdowns():
         q = np.repeat(pts[:, :, np.newaxis], 9, axis=2)
         return pts, q
 
-    rep = engine.run_full_backtest(snapshot=snapshot, custom_predictor_fn=dummy_pred_fn)
+    rep = engine.run_full_backtest(
+        snapshot=snapshot,
+        is_base_reference=True,
+        custom_predictor_fn=dummy_pred_fn,
+    )
 
     assert "low_move_under_2_ticks" in rep.breakdowns
     assert "weekday_vs_weekend" in rep.breakdowns

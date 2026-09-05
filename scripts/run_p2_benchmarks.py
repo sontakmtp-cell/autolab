@@ -61,8 +61,8 @@ def main() -> None:
     predictor = TimesFM3Predictor(device=device)
     engine = BacktestEngine(predictor=predictor)
 
-    # 3. Run 1h Backtest
-    print("\n>>> Running 1h Base Benchmark (horizon = 24 steps = 24 hours)...")
+    # 3. Run 1h Backtest (eval folds only, test set locked per PLAN)
+    print("\n>>> Running 1h Base Benchmark (horizon = 24 steps = 24 hours, eval folds only)...")
     t0_1h = time.time()
     rep_1h = engine.run_full_backtest(
         snapshot=snap_1h,
@@ -71,13 +71,13 @@ def main() -> None:
         batch_size=32 if device == "cuda" else 8,
         model_name="TimesFM3-Base",
         is_base_reference=True,
-        include_locked_test=True,
+        include_locked_test=False,
     )
     elapsed_1h = time.time() - t0_1h
     print(f"    Completed 1h in {elapsed_1h:.1f}s ({rep_1h.total_eval_windows} eval windows)")
 
-    # 4. Run 4h Backtest
-    print("\n>>> Running 4h Base Benchmark (horizon = 6 steps = 24 hours)...")
+    # 4. Run 4h Backtest (eval folds only, test set locked per PLAN)
+    print("\n>>> Running 4h Base Benchmark (horizon = 6 steps = 24 hours, eval folds only)...")
     t0_4h = time.time()
     rep_4h = engine.run_full_backtest(
         snapshot=snap_4h,
@@ -86,14 +86,14 @@ def main() -> None:
         batch_size=32 if device == "cuda" else 8,
         model_name="TimesFM3-Base",
         is_base_reference=True,
-        include_locked_test=True,
+        include_locked_test=False,
     )
     elapsed_4h = time.time() - t0_4h
     print(f"    Completed 4h in {elapsed_4h:.1f}s ({rep_4h.total_eval_windows} eval windows)")
 
     # 5. Summary Display
     print("\n" + "=" * 80)
-    print("  PHASE P2 BENCHMARK RESULTS SUMMARY")
+    print("  PHASE P2 BENCHMARK RESULTS SUMMARY (EVALUATION FOLDS ONLY — TEST SET LOCKED)")
     print("=" * 80)
 
     print("\n[1h Benchmark - 24 steps]")
@@ -122,9 +122,10 @@ def main() -> None:
     print(f"  Naive Flat MAE:         ${rep_4h.baseline_comparisons['naive_flat_eval_weighted_mae']:.2f} USDT")
     print(f"  Improvement over Naive: {rep_4h.baseline_comparisons['improvement_over_naive_pct']:.2f}%")
 
-    # 6. Save Evidence JSON
+    # 6. Save Evidence JSON (Eval folds only, zero test set contamination)
     evidence = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "policy": "EVAL_FOLDS_ONLY_LOCKED_TEST_PROTECTED",
         "hardware": {
             "device": str(device),
             "device_name": device_name,
@@ -148,7 +149,10 @@ def main() -> None:
                 "mean_width_80_usdt": rep_1h.mean_width_80,
                 "directional_accuracy_pct": rep_1h.directional_accuracy * 100.0,
                 "step_maes_usdt": rep_1h.step_mae,
-                "naive_comparison": rep_1h.baseline_comparisons,
+                "naive_comparison": {
+                    "naive_flat_eval_weighted_mae": rep_1h.baseline_comparisons["naive_flat_eval_weighted_mae"],
+                    "improvement_over_naive_pct": rep_1h.baseline_comparisons["improvement_over_naive_pct"],
+                },
                 "breakdowns": rep_1h.breakdowns,
                 "folds": [
                     {
@@ -163,13 +167,7 @@ def main() -> None:
                     }
                     for f in rep_1h.fold_metrics
                 ],
-                "test_locked": {
-                    "windows": rep_1h.test_metrics.num_windows if rep_1h.test_metrics else 0,
-                    "weighted_mae": rep_1h.test_metrics.weighted_mae if rep_1h.test_metrics else 0.0,
-                    "weighted_pinball": rep_1h.test_metrics.weighted_pinball if rep_1h.test_metrics else 0.0,
-                    "rmse": rep_1h.test_metrics.rmse if rep_1h.test_metrics else 0.0,
-                    "coverage_80": rep_1h.test_metrics.coverage_80 if rep_1h.test_metrics else 0.0,
-                },
+                "locked_test_status": "LOCKED_UNTOUCHED",
             },
             "4h": {
                 "score_version": rep_4h.score_version,
@@ -183,7 +181,10 @@ def main() -> None:
                 "mean_width_80_usdt": rep_4h.mean_width_80,
                 "directional_accuracy_pct": rep_4h.directional_accuracy * 100.0,
                 "step_maes_usdt": rep_4h.step_mae,
-                "naive_comparison": rep_4h.baseline_comparisons,
+                "naive_comparison": {
+                    "naive_flat_eval_weighted_mae": rep_4h.baseline_comparisons["naive_flat_eval_weighted_mae"],
+                    "improvement_over_naive_pct": rep_4h.baseline_comparisons["improvement_over_naive_pct"],
+                },
                 "breakdowns": rep_4h.breakdowns,
                 "folds": [
                     {
@@ -198,13 +199,7 @@ def main() -> None:
                     }
                     for f in rep_4h.fold_metrics
                 ],
-                "test_locked": {
-                    "windows": rep_4h.test_metrics.num_windows if rep_4h.test_metrics else 0,
-                    "weighted_mae": rep_4h.test_metrics.weighted_mae if rep_4h.test_metrics else 0.0,
-                    "weighted_pinball": rep_4h.test_metrics.weighted_pinball if rep_4h.test_metrics else 0.0,
-                    "rmse": rep_4h.test_metrics.rmse if rep_4h.test_metrics else 0.0,
-                    "coverage_80": rep_4h.test_metrics.coverage_80 if rep_4h.test_metrics else 0.0,
-                },
+                "locked_test_status": "LOCKED_UNTOUCHED",
             },
         },
     }

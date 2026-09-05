@@ -1,5 +1,6 @@
 {
-  "timestamp": "2026-09-05T16:03:26Z",
+  "timestamp": "2026-09-05T16:16:04Z",
+  "policy": "EVAL_FOLDS_ONLY_LOCKED_TEST_PROTECTED",
   "hardware": {
     "device": "cuda",
     "device_name": "NVIDIA GeForce RTX 5060 Ti",
@@ -30,8 +31,7 @@
       },
       "naive_comparison": {
         "naive_flat_eval_weighted_mae": 23.755758877642773,
-        "improvement_over_naive_pct": -5.309293998506955,
-        "naive_flat_test_weighted_mae": 19.71393638543007
+        "improvement_over_naive_pct": -5.309293998506955
       },
       "breakdowns": {
         "low_move_under_2_ticks": {
@@ -94,13 +94,7 @@
           "reference_valid": true
         }
       ],
-      "test_locked": {
-        "windows": 2137,
-        "weighted_mae": 21.939998976389568,
-        "weighted_pinball": 9.078981679039945,
-        "rmse": 34.33113972097366,
-        "coverage_80": 0.7020745593511153
-      }
+      "locked_test_status": "LOCKED_UNTOUCHED"
     },
     "4h": {
       "score_version": 1,
@@ -121,8 +115,7 @@
       },
       "naive_comparison": {
         "naive_flat_eval_weighted_mae": 25.32673328993056,
-        "improvement_over_naive_pct": -3.414771323645992,
-        "naive_flat_test_weighted_mae": 20.661748685747664
+        "improvement_over_naive_pct": -3.414771323645992
       },
       "breakdowns": {
         "low_move_under_2_ticks": {
@@ -185,13 +178,7 @@
           "reference_valid": true
         }
       ],
-      "test_locked": {
-        "windows": 535,
-        "weighted_mae": 21.670607884724937,
-        "weighted_pinball": 8.89960398911753,
-        "rmse": 33.29035760615825,
-        "coverage_80": 0.7725856697819314
-      }
+      "locked_test_status": "LOCKED_UNTOUCHED"
     }
   }
 }

@@ -74,15 +74,17 @@ Tài liệu này theo dõi tiến độ thực hiện 8 giai đoạn (P0 đến 
    - TimesFM 3.0 Base đạt chuẩn đối chiếu **Score v1 = 0.00**.
    - Phạt thêm đoạn đánh giá tệ nhất: $Score = 100 \times [1 - (0.80 \times \bar{L} + 0.20 \times L_{worst})]$.
    - Xử lý nến/fold thiếu thông tin (base error <= tick size): gắn cờ `insufficient_information=True`, loại khỏi phép chia và tổng hợp.
-4. **Động cơ Backtest (`BacktestEngine`) & Bảo vệ Test Khóa Kín:**
+   - Fail-fast bắt buộc: Candidate bắt buộc phải cung cấp `base_reference_metrics`, nếu thiếu sẽ ném `ValueError` ngay lập tức, triệt tiêu nguy cơ âm thầm trả Score 0.
+   - Khóa invariant Base: Chỉ chấp nhận Feature Set A, context_len 256, không có adapter loaded cho lượt chạy Base reference chuẩn.
+4. **Động cơ Backtest (`BacktestEngine`) & Bảo vệ Tuyệt Đối Test Khóa Kín:**
    - Xử lý theo lô (`batch_size=32/16`) trên GPU NVIDIA GeForce RTX 5060 Ti.
-   - `run_full_backtest()` mặc định **không mở tập test khóa kín** (`include_locked_test=False`), tránh rò rỉ trong quá trình chọn mô hình.
+   - Kịch bản benchmark chính thức `scripts/run_p2_benchmarks.py` và `run_full_backtest()` mặc định **chỉ chạy eval folds và không mở tập test khóa kín** (`include_locked_test=False`), loại trừ 100% rò rỉ tập test.
+   - Tệp bằng chứng `docs/paxg-lab/phases/p2_base_benchmark.json` được tạo lại chỉ chứa dữ liệu các fold đánh giá, không chứa dữ liệu tập test.
    - Cung cấp API riêng biệt `run_locked_verification()` dành riêng cho ứng viên chiến thắng cuối cùng.
    - Kiểm tra tương thích chặt chẽ `ForecastRequest.adapter_path` với `TimesFM3Predictor.adapter_path`.
    - Bổ sung đầy đủ các breakdown phân tích theo PLAN: biến động < 2 tick, ngày thường vs cuối tuần, nhóm biến động thấp/cao, 87 khối dự báo độc lập 24h.
-   - Lưu bằng chứng thực nghiệm đầy đủ tại `docs/paxg-lab/phases/p2_base_benchmark.json`.
 5. **Kiểm thử tự động:**
-   - Toàn bộ **80/80 tests vượt qua 100%** (`pytest tests/paxg_lab/ src/timesfm3/`), bổ sung 5 regression tests chứng minh Score candidate và bảo vệ locked test.
+   - **81 tests collected: 81 passed trên workstation (79 passed + 2 integration skipped trên clean CI runner)** (`pytest tests/paxg_lab/ src/timesfm3/`), bổ sung 6 regression tests kiểm soát Score candidate, fail-fast và bảo vệ locked test.
 
 ---
 
