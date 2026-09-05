@@ -1,5 +1,5 @@
 {
-  "execution_time": "2026-09-05T16:41:56Z",
+  "execution_time": "2026-09-05T17:11:09Z",
   "device": "cuda",
   "device_name": "NVIDIA GeForce RTX 5060 Ti",
   "pytorch_version": "2.12.1+cu130",
@@ -8,70 +8,68 @@
   "phase": "P3",
   "results": {
     "1h": {
-      "adapter_id": "paxg_1h_r4_setB_seed42_20260905_164330",
-      "adapter_path": "var\\paxg_lab\\adapters\\paxg_1h_r4_setB_seed42_20260905_164330",
+      "adapter_id": "paxg_1h_r4_setB_seed42_20260905_171246",
+      "adapter_path": "var\\paxg_lab\\adapters\\paxg_1h_r4_setB_seed42_20260905_171246",
       "horizon": 24,
       "timeframe": "1h",
-      "best_epoch": 2,
-      "best_val_loss": 0.011692980854017543,
-      "final_train_loss": 0.008542644566659874,
-      "training_time_sec": 89.89108228683472,
+      "best_epoch": 1,
+      "best_val_loss": 0.011692597110802897,
+      "final_train_loss": 0.008533046823231416,
+      "training_time_sec": 95.05977082252502,
       "history": [
         {
           "epoch": 1,
-          "train_loss": 0.007819569325420161,
-          "val_loss": 0.011692997060798675,
-          "learning_rate": 3.235294117647059e-05,
-          "duration_sec": 49.61616134643555
+          "train_loss": 0.007818118116119877,
+          "val_loss": 0.011692597110802897,
+          "learning_rate": 5e-05,
+          "duration_sec": 55.286704301834106
         },
         {
           "epoch": 2,
-          "train_loss": 0.008542644566659874,
-          "val_loss": 0.011692980854017543,
+          "train_loss": 0.008533046823231416,
+          "val_loss": 0.011692693969824268,
           "learning_rate": 5e-05,
-          "duration_sec": 40.09454679489136
+          "duration_sec": 39.441142082214355
         }
       ],
       "file_hashes": {
-        "adapter_config.json": "cb09ee54488fadc88022d95e8bcaf2eb854ce808af3ba4b5da606e16cd8c1612",
-        "adapter_model.safetensors": "6c5c6e372c8ab5147297cb9a77f99e102988fa6771461094f888c23ea0b5d29c",
-        "README.md": "835fdcb5acfbdc7a2454561b7c9593b6ef1a794a75a655ec25fad7389840f73b",
-        "paxg_manifest.json": "12f3a5d7fb8e7cfedba92fce1153a356b6e3af4590d9dcd6f69b3fd70fe58999"
+        "adapter_config.json": "4f1ead1ff26b6645bc06dfe568b51c0874c57dc7a04958dfbab82fefa02179ea",
+        "adapter_model.safetensors": "17f92c6ce103359dc4ac10a82b5fa2420c1a0ce39b7f0b015952b4b690599ac3",
+        "README.md": "835fdcb5acfbdc7a2454561b7c9593b6ef1a794a75a655ec25fad7389840f73b"
       },
-      "test_forecast_point_median": 4428.15966796875
+      "test_forecast_point_median": 4428.1494140625
     },
     "4h": {
-      "adapter_id": "paxg_4h_r4_setB_seed42_20260905_164447",
-      "adapter_path": "var\\paxg_lab\\adapters\\paxg_4h_r4_setB_seed42_20260905_164447",
+      "adapter_id": "paxg_4h_r4_setB_seed42_20260905_171403",
+      "adapter_path": "var\\paxg_lab\\adapters\\paxg_4h_r4_setB_seed42_20260905_171403",
       "horizon": 6,
       "timeframe": "4h",
       "best_epoch": 2,
-      "best_val_loss": 0.012623640114907176,
-      "final_train_loss": 0.008580655921377911,
-      "training_time_sec": 71.21324610710144,
+      "best_val_loss": 0.012609826144762337,
+      "final_train_loss": 0.008572729646402877,
+      "training_time_sec": 70.45577597618103,
       "history": [
         {
           "epoch": 1,
-          "train_loss": 0.009026022257785371,
-          "val_loss": 0.012634262815117836,
-          "learning_rate": 3.235294117647059e-05,
-          "duration_sec": 34.887507915496826
+          "train_loss": 0.009022565665873117,
+          "val_loss": 0.01262794816866517,
+          "learning_rate": 5e-05,
+          "duration_sec": 35.03164744377136
         },
         {
           "epoch": 2,
-          "train_loss": 0.008580655921377911,
-          "val_loss": 0.012623640114907176,
+          "train_loss": 0.008572729646402877,
+          "val_loss": 0.012609826144762337,
           "learning_rate": 5e-05,
-          "duration_sec": 36.234291553497314
+          "duration_sec": 35.317084312438965
         }
       ],
       "file_hashes": {
-        "adapter_config.json": "cb09ee54488fadc88022d95e8bcaf2eb854ce808af3ba4b5da606e16cd8c1612",
-        "adapter_model.safetensors": "ac9dd6ed8b6d152f94a95fd0e9c840339c3855470f8a03882afa226c3e0c6187",
-        "README.md": "835fdcb5acfbdc7a2454561b7c9593b6ef1a794a75a655ec25fad7389840f73b",
-        "paxg_manifest.json": "bcf5e0f965dd19c768cc54767bc7672f156306da3e3ae395e8a706643ddafecd"
+        "adapter_config.json": "4f1ead1ff26b6645bc06dfe568b51c0874c57dc7a04958dfbab82fefa02179ea",
+        "adapter_model.safetensors": "8426e5d0df22c24e562f3b51867a6c06c1684b380476ab629ecd7832f8f15089",
+        "README.md": "835fdcb5acfbdc7a2454561b7c9593b6ef1a794a75a655ec25fad7389840f73b"
       },
-      "test_forecast_point_median": 4432.23583984375
+      "test_forecast_point_median": 4432.58251953125
     }
   }
 }

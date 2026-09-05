@@ -20,7 +20,7 @@ class TrainSpec:
     """
 
     timeframe: Literal["1h", "4h"] = "1h"
-    horizon: int = 24
+    horizon: int | None = None
     feature_set: Literal["A", "B", "C"] = "B"
     context_len: int = DEFAULT_CONTEXT_LENGTH
     lora_r: int = 4
@@ -41,7 +41,7 @@ class TrainSpec:
     warmup_ratio: float = 0.10
 
     def __post_init__(self) -> None:
-        """Enforces strict hyperparameter constraints and horizon pairs."""
+        """Enforces strict hyperparameter constraints and horizon pairs per PLAN.md Section 3.2."""
         # 1. Timeframe & Horizon pair locking
         tf = str(self.timeframe).lower().strip()
         if tf not in ("1h", "4h"):
@@ -49,7 +49,9 @@ class TrainSpec:
         self.timeframe = tf  # type: ignore
 
         expected_horizon = get_horizon_for_timeframe(self.timeframe)
-        if self.horizon != expected_horizon:
+        if self.horizon is None:
+            self.horizon = expected_horizon
+        elif self.horizon != expected_horizon:
             raise ValueError(
                 f"Horizon mismatch for timeframe '{self.timeframe}': "
                 f"expected {expected_horizon}, got {self.horizon}. "
@@ -62,14 +64,14 @@ class TrainSpec:
             raise ValueError(f"Unsupported feature set '{self.feature_set}'. Must be 'A', 'B', or 'C'.")
         self.feature_set = fs  # type: ignore
 
-        # 3. Context Length
+        # 3. Context Length (PLAN 3.2: 128, 256, 512)
         if self.context_len not in ALLOWED_CONTEXT_LENGTHS:
             raise ValueError(
                 f"Context length {self.context_len} not allowed. "
                 f"Must be one of {ALLOWED_CONTEXT_LENGTHS}."
             )
 
-        # 4. LoRA Rank & Alpha
+        # 4. LoRA Rank & Alpha (PLAN 3.2: 2, 4, 8, 16; default alpha = 2 * r)
         if self.lora_r not in (2, 4, 8, 16):
             raise ValueError(f"LoRA rank {self.lora_r} invalid. Must be one of (2, 4, 8, 16).")
         if self.lora_alpha is None:
@@ -77,53 +79,56 @@ class TrainSpec:
         elif self.lora_alpha <= 0:
             raise ValueError(f"LoRA alpha must be positive, got {self.lora_alpha}.")
 
-        # 5. Dropout
+        # 5. Dropout (PLAN 3.2: 0–0.20)
         if not (0.0 <= self.lora_dropout <= 0.20):
             raise ValueError(f"LoRA dropout {self.lora_dropout} out of bounds [0.0, 0.20].")
 
-        # 6. Learning Rate
-        if not (1e-6 <= self.learning_rate <= 1e-3):
-            raise ValueError(f"Learning rate {self.learning_rate} out of safe bounds [1e-6, 1e-3].")
-
-        # 7. Epochs & Batching
-        if not (1 <= self.max_epochs <= 20):
-            raise ValueError(f"max_epochs must be between 1 and 20, got {self.max_epochs}.")
-        if self.batch_size not in (1, 2, 4, 8):
-            raise ValueError(f"Batch size {self.batch_size} must be one of (1, 2, 4, 8).")
-        if not (1 <= self.gradient_accumulation_steps <= 32):
+        # 6. Learning Rate (PLAN 3.2: 1e-5 to 3e-4)
+        if not (1e-5 <= self.learning_rate <= 3e-4):
             raise ValueError(
-                f"gradient_accumulation_steps must be between 1 and 32, "
+                f"Learning rate {self.learning_rate} out of PLAN 3.2 bounds [1e-5, 3e-4]."
+            )
+
+        # 7. Epochs & Batching (PLAN 3.2: max_epochs 1–10, batch_size 1, 2, 4, grad_accum 1–16)
+        if not (1 <= self.max_epochs <= 10):
+            raise ValueError(f"max_epochs must be between 1 and 10 per PLAN 3.2, got {self.max_epochs}.")
+        if self.batch_size not in (1, 2, 4):
+            raise ValueError(f"Batch size {self.batch_size} must be one of (1, 2, 4) per PLAN 3.2.")
+        if not (1 <= self.gradient_accumulation_steps <= 16):
+            raise ValueError(
+                f"gradient_accumulation_steps must be between 1 and 16 per PLAN 3.2, "
                 f"got {self.gradient_accumulation_steps}."
             )
 
-        # 8. Weight Decay & Early Stopping
-        if not (0.0 <= self.weight_decay <= 0.20):
-            raise ValueError(f"weight_decay {self.weight_decay} out of bounds [0.0, 0.20].")
-        if not (1 <= self.early_stopping_patience <= 10):
+        # 8. Weight Decay & Early Stopping (PLAN 3.2: weight_decay 0–0.10, patience 1–4)
+        if not (0.0 <= self.weight_decay <= 0.10):
+            raise ValueError(f"weight_decay {self.weight_decay} out of bounds [0.0, 0.10].")
+        if not (1 <= self.early_stopping_patience <= 4):
             raise ValueError(
-                f"early_stopping_patience must be between 1 and 10, "
+                f"early_stopping_patience must be between 1 and 4 per PLAN 3.2, "
                 f"got {self.early_stopping_patience}."
             )
 
-        # 9. Gradient Clipping
-        if not (0.1 <= self.grad_clip_norm <= 5.0):
-            raise ValueError(f"grad_clip_norm {self.grad_clip_norm} out of bounds [0.1, 5.0].")
+        # 9. Gradient Clipping (PLAN 3.2: 0.5–2.0)
+        if not (0.5 <= self.grad_clip_norm <= 2.0):
+            raise ValueError(f"grad_clip_norm {self.grad_clip_norm} out of bounds [0.5, 2.0].")
 
-        # 10. History Days
+        # 10. History Days (PLAN 3.2: 180 ngày, 365 ngày, toàn bộ)
         if isinstance(self.history_days, str):
             h_str = self.history_days.strip().lower()
-            if h_str == "all":
-                pass
-            elif h_str.isdigit():
+            if h_str in ("all", "toan_bo", "toàn bộ"):
+                self.history_days = "all"
+            elif h_str in ("180", "365"):
                 self.history_days = int(h_str)
             else:
                 raise ValueError(
-                    f"history_days '{self.history_days}' must be an integer, '180', '365', or 'all'."
+                    f"history_days '{self.history_days}' not allowed by PLAN 3.2. Must be 180, 365, or 'all'."
                 )
-        elif isinstance(self.history_days, (int, float)):
-            if self.history_days <= 0:
-                raise ValueError(f"history_days must be > 0, got {self.history_days}.")
-            self.history_days = int(self.history_days)
+        elif isinstance(self.history_days, int):
+            if self.history_days not in (180, 365):
+                raise ValueError(
+                    f"history_days {self.history_days} not allowed by PLAN 3.2. Must be 180, 365, or 'all'."
+                )
         else:
             raise ValueError(f"Invalid history_days type: {type(self.history_days)}")
 

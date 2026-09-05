@@ -9,12 +9,15 @@ from typing import Any, Callable
 import numpy as np
 
 from ..constants import (
+    MODEL_REVISION,
     SCORE_VERSION,
     get_horizon_for_timeframe,
     get_horizon_weights,
 )
+from ..data.features import FEATURE_SPECS
 from ..data.snapshot import DatasetSnapshot
 from ..data.split import calculate_split_plan, extract_windows
+from ..model.manifest import AdapterManifest
 from .metrics import (
     calculate_coverage_80,
     calculate_directional_accuracy,
@@ -82,6 +85,8 @@ class BacktestEngine:
         fold_id: int | str = 1,
         base_weighted_mae: float | None = None,
         base_weighted_pinball: float | None = None,
+        is_in_sample: bool = False,
+        in_sample_warning: str | None = None,
         custom_predictor_fn: Callable[[np.ndarray, int], tuple[np.ndarray, np.ndarray]] | None = None,
     ) -> tuple[FoldMetrics, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Evaluates a model over a specific temporal boundary [start_idx, end_idx).
@@ -119,7 +124,8 @@ class BacktestEngine:
                 composite_loss=1.0,
                 reference_valid=True,
                 insufficient_information=False,
-                warning=None,
+                is_in_sample=is_in_sample,
+                warning=in_sample_warning,
             )
             return (
                 empty_m,
@@ -148,6 +154,8 @@ class BacktestEngine:
             fold_id=fold_id,
             base_weighted_mae=base_weighted_mae,
             base_weighted_pinball=base_weighted_pinball,
+            is_in_sample=is_in_sample,
+            in_sample_warning=in_sample_warning,
         )
 
         return metrics, predictions, quantiles, fut_windows, origin_prices, origin_timestamps
@@ -219,6 +227,7 @@ class BacktestEngine:
         base_reference_metrics: dict[int | str, FoldMetrics] | ScoreReport | None = None,
         include_locked_test: bool = False,
         custom_predictor_fn: Callable[[np.ndarray, int], tuple[np.ndarray, np.ndarray]] | None = None,
+        adapter_manifest: AdapterManifest | None = None,
     ) -> ScoreReport:
         """Runs backtest across evaluation folds (and optionally test lock set).
 
@@ -234,9 +243,24 @@ class BacktestEngine:
             base_reference_metrics: Precomputed base fold metrics (or ScoreReport) to evaluate candidate against.
             include_locked_test: Whether to evaluate the locked test fold. Default False per PLAN.
             custom_predictor_fn: Optional custom prediction function for testing or baseline predictors.
+            adapter_manifest: Optional AdapterManifest. If None and predictor has manifest, auto-resolved.
         """
         timeframe = snapshot.timeframe
         horizon = get_horizon_for_timeframe(timeframe)
+
+        if adapter_manifest is None and self.predictor is not None:
+            adapter_manifest = getattr(self.predictor, "manifest", None)
+
+        # Strict compatibility verification if an adapter is active
+        if adapter_manifest is not None:
+            adapter_manifest.verify_compatibility(
+                expected_timeframe=timeframe,
+                expected_horizon=horizon,
+                expected_context=context_len,
+                expected_feature_set=feature_set,
+                expected_columns=list(FEATURE_SPECS[feature_set].columns) if feature_set in FEATURE_SPECS else None,
+                expected_base_revision=getattr(self.predictor, "model_revision", MODEL_REVISION) if self.predictor else None,
+            )
 
         features = snapshot.get_features(feature_set)
         # Target close price is the first column of features_a
@@ -296,6 +320,17 @@ class BacktestEngine:
                 base_w_mae = base_m.weighted_mae
                 base_w_pinball = base_m.weighted_pinball
 
+            eval_start_ms = int(timestamps[fold.eval_start])
+            eval_end_ms = int(timestamps[min(len(timestamps) - 1, fold.eval_end - 1)])
+            is_in_sample = False
+            overlap_warning = None
+            if adapter_manifest is not None:
+                is_overlap, warning_msg = adapter_manifest.check_in_sample_overlap(eval_start_ms, eval_end_ms)
+                if is_overlap:
+                    is_in_sample = True
+                    overlap_warning = warning_msg
+                    logger.warning("Fold %s in-sample overlap: %s", fold.fold_id, warning_msg)
+
             f_metric, preds, _, tgts, orig_p, orig_ts = self.evaluate_fold(
                 features=features,
                 targets=targets,
@@ -308,6 +343,8 @@ class BacktestEngine:
                 fold_id=fold.fold_id,
                 base_weighted_mae=base_w_mae,
                 base_weighted_pinball=base_w_pinball,
+                is_in_sample=is_in_sample,
+                in_sample_warning=overlap_warning,
                 custom_predictor_fn=custom_predictor_fn,
             )
             fold_metrics_list.append(f_metric)
@@ -334,6 +371,17 @@ class BacktestEngine:
                     base_test_mae = base_test_m.weighted_mae
                     base_test_pinball = base_test_m.weighted_pinball
 
+            test_is_in_sample = False
+            test_overlap_warning = None
+            if adapter_manifest is not None:
+                test_start_ms = int(timestamps[split_plan.test_start])
+                test_end_ms = int(timestamps[min(len(timestamps) - 1, split_plan.test_end - 1)])
+                test_overlap, test_warning_msg = adapter_manifest.check_in_sample_overlap(test_start_ms, test_end_ms)
+                if test_overlap:
+                    test_is_in_sample = True
+                    test_overlap_warning = test_warning_msg
+                    logger.warning("Locked test set in-sample overlap: %s", test_warning_msg)
+
             test_metric, test_preds, _, test_tgts, _, _ = self.evaluate_fold(
                 features=features,
                 targets=targets,
@@ -346,6 +394,8 @@ class BacktestEngine:
                 fold_id="test_locked",
                 base_weighted_mae=base_test_mae,
                 base_weighted_pinball=base_test_pinball,
+                is_in_sample=test_is_in_sample,
+                in_sample_warning=test_overlap_warning,
                 custom_predictor_fn=custom_predictor_fn,
             )
 
@@ -423,6 +473,24 @@ class BacktestEngine:
         if naive_test_metric is not None:
             baseline_comps["naive_flat_test_weighted_mae"] = naive_test_metric.weighted_mae
 
+        meta_dict: dict[str, Any] = {
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "snapshot_id": snapshot.metadata.snapshot_id,
+            "snapshot_sha256": snapshot.metadata.sha256,
+            "is_base_reference": is_base_reference,
+            "locked_test_evaluated": include_locked_test,
+        }
+        if adapter_manifest is not None:
+            meta_dict["adapter_id"] = adapter_manifest.adapter_id
+            in_sample_folds = [m.fold_id for m in fold_metrics_list if m.is_in_sample]
+            meta_dict["has_in_sample_eval_folds"] = len(in_sample_folds) > 0
+            meta_dict["in_sample_folds"] = in_sample_folds
+            if meta_dict["has_in_sample_eval_folds"]:
+                meta_dict["in_sample_warning"] = (
+                    f"WARNING: One or more evaluation folds ({in_sample_folds}) overlap adapter "
+                    "training/validation in-sample data! Performance scores may be optimistically biased."
+                )
+
         report = ScoreReport(
             score_version=SCORE_VERSION,
             timeframe=timeframe,
@@ -444,13 +512,7 @@ class BacktestEngine:
             test_metrics=test_metric,
             baseline_comparisons=baseline_comps,
             breakdowns=breakdowns,
-            metadata={
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "snapshot_id": snapshot.metadata.snapshot_id,
-                "snapshot_sha256": snapshot.metadata.sha256,
-                "is_base_reference": is_base_reference,
-                "locked_test_evaluated": include_locked_test,
-            },
+            metadata=meta_dict,
         )
 
         return report

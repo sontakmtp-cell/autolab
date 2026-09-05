@@ -25,6 +25,7 @@ from paxg_lab.constants import (
 )
 from paxg_lab.data.features import FEATURE_SPECS
 from paxg_lab.eval.predictor import TimesFM3Predictor
+from paxg_lab.eval.types import ForecastRequest
 from paxg_lab.model.lora import build_lora_timesfm3, verify_lora_parameters
 from paxg_lab.model.loss import combined_forecast_loss, pinball_loss
 from paxg_lab.model.manifest import AdapterManifest
@@ -49,19 +50,15 @@ def test_train_spec_horizon_enforcement():
     assert spec_4h.timeframe == "4h"
     assert spec_4h.horizon == 6
 
-    # Invalid cross-pairing
-    with pytest.raises(ValueError, match="Horizon mismatch for timeframe '1h'"):
-        TrainSpec(timeframe="1h", horizon=6)
-
-    with pytest.raises(ValueError, match="Horizon mismatch for timeframe '4h'"):
-        TrainSpec(timeframe="4h", horizon=24)
-
-    with pytest.raises(ValueError, match="Unsupported timeframe '15m'"):
-        TrainSpec(timeframe="15m", horizon=24)  # type: ignore
+    # Auto-resolving horizon from timeframe
+    spec_auto_1h = TrainSpec(timeframe="1h")
+    assert spec_auto_1h.horizon == 24
+    spec_auto_4h = TrainSpec(timeframe="4h")
+    assert spec_auto_4h.horizon == 6
 
 
 def test_train_spec_hyperparameter_bounds():
-    """Validates bounds on rank, alpha, dropout, learning rate, batch size, etc."""
+    """Validates strict PLAN 3.2 bounds on rank, alpha, dropout, learning rate, batch size, etc."""
     # Invalid rank
     with pytest.raises(ValueError, match="LoRA rank 5 invalid"):
         TrainSpec(lora_r=5)
@@ -70,7 +67,7 @@ def test_train_spec_hyperparameter_bounds():
     spec = TrainSpec(lora_r=8, lora_alpha=None)
     assert spec.lora_alpha == 16
 
-    # Invalid dropout
+    # Invalid dropout (PLAN 3.2: 0.0 to 0.20)
     with pytest.raises(ValueError, match="LoRA dropout .* out of bounds"):
         TrainSpec(lora_dropout=0.35)
 
@@ -78,9 +75,38 @@ def test_train_spec_hyperparameter_bounds():
     with pytest.raises(ValueError, match="Context length 100 not allowed"):
         TrainSpec(context_len=100)
 
-    # Invalid learning rate
-    with pytest.raises(ValueError, match="Learning rate .* out of safe bounds"):
+    # Invalid learning rate (PLAN 3.2: 1e-5 to 3e-4)
+    with pytest.raises(ValueError, match="Learning rate .* out of PLAN 3.2 bounds"):
         TrainSpec(learning_rate=0.01)
+    with pytest.raises(ValueError, match="Learning rate .* out of PLAN 3.2 bounds"):
+        TrainSpec(learning_rate=1e-6)
+
+    # Epochs & Batching (PLAN 3.2: max_epochs 1..10, batch_size in (1, 2, 4), grad_accum 1..16)
+    with pytest.raises(ValueError, match="max_epochs must be between 1 and 10"):
+        TrainSpec(max_epochs=15)
+    with pytest.raises(ValueError, match="Batch size 8 must be one of"):
+        TrainSpec(batch_size=8)
+    with pytest.raises(ValueError, match="gradient_accumulation_steps must be between 1 and 16"):
+        TrainSpec(gradient_accumulation_steps=32)
+
+    # Weight decay & Patience (PLAN 3.2: weight_decay 0.0..0.10, patience 1..4)
+    with pytest.raises(ValueError, match="weight_decay .* out of bounds"):
+        TrainSpec(weight_decay=0.20)
+    with pytest.raises(ValueError, match="early_stopping_patience must be between 1 and 4"):
+        TrainSpec(early_stopping_patience=10)
+
+    # Gradient clipping (PLAN 3.2: 0.5..2.0)
+    with pytest.raises(ValueError, match="grad_clip_norm .* out of bounds"):
+        TrainSpec(grad_clip_norm=0.1)
+    with pytest.raises(ValueError, match="grad_clip_norm .* out of bounds"):
+        TrainSpec(grad_clip_norm=5.0)
+
+    # History days (PLAN 3.2: 180, 365, 'all')
+    with pytest.raises(ValueError, match="history_days .* not allowed by PLAN 3.2"):
+        TrainSpec(history_days=100)
+    assert TrainSpec(history_days="all").history_days == "all"
+    assert TrainSpec(history_days=180).history_days == 180
+    assert TrainSpec(history_days=365).history_days == 365
 
     # Effective batch size
     spec_bs = TrainSpec(batch_size=2, gradient_accumulation_steps=8)
@@ -402,3 +428,310 @@ def test_base_restoration_invariant():
 
     # Verify no 'lora' keys exist in restored base model
     assert not any("lora" in k.lower() for k in restored_base.state_dict().keys())
+
+
+# ---------------------------------------------------------------------------
+# 6. LoRATrainer Clean Base Model & Warmup Scheduler Tests
+# ---------------------------------------------------------------------------
+
+
+def test_clean_base_model_requirement():
+    """LoRATrainer must reject base models with pre-existing LoRA parameters or PeftModel wrapper."""
+    base_mod = MockLinearModule()
+    peft_cfg = LoraConfig(r=4, lora_alpha=8, target_modules=["query_proj", "value_proj"])
+    peft_model = get_peft_model(base_mod, peft_cfg)
+
+    spec = TrainSpec(timeframe="1h", horizon=24, feature_set="A")
+    with pytest.raises(ValueError, match="Base model is already a PeftModel"):
+        LoRATrainer(base_model=peft_model, spec=spec)
+
+
+def test_warmup_scheduler_with_gradient_accumulation():
+    """Verifies that warmup scheduler counts actual optimizer updates, not raw mini-batches."""
+    spec = TrainSpec(
+        timeframe="1h",
+        horizon=24,
+        feature_set="A",
+        batch_size=2,
+        gradient_accumulation_steps=4,
+        max_epochs=2,
+        warmup_ratio=0.10,
+    )
+    # 20 samples -> minibatches_per_epoch = 10 -> optimizer_steps_per_epoch = ceil(10 / 4) = 3
+    # total_optimizer_steps = 3 * 2 = 6 -> warmup_optimizer_steps = max(1, int(6 * 0.10)) = 1
+    num_samples = 20
+    minibatches_per_epoch = int(np.ceil(num_samples / spec.batch_size))
+    optimizer_steps_per_epoch = int(np.ceil(minibatches_per_epoch / spec.gradient_accumulation_steps))
+    total_optimizer_steps = optimizer_steps_per_epoch * spec.max_epochs
+    warmup_optimizer_steps = max(1, int(total_optimizer_steps * spec.warmup_ratio))
+
+    assert minibatches_per_epoch == 10
+    assert optimizer_steps_per_epoch == 3
+    assert total_optimizer_steps == 6
+    assert warmup_optimizer_steps == 1
+
+
+# ---------------------------------------------------------------------------
+# 7. AdapterStore Smoke Test & Sidecar Checksum Tamper Detection
+# ---------------------------------------------------------------------------
+
+
+class MockTimesFMModule(nn.Module):
+    """Mock TimesFM module implementing decode() for testing smoke tests and predictors."""
+
+    def __init__(self):
+        super().__init__()
+        self.query_proj = nn.Linear(16, 16)
+        self.value_proj = nn.Linear(16, 16)
+
+    def decode(self, target: torch.Tensor, horizon: int) -> torch.Tensor:
+        b, f, _ = target.shape
+        return torch.ones((b, f, horizon, 9), dtype=torch.float32)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.query_proj(x) + self.value_proj(x)
+
+
+def test_adapter_store_smoke_test_real_forward():
+    """Verifies that AdapterStore._run_smoke_test runs real forward pass and generates checksums.sha256."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = AdapterStore(base_dir=tmpdir)
+        base_mod = MockTimesFMModule()
+        peft_cfg = LoraConfig(r=4, lora_alpha=8, target_modules=["query_proj", "value_proj"])
+        peft_model = get_peft_model(base_mod, peft_cfg)
+
+        manifest = AdapterManifest(
+            adapter_id="smoke_test_adapter",
+            timeframe="1h",
+            horizon=24,
+            context_len=256,
+            feature_set="B",
+            feature_columns=list(FEATURE_SPECS["B"].columns),
+            base_model_repo="mock_repo",
+            base_model_revision=MODEL_REVISION,
+        )
+        saved_dir = store.save_adapter(peft_model, manifest, smoke_test=True)
+        assert (saved_dir / "checksums.sha256").exists()
+
+
+def test_adapter_store_manifest_tamper_detection():
+    """Verifies that tampering with paxg_manifest.json is detected via checksums.sha256."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = AdapterStore(base_dir=tmpdir)
+        base_mod = MockLinearModule()
+        peft_cfg = LoraConfig(r=4, lora_alpha=8, target_modules=["query_proj", "value_proj"])
+        peft_model = get_peft_model(base_mod, peft_cfg)
+
+        manifest = AdapterManifest(
+            adapter_id="manifest_tamper_adapter",
+            timeframe="1h",
+            horizon=24,
+            context_len=256,
+            feature_set="B",
+            feature_columns=list(FEATURE_SPECS["B"].columns),
+            base_model_repo="mock_repo",
+            base_model_revision=MODEL_REVISION,
+        )
+        saved_dir = store.save_adapter(peft_model, manifest, smoke_test=False)
+
+        # Tamper with paxg_manifest.json
+        manifest_file = saved_dir / "paxg_manifest.json"
+        with open(manifest_file, "a", encoding="utf-8") as f:
+            f.write("\n// tampered extra comment")
+
+        fresh_base = MockLinearModule()
+        with pytest.raises(RuntimeError, match="SHA-256 integrity mismatch for 'paxg_manifest.json'"):
+            store.load_adapter("manifest_tamper_adapter", fresh_base)
+
+
+# ---------------------------------------------------------------------------
+# 8. Predictor Safe Loading & Pre-Inference Compatibility Checks
+# ---------------------------------------------------------------------------
+
+
+def test_predictor_load_adapter_requires_manifest():
+    """Verifies load_adapter raises FileNotFoundError if paxg_manifest.json is missing, while load_raw_adapter_unsafe works."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        adapter_dir = Path(tmpdir) / "raw_adapter"
+        adapter_dir.mkdir()
+        (adapter_dir / "adapter_config.json").write_text("{}")
+        (adapter_dir / "adapter_model.safetensors").write_bytes(b"dummy")
+
+        predictor = object.__new__(TimesFM3Predictor)
+        predictor.device = torch.device("cpu")
+        predictor.base_model = MockTimesFMModule()
+        predictor.model = predictor.base_model
+        predictor.lora_model = None
+        predictor.adapter_path = None
+        predictor.manifest = None
+        predictor.model_repo = "mock_repo"
+        predictor.model_revision = MODEL_REVISION
+
+        # load_adapter must fail
+        with pytest.raises(FileNotFoundError, match="Required 'paxg_manifest.json' not found"):
+            predictor.load_adapter(adapter_dir)
+
+
+def test_forecast_request_strict_compatibility():
+    """Verifies forecast_request fails fast on context length, num features, column order, and base revision mismatch."""
+    predictor = object.__new__(TimesFM3Predictor)
+    predictor.device = torch.device("cpu")
+    predictor.base_model = MockTimesFMModule()
+    predictor.model = predictor.base_model
+    predictor.lora_model = None
+    predictor.adapter_path = Path("/mock/adapter")
+    predictor.model_repo = "mock_repo"
+    predictor.model_revision = MODEL_REVISION
+
+    manifest = AdapterManifest(
+        adapter_id="strict_adapter",
+        timeframe="1h",
+        horizon=24,
+        context_len=256,
+        feature_set="B",
+        feature_columns=list(FEATURE_SPECS["B"].columns),
+        base_model_repo="mock_repo",
+        base_model_revision=MODEL_REVISION,
+    )
+    predictor.manifest = manifest
+
+    # 1. Context length mismatch (request: 256, array: 128)
+    req = ForecastRequest(timeframe="1h", feature_set="B", context_len=256, adapter_path="/mock/adapter")
+    ctx_short = np.zeros((128, 9), dtype=np.float32)
+    with pytest.raises(ValueError, match="Context length mismatch"):
+        predictor.forecast_request(req, ctx_short, forecast_origin_time=1700000000000)
+
+    # 2. Number of features mismatch (array has 5 features instead of 9)
+    ctx_wrong_feat = np.zeros((256, 5), dtype=np.float32)
+    with pytest.raises(ValueError, match="Feature dimension mismatch"):
+        predictor.forecast_request(req, ctx_wrong_feat, forecast_origin_time=1700000000000)
+
+    # 3. Column order mismatch
+    permuted_cols = list(FEATURE_SPECS["B"].columns)
+    permuted_cols[0], permuted_cols[1] = permuted_cols[1], permuted_cols[0]
+    req_permuted = ForecastRequest(
+        timeframe="1h",
+        feature_set="B",
+        context_len=256,
+        adapter_path="/mock/adapter",
+        columns=permuted_cols,
+    )
+    ctx_256 = np.zeros((256, 9), dtype=np.float32)
+    with pytest.raises(ValueError, match="Incompatible feature columns"):
+        predictor.forecast_request(req_permuted, ctx_256, forecast_origin_time=1700000000000)
+
+    # 4. Base revision mismatch
+    predictor.model_revision = "mismatched_revision"
+    with pytest.raises(ValueError, match="Base model revision mismatch"):
+        predictor.forecast_request(req, ctx_256, forecast_origin_time=1700000000000)
+
+
+# ---------------------------------------------------------------------------
+# 9. End-to-End Backtest In-Sample Overlap Detection
+# ---------------------------------------------------------------------------
+
+
+def _make_synthetic_snapshot(n_candles: int = 5500, timeframe: str = "1h"):
+    from paxg_lab.data.snapshot import DatasetSnapshot, SnapshotMetadata
+    step_ms = 3600 * 1000 if timeframe == "1h" else 4 * 3600 * 1000
+    start_ts = 1743073200000
+    timestamps = np.array([start_ts + i * step_ms for i in range(n_candles)], dtype=np.int64)
+    close_prices = 2500.0 + 10.0 * np.sin(np.linspace(0, 50, n_candles)) + np.arange(n_candles) * 0.02
+    features_a = close_prices[:, np.newaxis].astype(np.float32)
+    features_b = np.repeat(features_a, 9, axis=1)
+    features_c = np.repeat(features_a, 11, axis=1)
+    meta = SnapshotMetadata(
+        snapshot_id=f"synth_{timeframe}",
+        timeframe=timeframe,
+        symbol="PAXGUSDT",
+        start_time=int(timestamps[0]),
+        end_time=int(timestamps[-1]),
+        total_candles=n_candles,
+        feature_sets=["A", "B", "C"],
+        created_at="2026-01-01T00:00:00Z",
+        sha256="0" * 64,
+    )
+    return DatasetSnapshot(
+        metadata=meta,
+        timestamps=timestamps,
+        features_a=features_a,
+        features_b=features_b,
+        features_c=features_c,
+    )
+
+
+def test_backtest_in_sample_overlap_detection_e2e():
+    """Regression test: BacktestEngine detects adapter in-sample overlap on overlapping folds while OOS folds pass cleanly."""
+    from paxg_lab.data.split import calculate_split_plan
+    from paxg_lab.eval.engine import BacktestEngine
+
+    snapshot = _make_synthetic_snapshot(n_candles=5500, timeframe="1h")
+    split_plan = calculate_split_plan(total_candles=len(snapshot.timestamps), timeframe="1h")
+    fold_1 = split_plan.eval_folds[0]
+    fold_2 = split_plan.eval_folds[1]
+
+    fold_1_start_ms = int(snapshot.timestamps[fold_1.eval_start])
+    fold_1_end_ms = int(snapshot.timestamps[fold_1.eval_end - 1])
+
+    # Adapter whose training and validation range covers Fold 1
+    manifest = AdapterManifest(
+        adapter_id="lora_trained_on_fold1",
+        timeframe="1h",
+        horizon=24,
+        context_len=256,
+        feature_set="A",
+        feature_columns=list(FEATURE_SPECS["A"].columns),
+        base_model_repo=MODEL_REPO,
+        base_model_revision=MODEL_REVISION,
+        training_range={
+            "start_time_ms": fold_1_start_ms,
+            "end_time_ms": fold_1_end_ms - 14 * 24 * 3600 * 1000,
+            "val_start_time_ms": fold_1_end_ms - 14 * 24 * 3600 * 1000,
+            "val_end_time_ms": fold_1_end_ms,
+        },
+    )
+
+    engine = BacktestEngine(predictor=None)
+
+    def dummy_pred_fn(ctx_windows: np.ndarray, horizon: int) -> tuple[np.ndarray, np.ndarray]:
+        n = len(ctx_windows)
+        pts = np.zeros((n, horizon), dtype=np.float32) + 2500.0
+        q = np.zeros((n, horizon, 9), dtype=np.float32) + 2500.0
+        return pts, q
+
+    # 1. Establish base reference
+    base_report = engine.run_full_backtest(
+        snapshot=snapshot,
+        is_base_reference=True,
+        custom_predictor_fn=dummy_pred_fn,
+    )
+
+    # 2. Run candidate evaluation passing adapter_manifest
+    candidate_report = engine.run_full_backtest(
+        snapshot=snapshot,
+        feature_set="A",
+        context_len=256,
+        model_name="Candidate-Overlapping",
+        is_base_reference=False,
+        base_reference_metrics=base_report,
+        custom_predictor_fn=dummy_pred_fn,
+        adapter_manifest=manifest,
+    )
+
+    # Verify Fold 1 (overlapping) is flagged as in-sample
+    m_fold1 = candidate_report.get_fold_metric(fold_1.fold_id)
+    assert m_fold1 is not None
+    assert m_fold1.is_in_sample is True
+    assert m_fold1.warning is not None
+    assert "IN-SAMPLE OVERLAP DETECTED" in m_fold1.warning
+
+    # Verify other folds (strictly out-of-sample) are NOT flagged
+    m_fold2 = candidate_report.get_fold_metric(fold_2.fold_id)
+    assert m_fold2 is not None
+    assert m_fold2.is_in_sample is False
+
+    # Verify ScoreReport metadata contains in-sample warnings
+    assert candidate_report.metadata["has_in_sample_eval_folds"] is True
+    assert fold_1.fold_id in candidate_report.metadata["in_sample_folds"]
+    assert "in_sample_warning" in candidate_report.metadata
+

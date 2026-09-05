@@ -95,6 +95,7 @@ class AdapterManifest:
         expected_context: int | None = None,
         expected_feature_set: str | None = None,
         expected_columns: list[str] | None = None,
+        expected_num_features: int | None = None,
         expected_base_revision: str | None = None,
     ) -> None:
         """Strictly validates compatibility against expected deployment parameters.
@@ -144,6 +145,14 @@ class AdapterManifest:
                     f"  Requested columns: {expected_columns}"
                 )
 
+        # Number of features
+        if expected_num_features is not None:
+            if len(self.feature_columns) != expected_num_features:
+                raise ValueError(
+                    f"Incompatible number of features: adapter expects {len(self.feature_columns)}, "
+                    f"got {expected_num_features}."
+                )
+
         # Base model revision
         if expected_base_revision is not None:
             if self.base_model_revision != expected_base_revision:
@@ -168,24 +177,29 @@ class AdapterManifest:
         """
         train_start = self.training_range.get("start_time_ms")
         train_end = self.training_range.get("end_time_ms")
+        val_start = self.training_range.get("val_start_time_ms")
+        val_end = self.training_range.get("val_end_time_ms")
 
-        if train_start is None or train_end is None:
-            return (False, "Manifest training_range does not contain start_time_ms or end_time_ms.")
+        starts = [int(s) for s in (train_start, val_start) if s is not None]
+        ends = [int(e) for e in (train_end, val_end) if e is not None]
 
-        train_start = int(train_start)
-        train_end = int(train_end)
+        if not starts or not ends:
+            return (False, "Manifest training_range does not contain timestamp boundaries.")
 
-        # Overlap condition: max(eval_start_ms, train_start) <= min(eval_end_ms, train_end)
-        if max(eval_start_ms, train_start) <= min(eval_end_ms, train_end):
-            overlap_start = max(eval_start_ms, train_start)
-            overlap_end = min(eval_end_ms, train_end)
+        in_sample_start = min(starts)
+        in_sample_end = max(ends)
+
+        # Overlap condition: max(eval_start_ms, in_sample_start) <= min(eval_end_ms, in_sample_end)
+        if max(eval_start_ms, in_sample_start) <= min(eval_end_ms, in_sample_end):
+            overlap_start = max(eval_start_ms, in_sample_start)
+            overlap_end = min(eval_end_ms, in_sample_end)
             overlap_hours = (overlap_end - overlap_start) / (1000 * 3600)
             msg = (
                 f"IN-SAMPLE OVERLAP DETECTED: Evaluation period [{eval_start_ms}, {eval_end_ms}] "
-                f"overlaps adapter training range [{train_start}, {train_end}] "
+                f"overlaps adapter training/validation range [{in_sample_start}, {in_sample_end}] "
                 f"by {overlap_hours:.1f} hours ({overlap_start} to {overlap_end}). "
-                "Evaluation on in-sample data yields biased performance scores!"
+                "Evaluation on in-sample / parameter-selection data yields biased performance scores!"
             )
             return (True, msg)
 
-        return (False, "Evaluation period is strictly out-of-sample relative to adapter training data.")
+        return (False, "Evaluation period is strictly out-of-sample relative to adapter training and validation data.")

@@ -1,4 +1,4 @@
-"""Safe and atomic storage for LoRA adapters with SHA-256 verification and cleanup."""
+"""Safe and atomic storage for LoRA adapters with sidecar SHA-256 verification and cleanup."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from .manifest import AdapterManifest
 logger = logging.getLogger(__name__)
 
 DEFAULT_ADAPTER_STORE_DIR = Path("var/paxg_lab/adapters")
+CHECKSUMS_FILENAME = "checksums.sha256"
 
 
 def compute_file_sha256(path: str | Path) -> str:
@@ -50,23 +51,26 @@ class AdapterStore:
         self,
         peft_model: PeftModel,
         manifest: AdapterManifest,
+        base_model: nn.Module | None = None,
         smoke_test: bool = True,
     ) -> Path:
-        """Atomically saves a LoRA adapter, computes file hashes, and validates integrity.
+        """Atomically saves a LoRA adapter, generates sidecar SHA-256 checksums, and validates integrity.
 
         Workflow:
-          1. Write to temporary directory .tmp_{adapter_id} on same disk.
+          1. Write to temporary directory .tmp_{adapter_id}_{timestamp} on same disk.
           2. Save PEFT weights (safetensors) and configuration.
-          3. Calculate SHA-256 for all written weight/config files.
-          4. Record hashes in manifest and write paxg_manifest.json.
-          5. If smoke_test=True, run verification forward pass to ensure valid output.
-          6. Rename temporary directory to canonical directory atomically.
-          7. On any error, clean up temp directory and raise.
+          3. Calculate SHA-256 for generated weight and config files; store in manifest.
+          4. Write paxg_manifest.json.
+          5. Write sidecar checksums.sha256 covering ALL files (weights, configs, manifest).
+          6. If smoke_test=True, run verification forward pass to assert valid shape and finite output.
+          7. Rename temporary directory to canonical directory atomically.
+          8. On any error, clean up temp directory and raise.
 
         Args:
           peft_model: The trained PEFT model instance.
           manifest: Associated AdapterManifest with metadata.
-          smoke_test: Whether to run a smoke forward pass prior to final rename.
+          base_model: Optional base model to test loading from disk during smoke test.
+          smoke_test: Whether to run a verification forward pass prior to final rename.
 
         Returns:
           Path to saved canonical adapter directory.
@@ -100,16 +104,25 @@ class AdapterStore:
             manifest.is_verified = True
             manifest_path = temp_dir / "paxg_manifest.json"
             manifest.save_json(manifest_path)
-            # Add manifest hash itself to file_hashes
-            manifest.file_hashes["paxg_manifest.json"] = compute_file_sha256(manifest_path)
-            # Re-save manifest with its own hash included
-            manifest.save_json(manifest_path)
 
-            # 4. Optional smoke test: test forward pass
+            # 4. Generate sidecar checksums.sha256 covering all files including paxg_manifest.json
+            checksums_path = temp_dir / CHECKSUMS_FILENAME
+            with open(checksums_path, "w", encoding="utf-8") as f:
+                for item in sorted(temp_dir.glob("*")):
+                    if item.is_file() and item.name != CHECKSUMS_FILENAME:
+                        digest = compute_file_sha256(item)
+                        f.write(f"{digest}  {item.name}\n")
+
+            # 5. Smoke test: run actual forward pass to verify output shape & finiteness
             if smoke_test:
-                self._run_smoke_test(temp_dir, manifest)
+                self._run_smoke_test(
+                    temp_dir=temp_dir,
+                    manifest=manifest,
+                    peft_model=peft_model,
+                    base_model=base_model,
+                )
 
-            # 5. Atomic rename to target canonical directory
+            # 6. Atomic rename to target canonical directory
             logger.info("Atomically promoting %s to %s...", temp_dir.name, target_dir.name)
             # On Windows, os.replace performs atomic replace on same volume
             os.replace(temp_dir, target_dir)
@@ -122,21 +135,74 @@ class AdapterStore:
                 shutil.rmtree(temp_dir, ignore_errors=True)
             raise
 
-    def _run_smoke_test(self, adapter_dir: Path, manifest: AdapterManifest) -> None:
-        """Runs a minimal smoke test on a dummy batch to verify forward compatibility."""
+    def _run_smoke_test(
+        self,
+        temp_dir: Path,
+        manifest: AdapterManifest,
+        peft_model: PeftModel | None = None,
+        base_model: nn.Module | None = None,
+    ) -> None:
+        """Runs a real forward pass smoke test to verify compatibility and finite outputs."""
         logger.info("Running smoke test for adapter '%s'...", manifest.adapter_id)
-        # Dummy batch of (1, num_features, context_len)
-        num_features = len(manifest.feature_columns) if manifest.feature_columns else 1
-        dummy_ctx = torch.zeros(
-            (1, num_features, manifest.context_len),
-            dtype=torch.float32,
-        )
-        # Verify that required files exist
-        if not (adapter_dir / "adapter_config.json").exists():
-            raise FileNotFoundError(f"Missing adapter_config.json in {adapter_dir}")
-        safetensor_files = list(adapter_dir.glob("*.safetensors")) + list(adapter_dir.glob("*.bin"))
+        if not (temp_dir / "adapter_config.json").exists():
+            raise FileNotFoundError(f"Missing adapter_config.json in {temp_dir}")
+        safetensor_files = list(temp_dir.glob("*.safetensors")) + list(temp_dir.glob("*.bin"))
         if not safetensor_files:
-            raise FileNotFoundError(f"Missing weight files in {adapter_dir}")
+            raise FileNotFoundError(f"Missing weight files in {temp_dir}")
+
+        num_features = len(manifest.feature_columns) if manifest.feature_columns else 1
+
+        # Determine device from available model
+        test_model = None
+        if base_model is not None:
+            # Test actual loading from temporary directory
+            test_model = load_lora_adapter(base_model, temp_dir)
+        elif peft_model is not None:
+            test_model = peft_model
+
+        if test_model is not None:
+            device = next(test_model.parameters()).device
+            dummy_ctx = torch.zeros(
+                (1, num_features, manifest.context_len),
+                dtype=torch.float32,
+                device=device,
+            )
+
+            # Execute forward pass
+            core = test_model
+            if hasattr(core, "base_model"):
+                core = core.base_model
+            if hasattr(core, "model"):
+                core = core.model
+
+            with torch.no_grad():
+                test_model.eval()
+                if hasattr(core, "forward_decode"):
+                    out = core.forward_decode(target=dummy_ctx, horizon=manifest.horizon)
+                elif hasattr(core, "decode"):
+                    out = core.decode(target=dummy_ctx, horizon=manifest.horizon)
+                else:
+                    out = test_model(dummy_ctx)
+
+            # Validate shape: out should have horizon and quantiles
+            if hasattr(out, "shape"):
+                if out.ndim >= 3:
+                    out_horizon = out.shape[-2]
+                    out_quantiles = out.shape[-1]
+                    if out_horizon != manifest.horizon:
+                        raise ValueError(
+                            f"Smoke test horizon mismatch: expected {manifest.horizon}, got {out_horizon}"
+                        )
+                    if out_quantiles != 9:
+                        raise ValueError(
+                            f"Smoke test quantiles mismatch: expected 9, got {out_quantiles}"
+                        )
+                # Check that outputs are strictly finite
+                if not torch.isfinite(out).all():
+                    raise ValueError(
+                        f"Smoke test failed for '{manifest.adapter_id}': output contains NaN or Inf!"
+                    )
+            logger.info("Smoke test passed successfully: shape=%s, finite=True", getattr(out, "shape", None))
 
     def load_adapter(
         self,
@@ -180,25 +246,51 @@ class AdapterStore:
                 "Refusing to load unverified or corrupted adapter."
             )
 
+        # 1. SHA-256 integrity verification via sidecar checksums.sha256
+        checksums_file = adapter_path / CHECKSUMS_FILENAME
+        if checksums_file.exists():
+            with open(checksums_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split(maxsplit=1)
+                    if len(parts) == 2:
+                        expected_hash, fname = parts[0].strip(), parts[1].strip()
+                        fpath = adapter_path / fname
+                        if not fpath.exists():
+                            raise FileNotFoundError(
+                                f"Integrity check failed: required file '{fname}' missing from {adapter_path}."
+                            )
+                        actual_hash = compute_file_sha256(fpath)
+                        if actual_hash != expected_hash:
+                            raise RuntimeError(
+                                f"SHA-256 integrity mismatch for '{fname}' in adapter '{adapter_path.name}':\n"
+                                f"  Expected: {expected_hash}\n"
+                                f"  Actual:   {actual_hash}\n"
+                                "Refusing to load potentially corrupted or modified files!"
+                            )
+
         manifest = AdapterManifest.load_json(manifest_file)
 
-        # 1. SHA-256 integrity verification
-        for filename, expected_hash in manifest.file_hashes.items():
-            if filename == "paxg_manifest.json":
-                continue  # manifest contains itself; verify other files
-            file_path = adapter_path / filename
-            if not file_path.exists():
-                raise FileNotFoundError(
-                    f"Integrity check failed: required file '{filename}' missing from {adapter_path}."
-                )
-            actual_hash = compute_file_sha256(file_path)
-            if actual_hash != expected_hash:
-                raise RuntimeError(
-                    f"SHA-256 integrity mismatch for '{filename}' in adapter '{manifest.adapter_id}':\n"
-                    f"  Expected: {expected_hash}\n"
-                    f"  Actual:   {actual_hash}\n"
-                    "Refusing to load potentially corrupted or modified weights!"
-                )
+        if not checksums_file.exists():
+            # Fallback to manifest.file_hashes for weights/config
+            for filename, expected_hash in manifest.file_hashes.items():
+                if filename == "paxg_manifest.json":
+                    continue
+                file_path = adapter_path / filename
+                if not file_path.exists():
+                    raise FileNotFoundError(
+                        f"Integrity check failed: required file '{filename}' missing from {adapter_path}."
+                    )
+                actual_hash = compute_file_sha256(file_path)
+                if actual_hash != expected_hash:
+                    raise RuntimeError(
+                        f"SHA-256 integrity mismatch for '{filename}' in adapter '{manifest.adapter_id}':\n"
+                        f"  Expected: {expected_hash}\n"
+                        f"  Actual:   {actual_hash}\n"
+                        "Refusing to load potentially corrupted or modified weights!"
+                    )
 
         # 2. Strict compatibility verification
         manifest.verify_compatibility(
@@ -230,7 +322,7 @@ class AdapterStore:
                         cleaned.append(item.name)
                         logger.info("Cleaned up stale temporary directory: %s", item.name)
                 except Exception as e:
-                    logger.warning("Could not clean up temp dir %s: %e", item, e)
+                    logger.warning("Could not clean up temp dir %s: %s", item, e)
         return cleaned
 
     def list_adapters(self) -> list[AdapterManifest]:

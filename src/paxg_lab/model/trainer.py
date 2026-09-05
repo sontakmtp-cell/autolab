@@ -66,6 +66,18 @@ class LoRATrainer:
         else:
             self.device = torch.device(device)
 
+        # Ensure base model does NOT already have LoRA or PEFT attached
+        if isinstance(base_model, PeftModel) or hasattr(base_model, "peft_config"):
+            raise ValueError(
+                "Base model is already a PeftModel! Each training trial must start from a clean, frozen base model."
+            )
+        for name, _ in base_model.named_parameters():
+            if "lora" in name.lower():
+                raise ValueError(
+                    f"Base model contains pre-existing LoRA parameter '{name}'! "
+                    "Each training trial must start from a clean base model without leftover adapter weights."
+                )
+
         self.base_model.to(self.device)
 
         # Ensure base model is in eval mode before adapter attachment
@@ -250,9 +262,10 @@ class LoRATrainer:
 
         num_train_samples = len(train_ctx)
         effective_samples = min(num_train_samples, self.spec.max_samples_per_epoch)
-        steps_per_epoch = math.ceil(effective_samples / self.spec.batch_size)
-        total_steps = steps_per_epoch * self.spec.max_epochs
-        warmup_steps = max(1, int(total_steps * self.spec.warmup_ratio))
+        minibatches_per_epoch = math.ceil(effective_samples / self.spec.batch_size)
+        optimizer_steps_per_epoch = math.ceil(minibatches_per_epoch / self.spec.gradient_accumulation_steps)
+        total_optimizer_steps = optimizer_steps_per_epoch * self.spec.max_epochs
+        warmup_optimizer_steps = max(1, int(total_optimizer_steps * self.spec.warmup_ratio))
 
         # 4. Optimizer and Warmup Scheduler
         optimizer = torch.optim.AdamW(
@@ -261,9 +274,9 @@ class LoRATrainer:
             weight_decay=self.spec.weight_decay,
         )
 
-        def lr_lambda(current_step: int) -> float:
-            if current_step < warmup_steps:
-                return float(current_step + 1) / float(warmup_steps)
+        def lr_lambda(current_optimizer_step: int) -> float:
+            if current_optimizer_step < warmup_optimizer_steps:
+                return float(current_optimizer_step + 1) / float(warmup_optimizer_steps)
             return 1.0
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -280,12 +293,15 @@ class LoRATrainer:
         rng = np.random.default_rng(self.spec.seed)
 
         logger.info(
-            "Starting LoRA training: max_epochs=%d, batch_size=%d, grad_accum=%d (effective=%d), total_steps=%d",
+            "Starting LoRA training: max_epochs=%d, batch_size=%d, grad_accum=%d (effective=%d), "
+            "minibatches_per_epoch=%d, total_optimizer_steps=%d, warmup_optimizer_steps=%d",
             self.spec.max_epochs,
             self.spec.batch_size,
             self.spec.gradient_accumulation_steps,
             self.spec.effective_batch_size,
-            total_steps,
+            minibatches_per_epoch,
+            total_optimizer_steps,
+            warmup_optimizer_steps,
         )
 
         for epoch in range(1, self.spec.max_epochs + 1):

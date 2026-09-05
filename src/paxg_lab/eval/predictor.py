@@ -45,6 +45,9 @@ class TimesFM3Predictor:
         self.base_model.to(self.device)
         self.base_model.eval()
 
+        self.model_repo = model_repo
+        self.model_revision = model_revision
+
         self.adapter_path: Path | None = None
         self.manifest: AdapterManifest | None = None
         self.lora_model = None
@@ -59,23 +62,47 @@ class TimesFM3Predictor:
         if not p.is_dir():
             raise FileNotFoundError(f"Adapter path not found: {p}")
 
+        manifest_file = p / "paxg_manifest.json"
+        if not manifest_file.exists():
+            raise FileNotFoundError(
+                f"Required 'paxg_manifest.json' not found in adapter directory: {p}. "
+                "Production adapters must have a valid manifest. "
+                "For isolated debugging/development, use 'load_raw_adapter_unsafe()'."
+            )
+
         # If an adapter was already active, unload it first to maintain purity
         if self.lora_model is not None:
             self.unload_adapter()
 
-        manifest_file = p / "paxg_manifest.json"
-        if manifest_file.exists():
-            logger.info("Loading verified adapter with manifest from %s...", p)
-            store = AdapterStore(base_dir=p.parent)
-            self.lora_model, self.manifest = store.load_adapter(
-                adapter_id_or_path=p,
-                base_model=self.base_model,
-            )
-        else:
-            logger.info("Loading unmanifested adapter from %s...", p)
-            self.lora_model = load_lora_adapter(self.base_model, p)
-            self.manifest = None
+        logger.info("Loading verified adapter with manifest from %s...", p)
+        store = AdapterStore(base_dir=p.parent)
+        self.lora_model, self.manifest = store.load_adapter(
+            adapter_id_or_path=p,
+            base_model=self.base_model,
+        )
 
+        self.adapter_path = p
+        self.lora_model.to(self.device)
+        self.lora_model.eval()
+        self.model = self.lora_model
+
+    def load_raw_adapter_unsafe(self, adapter_path: str | Path) -> None:
+        """Loads a raw LoRA adapter without manifest verification.
+
+        WARNING: This method bypasses SHA-256 tamper verification, timeframe,
+        horizon, feature set, column order, and base revision compatibility checks.
+        Use strictly for isolated development/debugging.
+        """
+        p = Path(adapter_path)
+        if not p.is_dir():
+            raise FileNotFoundError(f"Adapter path not found: {p}")
+
+        if self.lora_model is not None:
+            self.unload_adapter()
+
+        logger.warning("UNSAFE LOAD: Loading unverified adapter without manifest from %s...", p)
+        self.lora_model = load_lora_adapter(self.base_model, p)
+        self.manifest = None
         self.adapter_path = p
         self.lora_model.to(self.device)
         self.lora_model.eval()
@@ -167,6 +194,28 @@ class TimesFM3Predictor:
         horizon = request.horizon or get_horizon_for_timeframe(request.timeframe)
         step_ms = 3600 * 1000 if request.timeframe == "1h" else 4 * 3600 * 1000
 
+        # Validate context length and feature dimension against request
+        actual_context_len = len(context_features)
+        actual_num_features = context_features.shape[1] if context_features.ndim > 1 else 1
+
+        if actual_context_len != request.context_len:
+            raise ValueError(
+                f"Context length mismatch: request specifies context_len={request.context_len}, "
+                f"but received array of length {actual_context_len}."
+            )
+
+        # Resolve columns from request or FEATURE_SPECS
+        from ..data.features import FEATURE_SPECS
+
+        resolved_columns = list(request.columns) if request.columns is not None else (
+            list(FEATURE_SPECS[request.feature_set].columns) if request.feature_set in FEATURE_SPECS else []
+        )
+        if len(resolved_columns) != actual_num_features:
+            raise ValueError(
+                f"Feature dimension mismatch: context array has {actual_num_features} features, "
+                f"but resolved column list has {len(resolved_columns)} ({resolved_columns})."
+            )
+
         # Manifest compatibility check if adapter has manifest
         in_sample_warning = None
         manifest = getattr(self, "manifest", None)
@@ -174,7 +223,11 @@ class TimesFM3Predictor:
             manifest.verify_compatibility(
                 expected_timeframe=request.timeframe,
                 expected_horizon=horizon,
+                expected_context=actual_context_len,
                 expected_feature_set=request.feature_set,
+                expected_columns=resolved_columns,
+                expected_num_features=actual_num_features,
+                expected_base_revision=getattr(self, "model_revision", MODEL_REVISION),
             )
             # Check in-sample overlap
             eval_start = forecast_origin_time + step_ms
