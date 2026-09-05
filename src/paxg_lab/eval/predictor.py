@@ -114,6 +114,16 @@ class TimesFM3Predictor:
         forecast_origin_time: int,
     ) -> ForecastResult:
         """Executes a single forecast request and produces ForecastResult with aligned timestamps."""
+        # Strict validation of adapter_path
+        req_adapter = str(Path(request.adapter_path).resolve()) if request.adapter_path else None
+        pred_adapter = str(Path(self.adapter_path).resolve()) if self.adapter_path else None
+        if req_adapter != pred_adapter:
+            raise ValueError(
+                f"ForecastRequest adapter_path mismatch: request specifies '{request.adapter_path}' "
+                f"(resolved: '{req_adapter}'), but predictor has adapter '{self.adapter_path}' "
+                f"(resolved: '{pred_adapter}'). A separate predictor must be initialized for a different adapter."
+            )
+
         horizon = request.horizon or get_horizon_for_timeframe(request.timeframe)
         step_ms = 3600 * 1000 if request.timeframe == "1h" else 4 * 3600 * 1000
 

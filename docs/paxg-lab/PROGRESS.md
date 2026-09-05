@@ -67,16 +67,22 @@ Tài liệu này theo dõi tiến độ thực hiện 8 giai đoạn (P0 đến 
 2. **Tính đơn điệu của phân vị & Khoảng bất định:**
    - Tự động sắp xếp 9 phân vị đảm bảo tính đơn điệu $q_{10} \le q_{20} \le \dots \le q_{90}$.
    - Độ bao phủ dải bất định danh nghĩa 80% $[q_{10}, q_{90}]$ đạt mức xuất sắc: **75.9%** (1h) và **79.7%** (4h).
-3. **Công thức tính điểm Score v1:**
+3. **Công thức tính điểm Score v1 & Kết nối Base End-to-End:**
    - Thiết lập trọng số suy giảm thời gian: 0-6h (50%), 6-12h (30%), 12-24h (20%).
+   - Từng fold kết nối trực tiếp với `weighted_mae` và `weighted_pinball` của Base:
+     $A_f = \text{MAE}_{cand} / \text{MAE}_{base}$, $Q_f = \text{Pinball}_{cand} / \text{Pinball}_{base}$, $L_f = 0.70 A_f + 0.30 Q_f$.
    - TimesFM 3.0 Base đạt chuẩn đối chiếu **Score v1 = 0.00**.
    - Phạt thêm đoạn đánh giá tệ nhất: $Score = 100 \times [1 - (0.80 \times \bar{L} + 0.20 \times L_{worst})]$.
-4. **Động cơ Backtest (`BacktestEngine`):**
-   - Xử lý theo lô (`batch_size=32/16`) trên GPU NVIDIA GeForce RTX 5060 Ti, hoàn thành 2,091 cửa sổ 1h trong 38.1s và 525 cửa sổ 4h trong 10.6s.
-   - Đánh giá trên 3 fold ngoài mẫu độc lập và tập kiểm chứng khóa kín.
+   - Xử lý nến/fold thiếu thông tin (base error <= tick size): gắn cờ `insufficient_information=True`, loại khỏi phép chia và tổng hợp.
+4. **Động cơ Backtest (`BacktestEngine`) & Bảo vệ Test Khóa Kín:**
+   - Xử lý theo lô (`batch_size=32/16`) trên GPU NVIDIA GeForce RTX 5060 Ti.
+   - `run_full_backtest()` mặc định **không mở tập test khóa kín** (`include_locked_test=False`), tránh rò rỉ trong quá trình chọn mô hình.
+   - Cung cấp API riêng biệt `run_locked_verification()` dành riêng cho ứng viên chiến thắng cuối cùng.
+   - Kiểm tra tương thích chặt chẽ `ForecastRequest.adapter_path` với `TimesFM3Predictor.adapter_path`.
+   - Bổ sung đầy đủ các breakdown phân tích theo PLAN: biến động < 2 tick, ngày thường vs cuối tuần, nhóm biến động thấp/cao, 87 khối dự báo độc lập 24h.
    - Lưu bằng chứng thực nghiệm đầy đủ tại `docs/paxg-lab/phases/p2_base_benchmark.json`.
 5. **Kiểm thử tự động:**
-   - Toàn bộ 75/75 tests vượt qua 100% (`pytest tests/paxg_lab/ src/timesfm3/`).
+   - Toàn bộ **80/80 tests vượt qua 100%** (`pytest tests/paxg_lab/ src/timesfm3/`), bổ sung 5 regression tests chứng minh Score candidate và bảo vệ locked test.
 
 ---
 

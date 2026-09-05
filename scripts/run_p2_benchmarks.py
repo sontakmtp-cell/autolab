@@ -70,6 +70,8 @@ def main() -> None:
         context_len=256,
         batch_size=32 if device == "cuda" else 8,
         model_name="TimesFM3-Base",
+        is_base_reference=True,
+        include_locked_test=True,
     )
     elapsed_1h = time.time() - t0_1h
     print(f"    Completed 1h in {elapsed_1h:.1f}s ({rep_1h.total_eval_windows} eval windows)")
@@ -83,6 +85,8 @@ def main() -> None:
         context_len=256,
         batch_size=32 if device == "cuda" else 8,
         model_name="TimesFM3-Base",
+        is_base_reference=True,
+        include_locked_test=True,
     )
     elapsed_4h = time.time() - t0_4h
     print(f"    Completed 4h in {elapsed_4h:.1f}s ({rep_4h.total_eval_windows} eval windows)")
@@ -145,20 +149,24 @@ def main() -> None:
                 "directional_accuracy_pct": rep_1h.directional_accuracy * 100.0,
                 "step_maes_usdt": rep_1h.step_mae,
                 "naive_comparison": rep_1h.baseline_comparisons,
+                "breakdowns": rep_1h.breakdowns,
                 "folds": [
                     {
                         "fold_id": f.fold_id,
                         "windows": f.num_windows,
                         "weighted_mae": f.weighted_mae,
+                        "weighted_pinball": f.weighted_pinball,
                         "relative_mae_to_base": f.relative_mae_to_base,
                         "relative_pinball_to_base": f.relative_pinball_to_base,
                         "composite_loss": f.composite_loss,
+                        "reference_valid": f.reference_valid,
                     }
                     for f in rep_1h.fold_metrics
                 ],
                 "test_locked": {
                     "windows": rep_1h.test_metrics.num_windows if rep_1h.test_metrics else 0,
                     "weighted_mae": rep_1h.test_metrics.weighted_mae if rep_1h.test_metrics else 0.0,
+                    "weighted_pinball": rep_1h.test_metrics.weighted_pinball if rep_1h.test_metrics else 0.0,
                     "rmse": rep_1h.test_metrics.rmse if rep_1h.test_metrics else 0.0,
                     "coverage_80": rep_1h.test_metrics.coverage_80 if rep_1h.test_metrics else 0.0,
                 },
@@ -176,20 +184,24 @@ def main() -> None:
                 "directional_accuracy_pct": rep_4h.directional_accuracy * 100.0,
                 "step_maes_usdt": rep_4h.step_mae,
                 "naive_comparison": rep_4h.baseline_comparisons,
+                "breakdowns": rep_4h.breakdowns,
                 "folds": [
                     {
                         "fold_id": f.fold_id,
                         "windows": f.num_windows,
                         "weighted_mae": f.weighted_mae,
+                        "weighted_pinball": f.weighted_pinball,
                         "relative_mae_to_base": f.relative_mae_to_base,
                         "relative_pinball_to_base": f.relative_pinball_to_base,
                         "composite_loss": f.composite_loss,
+                        "reference_valid": f.reference_valid,
                     }
                     for f in rep_4h.fold_metrics
                 ],
                 "test_locked": {
                     "windows": rep_4h.test_metrics.num_windows if rep_4h.test_metrics else 0,
                     "weighted_mae": rep_4h.test_metrics.weighted_mae if rep_4h.test_metrics else 0.0,
+                    "weighted_pinball": rep_4h.test_metrics.weighted_pinball if rep_4h.test_metrics else 0.0,
                     "rmse": rep_4h.test_metrics.rmse if rep_4h.test_metrics else 0.0,
                     "coverage_80": rep_4h.test_metrics.coverage_80 if rep_4h.test_metrics else 0.0,
                 },

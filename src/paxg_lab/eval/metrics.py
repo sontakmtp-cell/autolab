@@ -169,6 +169,112 @@ def calculate_directional_accuracy(
     return float(np.mean(matches))
 
 
+import datetime
+from typing import Any
+
+
+def calculate_low_move_breakdown(
+    targets: np.ndarray,
+    origin_prices: np.ndarray,
+    min_move_ticks: float = 2.0 * TICK_SIZE,
+) -> dict[str, Any]:
+    """Calculates statistics for movements under 2 ticks."""
+    if len(targets) == 0:
+        return {"count": 0, "pct": 0.0, "tick_size": TICK_SIZE, "threshold_usdt": min_move_ticks}
+
+    orig = origin_prices[:, np.newaxis]
+    actual_move = np.abs(targets - orig)
+    low_moves = actual_move < min_move_ticks
+    low_count = int(np.sum(low_moves))
+    total_elements = int(actual_move.size)
+    low_pct = float(low_count / max(total_elements, 1) * 100.0)
+
+    return {
+        "low_move_steps": low_count,
+        "total_steps": total_elements,
+        "pct": low_pct,
+        "threshold_usdt": min_move_ticks,
+        "tick_size": TICK_SIZE,
+    }
+
+
+def calculate_temporal_breakdown(
+    predictions: np.ndarray,
+    targets: np.ndarray,
+    origin_timestamps: np.ndarray,
+    weights: np.ndarray | tuple[float, ...],
+) -> dict[str, Any]:
+    """Calculates MAE split by weekday (Mon-Fri) vs weekend (Sat-Sun) in UTC."""
+    if len(predictions) == 0 or len(origin_timestamps) == 0:
+        return {"weekday_weighted_mae": 0.0, "weekend_weighted_mae": 0.0, "weekday_windows": 0, "weekend_windows": 0}
+
+    # Extract UTC day of week: Monday=0, Sunday=6
+    dows = np.array([
+        datetime.datetime.fromtimestamp(ts / 1000.0, tz=datetime.timezone.utc).weekday()
+        for ts in origin_timestamps
+    ])
+
+    is_weekday = dows < 5
+    is_weekend = dows >= 5
+
+    weekday_mae = calculate_weighted_mae(predictions[is_weekday], targets[is_weekday], weights) if np.any(is_weekday) else 0.0
+    weekend_mae = calculate_weighted_mae(predictions[is_weekend], targets[is_weekend], weights) if np.any(is_weekend) else 0.0
+
+    return {
+        "weekday_windows": int(np.sum(is_weekday)),
+        "weekend_windows": int(np.sum(is_weekend)),
+        "weekday_weighted_mae": weekday_mae,
+        "weekend_weighted_mae": weekend_mae,
+    }
+
+
+def calculate_volatility_breakdown(
+    predictions: np.ndarray,
+    targets: np.ndarray,
+    origin_prices: np.ndarray,
+    weights: np.ndarray | tuple[float, ...],
+) -> dict[str, Any]:
+    """Calculates MAE split by low vs high volatility (split by median realized volatility)."""
+    if len(predictions) == 0:
+        return {"low_vol_weighted_mae": 0.0, "high_vol_weighted_mae": 0.0, "median_volatility": 0.0}
+
+    orig = origin_prices[:, np.newaxis]
+    window_vol = np.std(targets - orig, axis=1)
+    median_vol = float(np.median(window_vol))
+
+    low_vol_mask = window_vol <= median_vol
+    high_vol_mask = window_vol > median_vol
+
+    low_vol_mae = calculate_weighted_mae(predictions[low_vol_mask], targets[low_vol_mask], weights) if np.any(low_vol_mask) else 0.0
+    high_vol_mae = calculate_weighted_mae(predictions[high_vol_mask], targets[high_vol_mask], weights) if np.any(high_vol_mask) else 0.0
+
+    return {
+        "median_volatility": median_vol,
+        "low_vol_windows": int(np.sum(low_vol_mask)),
+        "high_vol_windows": int(np.sum(high_vol_mask)),
+        "low_vol_weighted_mae": low_vol_mae,
+        "high_vol_weighted_mae": high_vol_mae,
+    }
+
+
+def calculate_sampling_breakdown(
+    num_windows: int,
+    horizon: int,
+    step: int = 1,
+) -> dict[str, Any]:
+    """Calculates window sampling, overlap ratio, and independent block statistics."""
+    overlap_ratio = float((horizon - step) / horizon) if horizon > step else 0.0
+    independent_blocks = int(num_windows // horizon) if horizon > 0 else 0
+
+    return {
+        "num_windows": num_windows,
+        "step": step,
+        "horizon": horizon,
+        "overlap_ratio": overlap_ratio,
+        "independent_blocks": independent_blocks,
+    }
+
+
 def compute_fold_metrics(
     predictions: np.ndarray,
     quantiles: np.ndarray,
@@ -195,6 +301,9 @@ def compute_fold_metrics(
             relative_mae_to_base=1.0,
             relative_pinball_to_base=1.0,
             composite_loss=1.0,
+            reference_valid=True,
+            insufficient_information=False,
+            warning=None,
         )
 
     weights = get_horizon_weights(timeframe)
@@ -206,19 +315,31 @@ def compute_fold_metrics(
     width80 = calculate_mean_width_80(quantiles)
     dir_acc = calculate_directional_accuracy(predictions, targets, origin_prices)
 
-    # Relative to base reference
-    if base_weighted_mae is not None and base_weighted_mae > TICK_SIZE:
-        a_f = w_mae / base_weighted_mae
+    # Base reference evaluation and zero-error policy
+    reference_valid = True
+    insufficient_information = False
+    warning_msg = None
+
+    if base_weighted_mae is not None and base_weighted_pinball is not None:
+        if base_weighted_mae <= TICK_SIZE or base_weighted_pinball <= TICK_SIZE:
+            reference_valid = False
+            insufficient_information = True
+            warning_msg = (
+                f"Base reference error is near zero (MAE={base_weighted_mae:.4f}, "
+                f"Pinball={base_weighted_pinball:.4f} <= tick {TICK_SIZE}). Fold marked insufficient information."
+            )
+            a_f = float("nan")
+            q_f = float("nan")
+            l_f = float("nan")
+        else:
+            a_f = w_mae / base_weighted_mae
+            q_f = w_pinball / base_weighted_pinball
+            l_f = 0.70 * a_f + 0.30 * q_f
     else:
+        # Self-referenced baseline (Base model): A_f = Q_f = 1.0 -> L_f = 1.0
         a_f = 1.0
-
-    if base_weighted_pinball is not None and base_weighted_pinball > TICK_SIZE:
-        q_f = w_pinball / base_weighted_pinball
-    else:
         q_f = 1.0
-
-    # L_f = 0.70 * A_f + 0.30 * Q_f
-    l_f = 0.70 * a_f + 0.30 * q_f
+        l_f = 1.0
 
     return FoldMetrics(
         fold_id=fold_id,
@@ -233,29 +354,47 @@ def compute_fold_metrics(
         relative_mae_to_base=a_f,
         relative_pinball_to_base=q_f,
         composite_loss=l_f,
+        reference_valid=reference_valid,
+        insufficient_information=insufficient_information,
+        warning=warning_msg,
     )
 
 
-def compute_score_v1(fold_losses: list[float]) -> float:
+def compute_score_v1(
+    fold_losses: list[float],
+    valid_mask: list[bool] | None = None,
+) -> float:
     """Calculates official Score v1 across evaluation folds.
 
     Formula:
-      Score = 100 * [1 - (0.80 * mean(L_f) + 0.20 * max(L_f))]
-
-    Where:
       L_f = 0.70 * A_f + 0.30 * Q_f
       A_f = Weighted MAE(model) / Weighted MAE(base)
       Q_f = Weighted Pinball(model) / Weighted Pinball(base)
 
+      Penalty = 0.80 * mean(L_f) + 0.20 * max(L_f)
+      Score = 100 * [1 - Penalty]
+
     Base reference model produces Score = 0.0.
-    Positive scores indicate superior performance; negative scores indicate inferior.
+    Folds marked insufficient_information (reference_valid=False or NaN loss) are excluded.
+    If all folds are invalid, raises ValueError per PLAN policy.
     """
     if not fold_losses:
         return 0.0
 
-    mean_l = float(np.mean(fold_losses))
-    worst_l = float(np.max(fold_losses))
+    if valid_mask is not None:
+        active_losses = [l for l, v in zip(fold_losses, valid_mask) if v and not np.isnan(l)]
+    else:
+        active_losses = [l for l in fold_losses if not np.isnan(l)]
+
+    if not active_losses:
+        raise ValueError(
+            "All evaluation folds have insufficient information (base error <= tick size). Cannot compute Score v1."
+        )
+
+    mean_l = float(np.mean(active_losses))
+    worst_l = float(np.max(active_losses))
 
     penalty = 0.80 * mean_l + 0.20 * worst_l
     score = 100.0 * (1.0 - penalty)
     return float(score)
+

@@ -228,3 +228,230 @@ def test_real_base_inference_on_snapshots():
     assert res_4h.quantiles.shape == (6, 9)
     assert len(res_4h.target_timestamps) == 6
     assert np.all(np.diff(res_4h.quantiles, axis=-1) >= 0.0)
+
+
+from unittest.mock import MagicMock
+from paxg_lab.constants import TICK_SIZE
+from paxg_lab.data.snapshot import SnapshotMetadata
+
+
+def _make_synthetic_snapshot(n_candles: int = 5500, timeframe: str = "1h") -> DatasetSnapshot:
+    step_ms = 3600 * 1000 if timeframe == "1h" else 4 * 3600 * 1000
+    start_ts = 1743073200000
+    timestamps = np.array([start_ts + i * step_ms for i in range(n_candles)], dtype=np.int64)
+    close_prices = 2500.0 + 10.0 * np.sin(np.linspace(0, 50, n_candles)) + np.arange(n_candles) * 0.02
+    features_a = close_prices[:, np.newaxis].astype(np.float32)
+    features_b = np.repeat(features_a, 9, axis=1)
+    features_c = np.repeat(features_a, 11, axis=1)
+    meta = SnapshotMetadata(
+        snapshot_id=f"synth_{timeframe}",
+        timeframe=timeframe,
+        symbol="PAXGUSDT",
+        start_time=int(timestamps[0]),
+        end_time=int(timestamps[-1]),
+        total_candles=n_candles,
+        feature_sets=["A", "B", "C"],
+        created_at="2026-01-01T00:00:00Z",
+        sha256="0" * 64,
+    )
+    return DatasetSnapshot(
+        metadata=meta,
+        timestamps=timestamps,
+        features_a=features_a,
+        features_b=features_b,
+        features_c=features_c,
+    )
+
+
+def test_end_to_end_score_v1_base_candidate_perfect_bad():
+    """Regression test proving Score v1 end-to-end:
+
+    - Base reference model -> Score == 0.00
+    - Perfect candidate predictor -> Score > 0.00 (substantially positive)
+    - Intentionally bad candidate predictor -> Score < 0.00
+    """
+    snapshot = _make_synthetic_snapshot(n_candles=5500, timeframe="1h")
+    engine = BacktestEngine(predictor=None)
+
+    # 1. Base Predictor: flat prediction + slight offset
+    def base_predictor_fn(ctx_windows: np.ndarray, horizon: int) -> tuple[np.ndarray, np.ndarray]:
+        n = len(ctx_windows)
+        last_val = ctx_windows[:, -1, 0] if ctx_windows.ndim == 3 else ctx_windows[:, -1]
+        pts = np.repeat((last_val + 5.0)[:, np.newaxis], horizon, axis=1)
+        q = np.repeat(pts[:, :, np.newaxis], 9, axis=2)
+        for i in range(9):
+            q[:, :, i] += (i - 4) * 2.0
+        return pts, q
+
+    rep_base = engine.run_full_backtest(
+        snapshot=snapshot,
+        is_base_reference=True,
+        custom_predictor_fn=base_predictor_fn,
+    )
+    assert np.isclose(rep_base.score, 0.0, atol=1e-5), f"Base model must have Score == 0.0, got {rep_base.score}"
+    assert rep_base.overall_weighted_mae > 0.0
+
+    # 2. Perfect Candidate Predictor: accurately tracks future targets
+    targets = snapshot.features_a[:, 0]
+
+    def perfect_predictor_fn(ctx_windows: np.ndarray, horizon: int) -> tuple[np.ndarray, np.ndarray]:
+        # Perfectly predicts targets with minimal noise (error near zero)
+        n = len(ctx_windows)
+        last_val = ctx_windows[:, -1, 0] if ctx_windows.ndim == 3 else ctx_windows[:, -1]
+        # Very close prediction: error ~ 0.05 vs base error ~ 5.0
+        pts = np.repeat((last_val + 0.05)[:, np.newaxis], horizon, axis=1)
+        q = np.repeat(pts[:, :, np.newaxis], 9, axis=2)
+        for i in range(9):
+            q[:, :, i] += (i - 4) * 0.1
+        return pts, q
+
+    rep_perfect = engine.run_full_backtest(
+        snapshot=snapshot,
+        base_reference_metrics=rep_base,
+        custom_predictor_fn=perfect_predictor_fn,
+    )
+    assert rep_perfect.score > 50.0, f"Perfect model must have high positive Score, got {rep_perfect.score}"
+    assert rep_perfect.overall_weighted_mae < rep_base.overall_weighted_mae
+
+    # 3. Intentionally Bad Candidate Predictor: huge error
+    def bad_predictor_fn(ctx_windows: np.ndarray, horizon: int) -> tuple[np.ndarray, np.ndarray]:
+        n = len(ctx_windows)
+        last_val = ctx_windows[:, -1, 0] if ctx_windows.ndim == 3 else ctx_windows[:, -1]
+        pts = np.repeat((last_val + 200.0)[:, np.newaxis], horizon, axis=1)
+        q = np.repeat(pts[:, :, np.newaxis], 9, axis=2)
+        for i in range(9):
+            q[:, :, i] += (i - 4) * 5.0
+        return pts, q
+
+    rep_bad = engine.run_full_backtest(
+        snapshot=snapshot,
+        base_reference_metrics=rep_base,
+        custom_predictor_fn=bad_predictor_fn,
+    )
+    assert rep_bad.score < 0.0, f"Bad model must have negative Score, got {rep_bad.score}"
+    assert rep_bad.overall_weighted_mae > rep_base.overall_weighted_mae
+
+
+def test_locked_test_isolated_by_default():
+    """Verifies that run_full_backtest does NOT open test_locked by default,
+
+    and that run_locked_verification evaluates test_locked strictly on demand.
+    """
+    snapshot = _make_synthetic_snapshot(n_candles=5500, timeframe="1h")
+    engine = BacktestEngine(predictor=None)
+
+    def dummy_pred_fn(ctx_windows: np.ndarray, horizon: int) -> tuple[np.ndarray, np.ndarray]:
+        n = len(ctx_windows)
+        pts = np.zeros((n, horizon), dtype=np.float32) + 2500.0
+        q = np.zeros((n, horizon, 9), dtype=np.float32) + 2500.0
+        return pts, q
+
+    # By default, include_locked_test is False
+    rep = engine.run_full_backtest(
+        snapshot=snapshot,
+        custom_predictor_fn=dummy_pred_fn,
+    )
+    assert rep.test_metrics is None, "Locked test must not be evaluated during standard backtest."
+    assert rep.metadata["locked_test_evaluated"] is False
+
+    # Dedicated locked verification API
+    locked_metric = engine.run_locked_verification(
+        snapshot=snapshot,
+        custom_predictor_fn=dummy_pred_fn,
+    )
+    assert locked_metric.fold_id == "test_locked"
+    assert locked_metric.num_windows > 0
+
+
+def test_forecast_request_adapter_mismatch_raises_error():
+    """Verifies that forecast_request strictly enforces request.adapter_path == predictor.adapter_path."""
+    predictor = object.__new__(TimesFM3Predictor)
+    predictor.device = torch.device("cpu")
+    predictor.adapter_path = None
+    predictor.predict_batch = MagicMock(return_value=(
+        np.zeros((1, 24), dtype=np.float32),
+        np.zeros((1, 24, 9), dtype=np.float32),
+    ))
+
+    # 1. Matching adapter_path (both None) -> passes
+    req_valid = ForecastRequest(timeframe="1h", adapter_path=None)
+    res = predictor.forecast_request(req_valid, np.zeros((256,), dtype=np.float32), 1743073200000)
+    assert res is not None
+
+    # 2. Mismatched adapter_path (request specifies LoRA, predictor is Base) -> raises ValueError
+    req_mismatch = ForecastRequest(timeframe="1h", adapter_path="adapters/lora_1h")
+    with pytest.raises(ValueError, match="ForecastRequest adapter_path mismatch"):
+        predictor.forecast_request(req_mismatch, np.zeros((256,), dtype=np.float32), 1743073200000)
+
+
+def test_base_error_near_zero_handling():
+    """Verifies that base errors <= tick size are flagged as insufficient information
+
+    and handled without division by zero.
+    """
+    n_windows = 10
+    horizon = 24
+    preds = np.full((n_windows, horizon), 2500.0)
+    targets = np.full((n_windows, horizon), 2500.0)
+    quantiles = np.zeros((n_windows, horizon, 9)) + 2500.0
+    orig = np.full(n_windows, 2500.0)
+
+    # Base error <= TICK_SIZE (0.01)
+    m = compute_fold_metrics(
+        predictions=preds,
+        quantiles=quantiles,
+        targets=targets,
+        origin_prices=orig,
+        timeframe="1h",
+        fold_id=1,
+        base_weighted_mae=0.005,
+        base_weighted_pinball=0.005,
+    )
+    assert m.reference_valid is False
+    assert m.insufficient_information is True
+    assert np.isnan(m.composite_loss)
+    assert m.warning is not None
+    assert "insufficient information" in m.warning
+
+    # When all folds are invalid, compute_score_v1 raises ValueError
+    with pytest.raises(ValueError, match="insufficient information"):
+        compute_score_v1([float("nan"), float("nan")], valid_mask=[False, False])
+
+    # When some folds are valid, invalid folds are excluded
+    score = compute_score_v1([float("nan"), 1.0, 1.0], valid_mask=[False, True, True])
+    assert np.isclose(score, 0.0)
+
+
+def test_score_report_breakdowns():
+    """Verifies that ScoreReport contains all required PLAN breakdown metrics."""
+    snapshot = _make_synthetic_snapshot(n_candles=5500, timeframe="1h")
+    engine = BacktestEngine(predictor=None)
+
+    def dummy_pred_fn(ctx_windows: np.ndarray, horizon: int) -> tuple[np.ndarray, np.ndarray]:
+        n = len(ctx_windows)
+        last_val = ctx_windows[:, -1, 0] if ctx_windows.ndim == 3 else ctx_windows[:, -1]
+        pts = np.repeat((last_val + 1.0)[:, np.newaxis], horizon, axis=1)
+        q = np.repeat(pts[:, :, np.newaxis], 9, axis=2)
+        return pts, q
+
+    rep = engine.run_full_backtest(snapshot=snapshot, custom_predictor_fn=dummy_pred_fn)
+
+    assert "low_move_under_2_ticks" in rep.breakdowns
+    assert "weekday_vs_weekend" in rep.breakdowns
+    assert "volatility_buckets" in rep.breakdowns
+    assert "window_sampling" in rep.breakdowns
+
+    sampling = rep.breakdowns["window_sampling"]
+    assert sampling["horizon"] == 24
+    assert sampling["step"] == 1
+    assert np.isclose(sampling["overlap_ratio"], 23.0 / 24.0)
+    assert sampling["independent_blocks"] > 0
+
+    temporal = rep.breakdowns["weekday_vs_weekend"]
+    assert "weekday_weighted_mae" in temporal
+    assert "weekend_weighted_mae" in temporal
+
+    vol = rep.breakdowns["volatility_buckets"]
+    assert "low_vol_weighted_mae" in vol
+    assert "high_vol_weighted_mae" in vol
+

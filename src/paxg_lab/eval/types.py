@@ -68,6 +68,9 @@ class FoldMetrics:
     relative_mae_to_base: float = 1.0  # A_f
     relative_pinball_to_base: float = 1.0  # Q_f
     composite_loss: float = 1.0  # L_f = 0.70 A_f + 0.30 Q_f
+    reference_valid: bool = True  # False if base error <= tick size
+    insufficient_information: bool = False  # Flag per PLAN for near-zero error folds
+    warning: str | None = None
 
 
 @dataclass(frozen=True)
@@ -91,4 +94,13 @@ class ScoreReport:
     fold_metrics: list[FoldMetrics] = field(default_factory=list)
     test_metrics: FoldMetrics | None = None
     baseline_comparisons: dict[str, Any] = field(default_factory=dict)
+    breakdowns: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def get_fold_metric(self, fold_id: int | str) -> FoldMetrics | None:
+        """Returns the FoldMetrics corresponding to the given fold_id, if present."""
+        for m in self.fold_metrics:
+            if m.fold_id == fold_id:
+                return m
+        return None
+

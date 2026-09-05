@@ -17,6 +17,10 @@ from .metrics import (
     calculate_directional_accuracy,
     compute_fold_metrics,
     compute_score_v1,
+    calculate_low_move_breakdown,
+    calculate_temporal_breakdown,
+    calculate_volatility_breakdown,
+    calculate_sampling_breakdown,
 )
 from .predictor import TimesFM3Predictor
 from .engine import BacktestEngine
@@ -34,6 +38,10 @@ __all__ = [
     "calculate_coverage_80",
     "calculate_mean_width_80",
     "calculate_directional_accuracy",
+    "calculate_low_move_breakdown",
+    "calculate_temporal_breakdown",
+    "calculate_volatility_breakdown",
+    "calculate_sampling_breakdown",
     "compute_fold_metrics",
     "compute_score_v1",
     "TimesFM3Predictor",
