@@ -1,0 +1,49 @@
+{
+  "ingestion": {
+    "klines_1h_saved": 12651,
+    "klines_4h_saved": 3162,
+    "mark_1h_saved": 12651,
+    "mark_4h_saved": 3162,
+    "funding_saved": 3162
+  },
+  "quality_report": {
+    "status": "HEALTHY",
+    "1h": {
+      "candle_count": 12651,
+      "start_time": 1743073200000,
+      "end_time": 1788613200000,
+      "ohlc_valid": true,
+      "gaps_count": 0,
+      "gaps": []
+    },
+    "4h": {
+      "candle_count": 3162,
+      "start_time": 1743076800000,
+      "end_time": 1788595200000,
+      "ohlc_valid": true,
+      "gaps_count": 0,
+      "gaps": []
+    },
+    "cross_validation_4h_vs_1h": {
+      "total_4h_candles": 3162,
+      "fully_covered_by_1h": 3162,
+      "discrepancies": 0,
+      "match_ratio": 1.0,
+      "sample_discrepancies": []
+    }
+  },
+  "snapshots": {
+    "1h": {
+      "snapshot_id": "paxgusdt_1h_1743073200000_1788613200000_837c9ee8",
+      "candles": 12651,
+      "sha256": "837c9ee88b61494ff9512561051092ec53f22e07008b9bea4b6ac16af7dabff0",
+      "path": "var\\paxg_lab\\snapshots\\paxgusdt_1h_1743073200000_1788613200000_837c9ee8"
+    },
+    "4h": {
+      "snapshot_id": "paxgusdt_4h_1743076800000_1788595200000_c9e0adaf",
+      "candles": 3162,
+      "sha256": "c9e0adaf3f392befee47bf516dd1c15d6e9c51add69d6fe8797a6dbca058c748",
+      "path": "var\\paxg_lab\\snapshots\\paxgusdt_4h_1743076800000_1788595200000_c9e0adaf"
+    }
+  }
+}
