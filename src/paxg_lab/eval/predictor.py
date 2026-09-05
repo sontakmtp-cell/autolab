@@ -17,6 +17,8 @@ from ..constants import (
     get_horizon_for_timeframe,
 )
 from ..model.lora import load_lora_adapter
+from ..model.manifest import AdapterManifest
+from ..model.store import AdapterStore
 from .types import ForecastRequest, ForecastResult
 from timesfm3 import TimesFM3Torch
 
@@ -43,15 +45,53 @@ class TimesFM3Predictor:
         self.base_model.to(self.device)
         self.base_model.eval()
 
-        self.adapter_path = Path(adapter_path) if adapter_path else None
+        self.adapter_path: Path | None = None
+        self.manifest: AdapterManifest | None = None
+        self.lora_model = None
         self.model = self.base_model
 
-        if self.adapter_path is not None:
-            logger.info("Loading LoRA adapter from %s...", self.adapter_path)
-            self.lora_model = load_lora_adapter(self.base_model, self.adapter_path)
-            self.lora_model.to(self.device)
-            self.lora_model.eval()
-            self.model = self.lora_model
+        if adapter_path is not None:
+            self.load_adapter(adapter_path)
+
+    def load_adapter(self, adapter_path: str | Path) -> None:
+        """Loads a LoRA adapter, verifying SHA-256 integrity and manifest compatibility."""
+        p = Path(adapter_path)
+        if not p.is_dir():
+            raise FileNotFoundError(f"Adapter path not found: {p}")
+
+        # If an adapter was already active, unload it first to maintain purity
+        if self.lora_model is not None:
+            self.unload_adapter()
+
+        manifest_file = p / "paxg_manifest.json"
+        if manifest_file.exists():
+            logger.info("Loading verified adapter with manifest from %s...", p)
+            store = AdapterStore(base_dir=p.parent)
+            self.lora_model, self.manifest = store.load_adapter(
+                adapter_id_or_path=p,
+                base_model=self.base_model,
+            )
+        else:
+            logger.info("Loading unmanifested adapter from %s...", p)
+            self.lora_model = load_lora_adapter(self.base_model, p)
+            self.manifest = None
+
+        self.adapter_path = p
+        self.lora_model.to(self.device)
+        self.lora_model.eval()
+        self.model = self.lora_model
+
+    def unload_adapter(self) -> None:
+        """Unloads active LoRA adapter and restores clean base model."""
+        if self.lora_model is not None:
+            logger.info("Unloading LoRA adapter and restoring clean base model...")
+            if hasattr(self.lora_model, "unload"):
+                self.base_model = self.lora_model.unload()
+            self.lora_model = None
+            self.adapter_path = None
+            self.manifest = None
+            self.model = self.base_model
+            self.model.eval()
 
     def predict_batch(
         self,
@@ -127,6 +167,23 @@ class TimesFM3Predictor:
         horizon = request.horizon or get_horizon_for_timeframe(request.timeframe)
         step_ms = 3600 * 1000 if request.timeframe == "1h" else 4 * 3600 * 1000
 
+        # Manifest compatibility check if adapter has manifest
+        in_sample_warning = None
+        manifest = getattr(self, "manifest", None)
+        if manifest is not None:
+            manifest.verify_compatibility(
+                expected_timeframe=request.timeframe,
+                expected_horizon=horizon,
+                expected_feature_set=request.feature_set,
+            )
+            # Check in-sample overlap
+            eval_start = forecast_origin_time + step_ms
+            eval_end = forecast_origin_time + horizon * step_ms
+            is_overlap, warning_msg = manifest.check_in_sample_overlap(eval_start, eval_end)
+            if is_overlap:
+                in_sample_warning = warning_msg
+                logger.warning(warning_msg)
+
         # Target future open_times match real future candle timestamps
         target_timestamps = [forecast_origin_time + (i + 1) * step_ms for i in range(horizon)]
 
@@ -137,6 +194,20 @@ class TimesFM3Predictor:
         p_pred = point_preds[0]
         q_pred = quantiles[0]
 
+        meta = {
+            "feature_set": request.feature_set,
+            "context_len": len(context_features),
+            "horizon": horizon,
+            "device": str(self.device),
+            "is_lora": self.adapter_path is not None,
+        }
+        if manifest is not None:
+            meta["adapter_id"] = manifest.adapter_id
+            meta["adapter_best_epoch"] = manifest.best_epoch
+            meta["adapter_best_val_loss"] = manifest.best_val_loss
+        if in_sample_warning is not None:
+            meta["in_sample_warning"] = in_sample_warning
+
         return ForecastResult(
             symbol=request.symbol,
             timeframe=request.timeframe,
@@ -146,11 +217,5 @@ class TimesFM3Predictor:
             quantiles=q_pred,
             uncertainty_lower=q_pred[:, 0],   # q10
             uncertainty_upper=q_pred[:, -1],  # q90
-            metadata={
-                "feature_set": request.feature_set,
-                "context_len": len(context_features),
-                "horizon": horizon,
-                "device": str(self.device),
-                "is_lora": self.adapter_path is not None,
-            },
+            metadata=meta,
         )

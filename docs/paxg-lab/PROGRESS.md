@@ -11,7 +11,7 @@ Tài liệu này theo dõi tiến độ thực hiện 8 giai đoạn (P0 đến 
 | **P0** | Tài liệu, môi trường riêng và chứng minh LoRA 3.0 trên RTX 5060 Ti | **HOÀN THÀNH** | [docs/paxg-lab/phases/P0.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P0.md) |
 | **P1** | Kho dữ liệu Binance PAXGUSDT Futures, đặc trưng A/B/C và phân chia không rò rỉ | **HOÀN THÀNH** | [docs/paxg-lab/phases/P1.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P1.md) |
 | **P2** | Base TimesFM 3.0, dự đoán 24/6 bước, backtest và Score v1 | **HOÀN THÀNH** | [docs/paxg-lab/phases/P2.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P2.md) |
-| **P3** | Huấn luyện thủ công LoRA, checkpoint tốt nhất và kho adapter | Chưa bắt đầu | [docs/paxg-lab/phases/P3.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P3.md) |
+| **P3** | Huấn luyện thủ công LoRA, checkpoint tốt nhất và kho adapter | **HOÀN THÀNH** | [docs/paxg-lab/phases/P3.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P3.md) |
 | **P4** | Hàng đợi GPU một tiến trình, dừng, heartbeat, phục hồi | Chưa bắt đầu | [docs/paxg-lab/phases/P4.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P4.md) |
 | **P5** | Giao diện Streamlit tiếng Việt đủ 5 thẻ, biểu đồ và điều khiển | Chưa bắt đầu | [docs/paxg-lab/phases/P5.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P5.md) |
 | **P6** | Tự động tối ưu Optuna TPE, kiểm chứng kín, công nhận LoRA thắng | Chưa bắt đầu | [docs/paxg-lab/phases/P6.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P6.md) |
@@ -19,7 +19,7 @@ Tài liệu này theo dõi tiến độ thực hiện 8 giai đoạn (P0 đến 
 
 ---
 
-## 2. Quyết định kỹ thuật đã chốt tại P0, P1 và P2
+## 2. Quyết định kỹ thuật đã chốt tại P0, P1, P2 và P3
 
 ### Tại P0:
 1. **Quy ước Horizon bắt buộc:**
@@ -83,15 +83,38 @@ Tài liệu này theo dõi tiến độ thực hiện 8 giai đoạn (P0 đến 
    - Cung cấp API riêng biệt `run_locked_verification()` dành riêng cho ứng viên chiến thắng cuối cùng.
    - Kiểm tra tương thích chặt chẽ `ForecastRequest.adapter_path` với `TimesFM3Predictor.adapter_path`.
    - Bổ sung đầy đủ các breakdown phân tích theo PLAN: biến động < 2 tick, ngày thường vs cuối tuần, nhóm biến động thấp/cao, 87 khối dự báo độc lập 24h.
-5. **Kiểm thử tự động:**
-   - **81 tests collected: 81 passed trên workstation (79 passed + 2 integration skipped trên clean CI runner)** (`pytest tests/paxg_lab/ src/timesfm3/`), bổ sung 6 regression tests kiểm soát Score candidate, fail-fast và bảo vệ locked test.
+
+### Tại P3:
+1. **Huấn luyện LoRA thủ công & Khóa Horizon:**
+   - Lớp cấu hình `TrainSpec` xác thực và khóa cứng bắt buộc: `1h` $\rightarrow$ `horizon = 24`, `4h` $\rightarrow$ `horizon = 6`. Từ chối mọi cấu hình sai cặp hoặc ngoài dải cho phép.
+   - Hàm loss kết hợp `combined_forecast_loss` trong `float32`: bằng trung bình sai số tuyệt đối của trung vị ($q_{50}$) cộng Pinball loss 9 phân vị, chuẩn hóa chia theo giá cuối ngữ cảnh $p_0$.
+   - Vòng huấn luyện `LoRATrainer` hỗ trợ đầy đủ tham số: rank (4), alpha (8), dropout (0.10), lr (5e-5), batch size (2), gradient accumulation (8, effective=16), linear warmup và gradient clipping (1.0).
+   - Cơ chế dừng sớm (early stopping) giám sát trên đoạn dừng sớm 14 ngày, tự động chụp snapshot trọng số tốt nhất (`best_checkpoint`) và khôi phục vào mô hình khi hoàn tất.
+2. **Khắc phục triệt để bẫy Autograd Sqrt:**
+   - Cố định hàm `update_running_stats` (`src/timesfm3/util.py`) và `linear_detrending` (`src/timesfm3/model.py`) bằng cách kẹp `torch.clamp_min(var, 1e-8)` trước các lệnh `torch.sqrt()`. Triệt tiêu hoàn toàn lỗi `SqrtBackward0 returned nan` do đạo hàm vô hạn tại 0.
+3. **Kho Adapter nguyên tử & Kháng gián đoạn:**
+   - `AdapterStore`: Lưu theo cơ chế nguyên tử 5 bước: `.tmp_{id}` $\rightarrow$ tính SHA-256 các file $\rightarrow$ ghi manifest $\rightarrow$ smoke test forward pass $\rightarrow$ đổi tên nguyên tử (`os.replace`) thành `{adapter_id}`.
+   - Tiến trình bị ngắt đột ngột giữa lúc ghi không bao giờ làm hỏng các adapter cũ; cung cấp cơ chế `cleanup_stale_temp_dirs` dọn sạch thư mục rác an toàn.
+4. **Manifest provenance & Kiểm tra tương thích nghiêm ngặt:**
+   - `AdapterManifest` lưu cấu hình LoRA, phạm vi thời gian huấn luyện, snapshot hash, checkpoint tốt nhất, và bảng mã băm SHA-256 cho từng tệp.
+   - Từ chối nạp nếu sai mã băm (tamper detection), sai horizon, sai khung thời gian, sai ngữ cảnh hoặc sai revision base.
+   - `check_in_sample_overlap`: Nhận diện và phát ra cảnh báo rõ ràng `IN-SAMPLE OVERLAP DETECTED` kèm số giờ chồng lấn nếu phạm vi đánh giá giao cắt với tập dữ liệu huấn luyện.
+5. **Bảo toàn Base Model Invariant:**
+   - Kiểm thử `test_base_restoration_invariant`: Chuỗi chuyển đổi $\text{Base} \rightarrow \text{Adapter A} \rightarrow \text{Adapter B} \rightarrow \text{Base}$ cho đầu ra trùng khớp tuyệt đối ($|F_0 - F_0'| = 0.00e+00$), các tensor trọng số gốc khớp từng bit, sạch 100% các khóa LoRA.
+6. **Bằng chứng thực nghiệm trên RTX 5060 Ti:**
+   - Kịch bản `scripts/run_p3_training.py` đã huấn luyện thành công 2 adapter thực tế:
+     - 1h (`horizon = 24`): `paxg_1h_r4_setB_seed42_20260905_164330` (`val_loss = 0.011693`, 89.9s).
+     - 4h (`horizon = 6`): `paxg_4h_r4_setB_seed42_20260905_164447` (`val_loss = 0.012624`, 71.2s).
+   - Toàn bộ bằng chứng được lưu tại `docs/paxg-lab/phases/p3_lora_proof.json`.
+7. **Kiểm thử tự động:**
+   - **90 tests collected: 90 passed** (`pytest tests/paxg_lab/ src/timesfm3/ -v`), 100% pass rate.
 
 ---
 
-## 3. Lệnh tiếp tục cho giai đoạn tiếp theo (P3)
+## 3. Lệnh tiếp tục cho giai đoạn tiếp theo (P4)
 
-Sau khi nghiệm thu P2, chuyển sang P3 bằng lệnh:
+Sau khi nghiệm thu P3, chuyển sang P4 bằng lệnh:
 
 ```text
-/goal Đọc bộ tài liệu docs/paxg-lab và thực hiện P3: huấn luyện thủ công LoRA cho TimesFM 3.0 trên RTX 5060 Ti, 24 nến cho 1h và 6 nến cho 4h, cùng nhìn trước 24 giờ. Thêm lưu checkpoint tốt nhất theo validation, kho adapter và manifest. Kiểm tra chống nhìn trước, không sửa base và tái lập được; chỉ hoàn thành P3.
+/goal Đọc bộ tài liệu docs/paxg-lab và thực hiện P4: xây dựng hàng đợi một tiến trình GPU, quản lý công việc (Queued, Running, Succeeded, Failed, Cancelled, Interrupted), cơ chế heartbeat phát hiện treo/tiến trình chết, dừng an toàn và phục hồi sau sự cố. Kiểm thử ngắt đột ngột, khóa luân phiên 1h/4h và tôn trọng quyền ưu tiên dự đoán; chỉ hoàn thành P4.
 ```

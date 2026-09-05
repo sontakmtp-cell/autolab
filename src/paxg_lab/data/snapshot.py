@@ -73,6 +73,18 @@ class DatasetSnapshot:
         else:
             raise ValueError(f"Unknown feature set '{feature_set}'.")
 
+    def to_dataframe(self, feature_set: str = "B") -> Any:
+        """Converts snapshot feature matrix and timestamps into a pandas DataFrame."""
+        import pandas as pd
+        from .features import FEATURE_SPECS
+
+        f_set = feature_set.upper().strip()
+        matrix = self.get_feature_matrix(f_set)
+        columns = list(FEATURE_SPECS[f_set].columns)
+        df = pd.DataFrame(matrix, columns=columns)
+        df.insert(0, "open_time", self.timestamps)
+        return df
+
     @classmethod
     def create(
         cls,

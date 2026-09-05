@@ -134,28 +134,35 @@ def update_running_stats(
   inc_var = torch.where(
     inc_n == 0,
     torch.zeros_like(inc_sum),
-    x_diff_sq.sum(dim=-1) / inc_n,
+    x_diff_sq.sum(dim=-1) / torch.clamp_min(inc_n, 1.0),
   )
-  inc_sigma = torch.sqrt(inc_var)
+  inc_sigma = torch.where(
+    inc_n == 0,
+    torch.zeros_like(inc_sum),
+    torch.sqrt(torch.clamp_min(inc_var, 1e-8)),
+  )
 
   new_n = n + inc_n
   new_mu = torch.where(
     new_n == 0,
     torch.zeros_like(mu),
-    (n * mu + inc_mu * inc_n) / new_n,
+    (n * mu + inc_mu * inc_n) / torch.clamp_min(new_n, 1.0),
   )
-  new_sigma = torch.sqrt(
-    torch.where(
-      new_n == 0,
-      torch.zeros_like(sigma),
-      (
-        n * sigma * sigma
-        + inc_n * inc_sigma * inc_sigma
-        + n * (mu - new_mu) * (mu - new_mu)
-        + inc_n * (inc_mu - new_mu) * (inc_mu - new_mu)
-      )
-      / new_n,
+  new_var = torch.where(
+    new_n == 0,
+    torch.zeros_like(sigma),
+    (
+      n * sigma * sigma
+      + inc_n * inc_sigma * inc_sigma
+      + n * (mu - new_mu) * (mu - new_mu)
+      + inc_n * (inc_mu - new_mu) * (inc_mu - new_mu)
     )
+    / torch.clamp_min(new_n, 1.0),
+  )
+  new_sigma = torch.where(
+    new_n == 0,
+    torch.zeros_like(sigma),
+    torch.sqrt(torch.clamp_min(new_var, 1e-8)),
   )
   return new_n, new_mu, new_sigma
 
