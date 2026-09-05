@@ -239,6 +239,8 @@ def test_extract_windows_no_future_leakage():
     n_pts = 500
     features = np.arange(n_pts, dtype=np.float32).reshape(-1, 1)
     targets = np.arange(n_pts, dtype=np.float32)
+    step_ms = 3600 * 1000
+    ts = np.array([1743073200000 + i * step_ms for i in range(n_pts)], dtype=np.int64)
 
     context_len = 32
     horizon = 24
@@ -252,6 +254,8 @@ def test_extract_windows_no_future_leakage():
         horizon=horizon,
         start_idx=start_idx,
         end_idx=end_idx,
+        timestamps=ts,
+        timeframe="1h",
     )
 
     assert len(ctx_w) == len(fut_w) == len(origins)
@@ -267,6 +271,8 @@ def test_extract_windows_start_idx_boundary():
     n_pts = 500
     features = np.arange(n_pts, dtype=np.float32).reshape(-1, 1)
     targets = np.arange(n_pts, dtype=np.float32)
+    step_ms = 3600 * 1000
+    ts = np.array([1743073200000 + i * step_ms for i in range(n_pts)], dtype=np.int64)
 
     context_len = 32
     horizon = 24
@@ -280,6 +286,8 @@ def test_extract_windows_start_idx_boundary():
         horizon=horizon,
         start_idx=start_idx,
         end_idx=end_idx,
+        timestamps=ts,
+        timeframe="1h",
     )
 
     assert len(ctx_w) == len(fut_w) == len(origins)
@@ -292,6 +300,36 @@ def test_extract_windows_start_idx_boundary():
         assert orig + horizon < end_idx, f"origin + horizon ({orig + horizon}) must be < end_idx ({end_idx})"
         assert fut[-1] < end_idx
         assert len(fut) == horizon
+
+
+def test_extract_windows_requires_timestamps_and_interval():
+    n_pts = 100
+    features = np.arange(n_pts, dtype=np.float32).reshape(-1, 1)
+    targets = np.arange(n_pts, dtype=np.float32)
+
+    # Calling without timestamps must raise ValueError (cannot bypass gap protection)
+    with pytest.raises(ValueError, match="extract_windows requires 'timestamps'"):
+        extract_windows(
+            features=features,
+            targets=targets,
+            context_len=20,
+            horizon=10,
+            start_idx=0,
+            end_idx=100,
+        )
+
+    # Calling without timeframe/interval must raise ValueError
+    ts = np.arange(n_pts, dtype=np.int64) * 3600000
+    with pytest.raises(ValueError, match="extract_windows requires either 'timeframe'"):
+        extract_windows(
+            features=features,
+            targets=targets,
+            context_len=20,
+            horizon=10,
+            start_idx=0,
+            end_idx=100,
+            timestamps=ts,
+        )
 
 
 def test_extract_windows_gap_rejection():

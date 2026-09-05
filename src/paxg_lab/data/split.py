@@ -155,28 +155,36 @@ def extract_windows(
             [],
         )
 
-    # Resolve expected timestamp interval if timestamps provided
-    ts_array: np.ndarray | None = None
-    step_ms: int | None = None
+    # Mandatory timestamp validation for gap protection
+    if timestamps is None:
+        raise ValueError(
+            "extract_windows requires 'timestamps' to enforce mandatory timestamp gap protection. "
+            "Cannot extract windows without timestamp continuity validation."
+        )
+
+    if timeframe is None and expected_interval_ms is None:
+        raise ValueError(
+            "extract_windows requires either 'timeframe' ('1h', '4h') or 'expected_interval_ms' "
+            "to validate interval continuity."
+        )
+
+    if expected_interval_ms is not None:
+        step_ms = expected_interval_ms
+    elif timeframe == "1h":
+        step_ms = 3600 * 1000
+    elif timeframe == "4h":
+        step_ms = 4 * 3600 * 1000
+    else:
+        raise ValueError(f"Unsupported timeframe '{timeframe}'. Expected '1h' or '4h'.")
+
+    ts_array = np.asarray(timestamps, dtype=np.int64)
+    if len(ts_array) != total_len:
+        raise ValueError(f"timestamps length ({len(ts_array)}) must match features length ({total_len})")
+
     bad_gap_indices: np.ndarray | None = None
-
-    if timestamps is not None:
-        ts_array = np.asarray(timestamps, dtype=np.int64)
-        if len(ts_array) != total_len:
-            raise ValueError(f"timestamps length ({len(ts_array)}) must match features length ({total_len})")
-
-        if expected_interval_ms is not None:
-            step_ms = expected_interval_ms
-        elif timeframe == "1h":
-            step_ms = 3600 * 1000
-        elif timeframe == "4h":
-            step_ms = 4 * 3600 * 1000
-        elif len(ts_array) > 1:
-            step_ms = int(np.median(np.diff(ts_array)))
-
-        if step_ms is not None and len(ts_array) > 1:
-            diffs = np.diff(ts_array)
-            bad_gap_indices = np.where(diffs != step_ms)[0]
+    if len(ts_array) > 1:
+        diffs = np.diff(ts_array)
+        bad_gap_indices = np.where(diffs != step_ms)[0]
 
     contexts = []
     futures = []
