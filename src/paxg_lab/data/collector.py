@@ -98,10 +98,11 @@ class MarketDataCollector:
         server_time = self.client.get_server_time()
         sym_info = self.client.get_symbol_info(symbol)
         onboard_date = int(sym_info.get("onboardDate", 1743071400000))
-
-        start_time = onboard_date
-        total_saved = 0
         step_ms = 3600 * 1000 if interval == "1h" else 4 * 3600 * 1000
+
+        latest_saved = None if force_from_start else self.storage.get_latest_mark_kline_time(symbol, interval)
+        start_time = (latest_saved + step_ms) if latest_saved is not None else onboard_date
+        total_saved = 0
 
         cur_start = start_time
         while cur_start < server_time:
@@ -133,14 +134,20 @@ class MarketDataCollector:
 
         return total_saved
 
-    def sync_funding_rates(self, symbol: str = SYMBOL) -> int:
-        """Fetches all funding rate history."""
+    def sync_funding_rates(
+        self,
+        symbol: str = SYMBOL,
+        force_from_start: bool = False,
+    ) -> int:
+        """Fetches all missing funding rate history and writes to SQLite."""
         server_time = self.client.get_server_time()
         sym_info = self.client.get_symbol_info(symbol)
         onboard_date = int(sym_info.get("onboardDate", 1743071400000))
 
+        latest_saved = None if force_from_start else self.storage.get_latest_funding_time(symbol)
+        cur_start = (latest_saved + 1) if latest_saved is not None else onboard_date
         total_saved = 0
-        cur_start = onboard_date
+
         while cur_start < server_time:
             batch = self.client.fetch_funding_rates(
                 symbol=symbol,
@@ -187,6 +194,7 @@ class MarketDataCollector:
 
         # 5. Run Quality Audit
         quality_report = generate_data_quality_report(df_1h, df_4h)
+        self.storage.save_quality_report(quality_report, timeframe="1h+4h")
 
         # 6. Build Feature Sets and Snapshots for 1h
         feat_a_1h, _, ts_1h = build_features(df_1h, feature_set="A")

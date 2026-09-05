@@ -46,18 +46,22 @@ Tài liệu này theo dõi tiến độ thực hiện 8 giai đoạn (P0 đến 
 3. **Ba bộ đặc trưng A/B/C:**
    - Bộ A (1 biến): `close`.
    - Bộ B (9 biến): Bộ A + `log1p(quote_volume)` + `log(high/low)` + `ret_oc` + `taker_buy_ratio` + cyclical sin/cos giờ/thứ.
-   - Bộ C (11 biến): Bộ B + `mark_close_basis` + `realized_funding_rate`. Ghép funding theo thời điểm công bố (`funding_time <= open_time`), không rò rỉ tương lai.
-4. **Snapshot bất biến:**
+   - Bộ C (11 biến): Bộ B + `mark_close_basis` + `realized_funding_rate`. Ghép funding theo thời điểm công bố (`funding_time <= open_time`), không rò rỉ tương lai. Nếu thiếu mark price, báo lỗi rõ ràng và không tự bù bằng trade close.
+4. **Snapshot bất biến & Báo cáo chất lượng:**
    - Đóng gói dữ liệu thành snapshot `.npz` kèm mã băm SHA-256:
      - 1h: `paxgusdt_1h_1743073200000_1788613200000_837c9ee8` (SHA-256: `837c9ee88b...`)
      - 4h: `paxgusdt_4h_1743076800000_1788595200000_c9e0adaf` (SHA-256: `c9e0adaf3f...`)
-5. **Phân chia chuỗi thời gian (SplitSpec):**
+   - Lưu trữ bền vững báo cáo kiểm tra chất lượng dữ liệu vào SQLite table `data_quality_reports`.
+   - Hỗ trợ đồng bộ dữ liệu gia tăng (incremental sync) cho cả klines, mark klines và funding rates.
+5. **Phân chia chuỗi thời gian (SplitSpec) & Trích xuất cửa sổ:**
+   - `extract_windows()`: Tôn trọng tuyệt đối ranh giới `[start_idx, end_idx)`. Target đầu tiên thỏa mãn $origin + 1 \ge start\_idx$, toàn bộ horizon nằm gọn trong $[start\_idx, end\_idx)$. Tự động loại bỏ bất kỳ cửa sổ nào chứa khoảng thiếu (gap) timestamp.
    - 90 ngày cuối: Kiểm chứng khóa kín (Test).
    - 90 ngày trước đó: 3 đoạn đánh giá ngoài mẫu (Eval folds, 30 ngày/fold).
    - Trước mỗi đoạn đánh giá: Tập huấn luyện (Train), 14 ngày cuối cho dừng sớm (Early Stopping).
    - Khoảng chống chồng lấn nhãn (Purge buffer): 24 nến cho 1h, 6 nến cho 4h.
 6. **Kiểm thử tự động:**
-   - Toàn bộ 62/62 tests vượt qua 100% (`pytest tests/paxg_lab/ src/timesfm3/`).
+   - Toàn bộ 66/66 tests vượt qua 100% (`pytest tests/paxg_lab/ src/timesfm3/`).
+
 
 ---
 

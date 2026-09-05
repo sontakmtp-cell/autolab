@@ -111,17 +111,29 @@ def extract_windows(
     start_idx: int,
     end_idx: int,
     step: int = 1,
+    timestamps: np.ndarray | list[int] | None = None,
+    timeframe: str | None = None,
+    expected_interval_ms: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[int]]:
     """Extracts sliding context and future target windows strictly within [start_idx, end_idx].
+
+    Requirements:
+      - First target index must be within required range: origin + 1 >= start_idx.
+      - Entire target horizon must lie strictly in [start_idx, end_idx).
+      - Context is allowed to look back before start_idx if historical data exists.
+      - If timestamps are provided, any window containing a timestamp gap is rejected.
 
     Args:
         features: (N, num_features) array.
         targets: (N,) or (N, 1) target array (close prices).
         context_len: Context length (e.g. 128, 256).
         horizon: Horizon length (24 for 1h, 6 for 4h).
-        start_idx: Window start bound (context can look back before start_idx if known).
+        start_idx: Window start bound (target starts >= start_idx).
         end_idx: Strict upper bound: target future MUST NOT exceed end_idx.
         step: Stride for sliding window.
+        timestamps: Optional 1D array of open_time timestamps.
+        timeframe: Optional timeframe string ("1h", "4h") to determine expected step.
+        expected_interval_ms: Optional explicit step in ms.
 
     Returns:
         Tuple of (context_windows, future_windows, forecast_origin_indices).
@@ -129,20 +141,60 @@ def extract_windows(
     targets_1d = np.squeeze(targets)
     total_len = len(features)
 
+    # Origin is the index of the last context point
+    # First target point is at origin + 1 (must be >= start_idx)
+    # Last target point is at origin + horizon (must be < end_idx, i.e. <= end_idx - 1)
+    # Context requires context_len points: origin - context_len + 1 >= 0
+    min_origin = max(context_len - 1, start_idx - 1)
+    max_origin = end_idx - horizon - 1
+
+    if min_origin > max_origin or total_len < context_len + horizon:
+        return (
+            np.empty((0, context_len, features.shape[-1]), dtype=features.dtype),
+            np.empty((0, horizon), dtype=targets_1d.dtype),
+            [],
+        )
+
+    # Resolve expected timestamp interval if timestamps provided
+    ts_array: np.ndarray | None = None
+    step_ms: int | None = None
+    bad_gap_indices: np.ndarray | None = None
+
+    if timestamps is not None:
+        ts_array = np.asarray(timestamps, dtype=np.int64)
+        if len(ts_array) != total_len:
+            raise ValueError(f"timestamps length ({len(ts_array)}) must match features length ({total_len})")
+
+        if expected_interval_ms is not None:
+            step_ms = expected_interval_ms
+        elif timeframe == "1h":
+            step_ms = 3600 * 1000
+        elif timeframe == "4h":
+            step_ms = 4 * 3600 * 1000
+        elif len(ts_array) > 1:
+            step_ms = int(np.median(np.diff(ts_array)))
+
+        if step_ms is not None and len(ts_array) > 1:
+            diffs = np.diff(ts_array)
+            bad_gap_indices = np.where(diffs != step_ms)[0]
+
     contexts = []
     futures = []
     origins = []
 
-    # origin is the index of the last context point
-    # target spans [origin + 1, origin + 1 + horizon]
-    # condition: origin + 1 + horizon <= end_idx
-    # and origin - context_len + 1 >= max(0, start_idx - context_len)
-    min_origin = context_len - 1
-    max_origin = end_idx - horizon - 1
-
     for origin in range(min_origin, max_origin + 1, step):
-        ctx_slice = features[origin - context_len + 1 : origin + 1]
-        fut_slice = targets_1d[origin + 1 : origin + 1 + horizon]
+        w_start = origin - context_len + 1
+        w_end = origin + 1 + horizon
+
+        # Check timestamp continuity across full window (context + horizon)
+        if ts_array is not None and step_ms is not None and bad_gap_indices is not None and len(bad_gap_indices) > 0:
+            # Check if any gap transition falls within [w_start, w_end - 1)
+            idx = np.searchsorted(bad_gap_indices, w_start)
+            if idx < len(bad_gap_indices) and bad_gap_indices[idx] < w_end - 1:
+                continue
+
+        ctx_slice = features[w_start : origin + 1]
+        fut_slice = targets_1d[origin + 1 : w_end]
 
         if len(ctx_slice) == context_len and len(fut_slice) == horizon:
             contexts.append(ctx_slice)

@@ -142,8 +142,12 @@ def build_features(
         mark_clean["mark_close"] = mark_clean["mark_close"].astype(np.float64)
 
         df = pd.merge(df, mark_clean, on="open_time", how="left")
-        # If any missing mark close, fill with regular close
-        df["mark_close"] = df["mark_close"].fillna(df["close"])
+        missing_marks = int(df["mark_close"].isna().sum())
+        if missing_marks > 0:
+            raise ValueError(
+                f"Feature Set C unavailable: missing mark price data for {missing_marks} candle(s). "
+                f"Cannot impute missing mark price with trade close."
+            )
         df["mark_close_basis"] = (df["mark_close"] - df["close"]) / np.maximum(df["close"], 1e-8)
 
         # Merge funding rate strictly using backward asof: fundingTime <= open_time (no lookahead)

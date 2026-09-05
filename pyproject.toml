@@ -47,4 +47,10 @@ where = ["src"]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests as integration tests requiring local data or external services",
+]
+
+
 

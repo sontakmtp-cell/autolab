@@ -162,7 +162,7 @@ class MarketDataStorage:
         rows = []
         for k in raw_mark_klines:
             open_time = int(k[0])
-            close_time = int(k[6])
+            close_time = int(k[6]) if len(k) > 6 else int(k[-1])
 
             if server_time is not None and close_time > server_time:
                 continue
@@ -239,6 +239,34 @@ class MarketDataStorage:
             cur = conn.execute(
                 "SELECT MIN(open_time) FROM klines WHERE symbol = ? AND interval = ? AND source = ?;",
                 (symbol, interval, source)
+            )
+            row = cur.fetchone()
+            return row[0] if row and row[0] is not None else None
+
+    def get_latest_mark_kline_time(
+        self,
+        symbol: str = "PAXGUSDT",
+        interval: str = "1h",
+        source: str = "binance",
+    ) -> int | None:
+        """Returns the maximum open_time recorded for mark klines."""
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                "SELECT MAX(open_time) FROM mark_klines WHERE symbol = ? AND interval = ? AND source = ?;",
+                (symbol, interval, source),
+            )
+            row = cur.fetchone()
+            return row[0] if row and row[0] is not None else None
+
+    def get_latest_funding_time(
+        self,
+        symbol: str = "PAXGUSDT",
+    ) -> int | None:
+        """Returns the maximum funding_time recorded for funding rates."""
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                "SELECT MAX(funding_time) FROM funding_rates WHERE symbol = ?;",
+                (symbol,),
             )
             row = cur.fetchone()
             return row[0] if row and row[0] is not None else None
@@ -321,3 +349,95 @@ class MarketDataStorage:
             df = pd.read_sql_query(sql, conn, params=params)
 
         return df
+
+    def save_quality_report(
+        self,
+        report: dict[str, Any],
+        timeframe: str = "1h+4h",
+        created_at: str | None = None,
+    ) -> int:
+        """Saves a data quality audit report to SQLite."""
+        import datetime
+
+        if created_at is None:
+            created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        total_candles = 0
+        gaps_count = 0
+        for tf_key in ("1h", "4h"):
+            if tf_key in report and isinstance(report[tf_key], dict):
+                total_candles += int(report[tf_key].get("candle_count", 0))
+                gaps_count += int(report[tf_key].get("gaps_count", 0))
+
+        anomalies_count = 0
+        if "cross_validation_4h_vs_1h" in report:
+            anomalies_count += int(report["cross_validation_4h_vs_1h"].get("discrepancies", 0))
+
+        report_json = json.dumps(report, default=str)
+
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO data_quality_reports (
+                    created_at, timeframe, total_candles, gaps_count, anomalies_count, report_json
+                ) VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (created_at, timeframe, total_candles, gaps_count, anomalies_count, report_json),
+            )
+            return cur.lastrowid or 0
+
+    def load_latest_quality_report(
+        self,
+        timeframe: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Loads the most recently persisted quality report."""
+        query = "SELECT id, created_at, timeframe, total_candles, gaps_count, anomalies_count, report_json FROM data_quality_reports"
+        params: list[Any] = []
+        if timeframe is not None:
+            query += " WHERE timeframe = ?"
+            params.append(timeframe)
+        query += " ORDER BY id DESC LIMIT 1;"
+
+        with self.get_connection() as conn:
+            cur = conn.execute(query, params)
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "id": row[0],
+                "created_at": row[1],
+                "timeframe": row[2],
+                "total_candles": row[3],
+                "gaps_count": row[4],
+                "anomalies_count": row[5],
+                "report": json.loads(row[6]),
+            }
+
+    def load_quality_reports(
+        self,
+        timeframe: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Loads all persisted quality reports."""
+        query = "SELECT id, created_at, timeframe, total_candles, gaps_count, anomalies_count, report_json FROM data_quality_reports"
+        params: list[Any] = []
+        if timeframe is not None:
+            query += " WHERE timeframe = ?"
+            params.append(timeframe)
+        query += " ORDER BY id ASC;"
+
+        with self.get_connection() as conn:
+            cur = conn.execute(query, params)
+            rows = cur.fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "created_at": r[1],
+                    "timeframe": r[2],
+                    "total_candles": r[3],
+                    "gaps_count": r[4],
+                    "anomalies_count": r[5],
+                    "report": json.loads(r[6]),
+                }
+                for r in rows
+            ]
+

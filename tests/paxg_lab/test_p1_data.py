@@ -9,7 +9,7 @@ from paxg_lab.constants import TIMEFRAME_HORIZONS
 from paxg_lab.data.features import build_features, FEATURE_SPECS
 from paxg_lab.data.snapshot import DatasetSnapshot, SNAPSHOTS_DIR
 from paxg_lab.data.split import calculate_split_plan, extract_windows
-from paxg_lab.data.storage import MarketDataStorage
+from paxg_lab.data.storage import MarketDataStorage, DEFAULT_DB_PATH
 from paxg_lab.data.validator import (
     validate_ohlc_integrity,
     detect_time_gaps,
@@ -166,6 +166,26 @@ def test_feature_sets_construction(sample_1h_klines):
     assert np.isfinite(feat_c).all()
 
 
+def test_feature_set_c_missing_mark_raises_error(sample_1h_klines):
+    # Missing mark candles must raise ValueError instead of silently imputing trade close
+    df_mark_missing = sample_1h_klines[["open_time", "close"]].iloc[:-5].copy()
+    funding_times = [sample_1h_klines.iloc[0]["open_time"] + i * 8 * 3600 * 1000 for i in range(15)]
+    df_funding = pd.DataFrame({
+        "symbol": "PAXGUSDT",
+        "funding_time": funding_times,
+        "funding_rate": [0.0001] * len(funding_times),
+        "mark_price": [2500.0] * len(funding_times),
+    })
+
+    with pytest.raises(ValueError, match="Feature Set C unavailable: missing mark price data"):
+        build_features(
+            sample_1h_klines,
+            df_mark=df_mark_missing,
+            df_funding=df_funding,
+            feature_set="C",
+        )
+
+
 def test_snapshot_creation_and_integrity(sample_1h_klines, tmp_path):
     feat_a, _, ts = build_features(sample_1h_klines, feature_set="A")
     feat_b, _, _ = build_features(sample_1h_klines, feature_set="B")
@@ -243,8 +263,125 @@ def test_extract_windows_no_future_leakage():
         assert len(fut) == horizon
 
 
+def test_extract_windows_start_idx_boundary():
+    n_pts = 500
+    features = np.arange(n_pts, dtype=np.float32).reshape(-1, 1)
+    targets = np.arange(n_pts, dtype=np.float32)
+
+    context_len = 32
+    horizon = 24
+    start_idx = 100
+    end_idx = 200
+
+    ctx_w, fut_w, origins = extract_windows(
+        features=features,
+        targets=targets,
+        context_len=context_len,
+        horizon=horizon,
+        start_idx=start_idx,
+        end_idx=end_idx,
+    )
+
+    assert len(ctx_w) == len(fut_w) == len(origins)
+    assert len(ctx_w) > 0
+
+    for fut, orig in zip(fut_w, origins):
+        # Target must be strictly inside [start_idx, end_idx)
+        assert orig + 1 >= start_idx, f"origin + 1 ({orig + 1}) must be >= start_idx ({start_idx})"
+        assert fut[0] >= start_idx
+        assert orig + horizon < end_idx, f"origin + horizon ({orig + horizon}) must be < end_idx ({end_idx})"
+        assert fut[-1] < end_idx
+        assert len(fut) == horizon
+
+
+def test_extract_windows_gap_rejection():
+    n_pts = 200
+    step_ms = 3600 * 1000
+    start_time = 1743073200000
+    ts = np.array([start_time + i * step_ms for i in range(n_pts)], dtype=np.int64)
+
+    # Introduce a gap at index 100: make ts[100] jump by 5 hours
+    ts_with_gap = ts.copy()
+    ts_with_gap[100:] += 5 * step_ms
+
+    features = np.arange(n_pts, dtype=np.float32).reshape(-1, 1)
+    targets = np.arange(n_pts, dtype=np.float32)
+
+    context_len = 20
+    horizon = 10
+
+    ctx_w, fut_w, origins = extract_windows(
+        features=features,
+        targets=targets,
+        context_len=context_len,
+        horizon=horizon,
+        start_idx=0,
+        end_idx=n_pts,
+        timestamps=ts_with_gap,
+        expected_interval_ms=step_ms,
+    )
+
+    assert len(ctx_w) > 0
+
+    # No extracted window must cross the gap transition between index 99 and 100
+    for orig in origins:
+        w_start = orig - context_len + 1
+        w_end = orig + horizon
+        assert not (w_start <= 99 < w_end), f"Window at origin {orig} encompasses the gap transition!"
+
+
+def test_market_data_storage_unit(tmp_path):
+    db_file = tmp_path / "test_storage.db"
+    storage = MarketDataStorage(db_file)
+
+    # Test empty queries
+    assert storage.get_latest_kline_time("PAXGUSDT", "1h") is None
+    assert storage.get_latest_mark_kline_time("PAXGUSDT", "1h") is None
+    assert storage.get_latest_funding_time("PAXGUSDT") is None
+    assert storage.load_latest_quality_report() is None
+
+    # Test saving klines
+    kline_row = [[1743073200000, "2500", "2510", "2490", "2505", "10", 1743076799999, "25000", 5, "5", "12500", "0"]]
+    inserted = storage.save_klines(kline_row, symbol="PAXGUSDT", interval="1h")
+    assert inserted == 1
+    assert storage.get_latest_kline_time("PAXGUSDT", "1h") == 1743073200000
+
+    # Test saving mark klines
+    mark_row = [[1743073200000, "2501", "2511", "2491", "2506", "0", 1743076799999]]
+    inserted_mark = storage.save_mark_klines(mark_row, symbol="PAXGUSDT", interval="1h")
+    assert inserted_mark == 1
+    assert storage.get_latest_mark_kline_time("PAXGUSDT", "1h") == 1743073200000
+
+    # Test saving funding rates
+    funding_data = [{"symbol": "PAXGUSDT", "fundingTime": 1743073200000, "fundingRate": "0.0001", "markPrice": "2501"}]
+    inserted_funding = storage.save_funding_rates(funding_data, symbol="PAXGUSDT")
+    assert inserted_funding == 1
+    assert storage.get_latest_funding_time("PAXGUSDT") == 1743073200000
+
+    # Test saving and reading data quality report
+    sample_report = {
+        "status": "HEALTHY",
+        "1h": {"candle_count": 100, "gaps_count": 0},
+        "4h": {"candle_count": 25, "gaps_count": 0},
+        "cross_validation_4h_vs_1h": {"discrepancies": 0},
+    }
+    report_id = storage.save_quality_report(sample_report, timeframe="1h+4h")
+    assert report_id > 0
+
+    latest_rep = storage.load_latest_quality_report()
+    assert latest_rep is not None
+    assert latest_rep["id"] == report_id
+    assert latest_rep["total_candles"] == 125
+    assert latest_rep["gaps_count"] == 0
+    assert latest_rep["report"]["status"] == "HEALTHY"
+
+
+@pytest.mark.integration
 def test_real_database_and_snapshots():
     """Validates real ingested database and snapshots on disk."""
+    if not DEFAULT_DB_PATH.exists() or not list(SNAPSHOTS_DIR.glob("paxgusdt_*")):
+        pytest.skip("Integration test skipped: real DB or snapshots not found in var/paxg_lab/")
+
     storage = MarketDataStorage()
     df_1h = storage.load_klines_df(symbol="PAXGUSDT", interval="1h")
     df_4h = storage.load_klines_df(symbol="PAXGUSDT", interval="4h")
@@ -260,3 +397,4 @@ def test_real_database_and_snapshots():
         snap = DatasetSnapshot.load(s_dir, verify_hash=True)
         assert snap.total_candles > 0
         assert snap.metadata.sha256 is not None
+
