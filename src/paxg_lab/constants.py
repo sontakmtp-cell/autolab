@@ -27,6 +27,18 @@ EXTENDED_LORA_TARGETS: Final[list[str]] = ["query_proj", "value_proj", "key_proj
 # Safe float bounds
 EPSILON: Final[float] = 1e-7
 
+# Score v1 Constants
+SCORE_VERSION: Final[int] = 1
+TICK_SIZE: Final[float] = 0.01
+
+# Time-decay weights for evaluation (0-6h: 50%, 6-12h: 30%, 12-24h: 20%)
+# 1h: 24 steps -> 1-6 (0.50/6), 7-12 (0.30/6), 13-24 (0.20/12)
+# 4h: 6 steps  -> 1 (0.50/1), 2-3 (0.30/2), 4-6 (0.20/3)
+HORIZON_WEIGHTS: Final[dict[str, tuple[float, ...]]] = {
+    "1h": tuple([0.50 / 6.0] * 6 + [0.30 / 6.0] * 6 + [0.20 / 12.0] * 12),
+    "4h": tuple([0.50] + [0.30 / 2.0] * 2 + [0.20 / 3.0] * 3),
+}
+
 
 def get_horizon_for_timeframe(timeframe: str) -> int:
     """Returns mandatory forecast horizon for the given timeframe."""
@@ -36,3 +48,13 @@ def get_horizon_for_timeframe(timeframe: str) -> int:
             f"Unsupported timeframe '{timeframe}'. Expected one of {list(TIMEFRAME_HORIZONS.keys())}."
         )
     return TIMEFRAME_HORIZONS[tf]
+
+
+def get_horizon_weights(timeframe: str) -> tuple[float, ...]:
+    """Returns normalized time-decay weights across forecast steps for timeframe."""
+    tf = timeframe.lower().strip()
+    if tf not in HORIZON_WEIGHTS:
+        raise ValueError(
+            f"Unsupported timeframe '{timeframe}'. Expected one of {list(HORIZON_WEIGHTS.keys())}."
+        )
+    return HORIZON_WEIGHTS[tf]

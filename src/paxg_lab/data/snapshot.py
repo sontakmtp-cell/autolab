@@ -52,6 +52,13 @@ class DatasetSnapshot:
     def total_candles(self) -> int:
         return len(self.timestamps)
 
+    @property
+    def timeframe(self) -> str:
+        return self.metadata.timeframe
+
+    def get_features(self, feature_set: str = "B") -> np.ndarray:
+        return self.get_feature_matrix(feature_set)
+
     def get_feature_matrix(self, feature_set: str = "B") -> np.ndarray:
         """Returns the feature matrix corresponding to feature set A, B, or C."""
         f_set = feature_set.upper().strip()

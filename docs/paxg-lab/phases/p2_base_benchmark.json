@@ -1,0 +1,125 @@
+{
+  "timestamp": "2026-09-05T14:57:10Z",
+  "hardware": {
+    "device": "cuda",
+    "device_name": "NVIDIA GeForce RTX 5060 Ti",
+    "pytorch_version": "2.12.1+cu130"
+  },
+  "model": {
+    "repo": "google/timesfm-3.0-pytorch",
+    "revision": "43046b85ec22d584a13f8098c2ed39c889e129c2",
+    "architecture": "TimesFM 3.0 PyTorch Base"
+  },
+  "benchmarks": {
+    "1h": {
+      "score_version": 1,
+      "score_v1": 0.0,
+      "horizon_steps": 24,
+      "eval_windows": 2091,
+      "weighted_mae": 25.017021958033244,
+      "weighted_rmse": 41.088063670439816,
+      "raw_mae": 32.13515090942383,
+      "coverage_80_pct": 75.93456081619641,
+      "mean_width_80_usdt": 100.73983001708984,
+      "directional_accuracy_pct": 52.2621957573416,
+      "step_maes_usdt": {
+        "1": 8.52600383758545,
+        "6": 22.266969680786133,
+        "12": 33.16716384887695,
+        "24": 48.636016845703125
+      },
+      "naive_comparison": {
+        "naive_flat_eval_weighted_mae": 23.755758877642773,
+        "naive_flat_test_weighted_mae": 19.71393638543007,
+        "improvement_over_naive_pct": -5.309293998506955
+      },
+      "folds": [
+        {
+          "fold_id": 1,
+          "windows": 697,
+          "weighted_mae": 35.92724720637003,
+          "relative_mae_to_base": 1.0,
+          "relative_pinball_to_base": 1.0,
+          "composite_loss": 1.0
+        },
+        {
+          "fold_id": 2,
+          "windows": 697,
+          "weighted_mae": 19.23740715185801,
+          "relative_mae_to_base": 1.0,
+          "relative_pinball_to_base": 1.0,
+          "composite_loss": 1.0
+        },
+        {
+          "fold_id": 3,
+          "windows": 697,
+          "weighted_mae": 19.886410331726072,
+          "relative_mae_to_base": 1.0,
+          "relative_pinball_to_base": 1.0,
+          "composite_loss": 1.0
+        }
+      ],
+      "test_locked": {
+        "windows": 2137,
+        "weighted_mae": 21.939998976389568,
+        "rmse": 34.33113972097366,
+        "coverage_80": 0.7020745593511153
+      }
+    },
+    "4h": {
+      "score_version": 1,
+      "score_v1": 0.0,
+      "horizon_steps": 6,
+      "eval_windows": 525,
+      "weighted_mae": 26.19158331553141,
+      "weighted_rmse": 42.84225670947946,
+      "raw_mae": 34.69353103637695,
+      "coverage_80_pct": 79.71428571428572,
+      "mean_width_80_usdt": 112.01268768310547,
+      "directional_accuracy_pct": 48.38095238095239,
+      "step_maes_usdt": {
+        "1": 17.117277145385742,
+        "2": 25.90801239013672,
+        "3": 32.852210998535156,
+        "6": 48.40593719482422
+      },
+      "naive_comparison": {
+        "naive_flat_eval_weighted_mae": 25.32673328993056,
+        "naive_flat_test_weighted_mae": 20.661748685747664,
+        "improvement_over_naive_pct": -3.414771323645992
+      },
+      "folds": [
+        {
+          "fold_id": 1,
+          "windows": 175,
+          "weighted_mae": 36.53597704569499,
+          "relative_mae_to_base": 1.0,
+          "relative_pinball_to_base": 1.0,
+          "composite_loss": 1.0
+        },
+        {
+          "fold_id": 2,
+          "windows": 175,
+          "weighted_mae": 21.354603354136145,
+          "relative_mae_to_base": 1.0,
+          "relative_pinball_to_base": 1.0,
+          "composite_loss": 1.0
+        },
+        {
+          "fold_id": 3,
+          "windows": 175,
+          "weighted_mae": 20.68418366114299,
+          "relative_mae_to_base": 1.0,
+          "relative_pinball_to_base": 1.0,
+          "composite_loss": 1.0
+        }
+      ],
+      "test_locked": {
+        "windows": 535,
+        "weighted_mae": 21.670607884724937,
+        "rmse": 33.29035760615825,
+        "coverage_80": 0.7725856697819314
+      }
+    }
+  }
+}
