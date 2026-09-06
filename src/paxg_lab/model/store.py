@@ -18,7 +18,13 @@ import torch
 import torch.nn as nn
 from peft import PeftModel
 
-from ..constants import ALLOWED_CONTEXT_LENGTHS, MODEL_REVISION, get_horizon_for_timeframe
+from ..constants import (
+    ALLOWED_CONTEXT_LENGTHS,
+    MODEL_REPO,
+    MODEL_REVISION,
+    get_horizon_for_timeframe,
+)
+from ..data.features import FEATURE_SPECS
 from .lora import load_lora_adapter
 from .manifest import AdapterManifest
 
@@ -648,10 +654,54 @@ class AdapterStore:
                         shutil.move(str(item), str(temp_dir))
                     shutil.rmtree(single_sub, ignore_errors=True)
 
-            # 3. Check paxg_manifest.json
+            # 3. Check mandatory files existence and non-emptiness
+            MANDATORY_ADAPTER_FILES = (
+                "paxg_manifest.json",
+                CHECKSUMS_FILENAME,
+                "adapter_model.safetensors",
+                "adapter_config.json",
+            )
+            for mfile in MANDATORY_ADAPTER_FILES:
+                fpath = temp_dir / mfile
+                if not fpath.is_file() or fpath.stat().st_size == 0:
+                    raise ValueError(f"Import failed: required adapter file '{mfile}' missing or empty in zip archive.")
+
+            # 4. Check and validate adapter_config.json
+            adapter_config_file = temp_dir / "adapter_config.json"
+            try:
+                with open(adapter_config_file, "r", encoding="utf-8") as f:
+                    peft_cfg = json.load(f)
+                if not isinstance(peft_cfg, dict) or not peft_cfg:
+                    raise ValueError("must be a non-empty JSON object.")
+            except Exception as err:
+                raise ValueError(f"Corrupted or invalid 'adapter_config.json': {err}") from err
+
+            # 5. Check paxg_manifest.json and enforce strict base model provenance
             manifest_file = temp_dir / "paxg_manifest.json"
-            if not manifest_file.exists():
-                raise ValueError("Import failed: 'paxg_manifest.json' missing from zip archive.")
+            try:
+                with open(manifest_file, "r", encoding="utf-8") as f:
+                    raw_manifest = json.load(f)
+                if not isinstance(raw_manifest, dict):
+                    raise ValueError("root must be a JSON object.")
+            except Exception as err:
+                raise ValueError(f"Corrupted or invalid 'paxg_manifest.json': {err}") from err
+
+            # Strict provenance: base_model_repo and base_model_revision must be explicitly present and exact match
+            if "base_model_repo" not in raw_manifest or not raw_manifest["base_model_repo"]:
+                raise ValueError("Incompatible manifest: missing mandatory 'base_model_repo' provenance.")
+            if "base_model_revision" not in raw_manifest or not raw_manifest["base_model_revision"]:
+                raise ValueError("Incompatible manifest: missing mandatory 'base_model_revision' provenance.")
+
+            if raw_manifest["base_model_repo"] != MODEL_REPO:
+                raise ValueError(
+                    f"Incompatible base_model_repo '{raw_manifest['base_model_repo']}'. "
+                    f"Expected strictly '{MODEL_REPO}'."
+                )
+            if raw_manifest["base_model_revision"] != MODEL_REVISION:
+                raise ValueError(
+                    f"Incompatible base_model_revision '{raw_manifest['base_model_revision']}'. "
+                    f"Expected strictly '{MODEL_REVISION}'."
+                )
 
             manifest = AdapterManifest.load_json(manifest_file)
             adapter_id = validate_adapter_id(manifest.adapter_id, self.base_dir)
@@ -659,7 +709,7 @@ class AdapterStore:
             if target_dir.exists() and not overwrite:
                 raise FileExistsError(f"Adapter '{adapter_id}' already exists. Set overwrite=True to replace.")
 
-            # 4. Static compatibility validation
+            # 6. Static compatibility validation
             if manifest.timeframe not in ("1h", "4h"):
                 raise ValueError(f"Incompatible adapter timeframe '{manifest.timeframe}'. Must be '1h' or '4h'.")
             expected_horizon = get_horizon_for_timeframe(manifest.timeframe)
@@ -673,21 +723,24 @@ class AdapterStore:
                     f"Incompatible adapter context_len {manifest.context_len}. "
                     f"Must be one of {ALLOWED_CONTEXT_LENGTHS}."
                 )
-            if manifest.feature_set not in ("A", "B", "C"):
-                raise ValueError(f"Incompatible adapter feature_set '{manifest.feature_set}'. Must be 'A', 'B', or 'C'.")
-            if hasattr(manifest, "base_model_repo") and manifest.base_model_repo:
-                if "timesfm" not in str(manifest.base_model_repo).lower():
-                    raise ValueError(f"Incompatible base model '{manifest.base_model_repo}'. Expected TimesFM 3.0 compatible model.")
+            if manifest.feature_set not in FEATURE_SPECS:
+                raise ValueError(
+                    f"Incompatible adapter feature_set '{manifest.feature_set}'. "
+                    f"Must be one of {list(FEATURE_SPECS.keys())}."
+                )
+            expected_feature_columns = list(FEATURE_SPECS[manifest.feature_set].columns)
+            if list(manifest.feature_columns) != expected_feature_columns:
+                raise ValueError(
+                    f"Incompatible feature_columns for feature_set '{manifest.feature_set}': "
+                    f"expected {expected_feature_columns}, got {manifest.feature_columns}."
+                )
 
-            # 5. Check mandatory files
+            # 7. Check forbidden weight files
             if (temp_dir / "adapter_model.bin").exists():
                 raise ValueError("Pickle/PyTorch binary weights ('adapter_model.bin') forbidden in adapter import.")
 
-            # 6. Verify checksums.sha256 sidecar
+            # 8. Verify checksums.sha256 sidecar
             checksums_file = temp_dir / CHECKSUMS_FILENAME
-            if not checksums_file.exists():
-                raise ValueError(f"Import failed: required sidecar '{CHECKSUMS_FILENAME}' missing from zip archive.")
-
             verified_files: set[Path] = set()
             with open(checksums_file, "r", encoding="utf-8") as f:
                 for line in f:
@@ -722,6 +775,11 @@ class AdapterStore:
                             raise ValueError(f"Checksum mismatch for '{fname}': expected {exp_hash}, got {act_hash}")
                         verified_files.add(extracted_file)
 
+            # Verify that all mandatory files are covered by checksums.sha256
+            for mfile in ("paxg_manifest.json", "adapter_model.safetensors", "adapter_config.json"):
+                if (temp_dir / mfile).resolve() not in verified_files:
+                    raise ValueError(f"Import failed: mandatory file '{mfile}' is not declared or verified in checksums.sha256.")
+
             # Archive completeness: ensure all files in temp_dir (except checksums.sha256) are covered by checksums
             all_files_in_temp = {f.resolve() for f in temp_dir.rglob("*") if f.is_file() and f.name != CHECKSUMS_FILENAME}
             uncovered_files = all_files_in_temp - verified_files
@@ -729,12 +787,12 @@ class AdapterStore:
                 uncovered_names = sorted([str(f.relative_to(temp_dir.resolve())) for f in uncovered_files])
                 raise ValueError(f"Import failed: archive contains unverified files not covered by checksums: {uncovered_names}")
 
-            # 7. Move to canonical target
+            # 9. Atomic move to canonical target
             if target_dir.exists() and overwrite:
                 shutil.rmtree(target_dir, ignore_errors=True)
             os.replace(temp_dir, target_dir)
 
-            # Register in DB
+            # 10. Register in DB (strictly after all validations and move have completed)
             self.set_alias(adapter_id, adapter_id)
             return adapter_id
 

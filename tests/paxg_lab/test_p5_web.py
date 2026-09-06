@@ -11,7 +11,15 @@ import zipfile
 
 import pytest
 
-from paxg_lab.constants import TIMEFRAME_1H, TIMEFRAME_4H, get_horizon_for_timeframe
+from paxg_lab.constants import (
+    ALLOWED_CONTEXT_LENGTHS,
+    MODEL_REPO,
+    MODEL_REVISION,
+    TIMEFRAME_1H,
+    TIMEFRAME_4H,
+    get_horizon_for_timeframe,
+)
+from paxg_lab.data.features import FEATURE_SPECS
 from paxg_lab.model.manifest import AdapterManifest
 from paxg_lab.model.store import AdapterStore, compute_file_sha256
 from paxg_lab.ui.charts import build_backtest_error_chart, build_candlestick_forecast_chart, build_loss_chart
@@ -56,7 +64,9 @@ def mock_adapter(temp_store: AdapterStore) -> str:
         horizon=24,
         context_len=256,
         feature_set="B",
-        feature_columns=["close", "volume"],
+        feature_columns=list(FEATURE_SPECS["B"].columns),
+        base_model_repo=MODEL_REPO,
+        base_model_revision=MODEL_REVISION,
         best_val_loss=0.012345,
     )
     manifest.save_json(target_dir / "paxg_manifest.json")
@@ -301,6 +311,11 @@ def test_safe_zip_import_rejection_of_manifest_traversal_adapter_id(temp_store: 
     """Verifies that zip archives with traversal adapter_id inside paxg_manifest.json are rejected."""
     malicious_ids = ["../../escape", "C:\\Windows\\System32", "/tmp/evil", "foo/bar"]
 
+    safetensors_bytes = b"DUMMY_SAFETENSORS_WEIGHTS"
+    config_bytes = json.dumps({"peft_type": "LORA", "r": 4}).encode("utf-8")
+    s_hash = hashlib.sha256(safetensors_bytes).hexdigest()
+    c_hash = hashlib.sha256(config_bytes).hexdigest()
+
     for idx, bad_id in enumerate(malicious_ids):
         bad_zip = tmp_path / f"bad_manifest_id_{idx}.zip"
         manifest_data = {
@@ -308,20 +323,27 @@ def test_safe_zip_import_rejection_of_manifest_traversal_adapter_id(temp_store: 
             "timeframe": "1h",
             "horizon": 24,
             "context_len": 256,
-            "feature_set": "B",
+            "feature_set": "A",
             "feature_columns": ["close"],
+            "base_model_repo": MODEL_REPO,
+            "base_model_revision": MODEL_REVISION,
             "best_val_loss": 0.012,
         }
         manifest_str = json.dumps(manifest_data)
-        import hashlib
         m_hash = hashlib.sha256(manifest_str.encode("utf-8")).hexdigest()
-        checksums_content = f"{m_hash}  paxg_manifest.json\n"
+        checksums_content = (
+            f"{m_hash}  paxg_manifest.json\n"
+            f"{s_hash}  adapter_model.safetensors\n"
+            f"{c_hash}  adapter_config.json\n"
+        )
 
         with zipfile.ZipFile(bad_zip, "w") as zf:
             zf.writestr("paxg_manifest.json", manifest_str)
+            zf.writestr("adapter_model.safetensors", safetensors_bytes)
+            zf.writestr("adapter_config.json", config_bytes)
             zf.writestr("checksums.sha256", checksums_content)
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=r"Path traversal|Reserved path|Invalid adapter_id format"):
             temp_store.import_adapter_zip(bad_zip)
 
         # Verify nothing was created outside base_dir
@@ -520,14 +542,38 @@ def test_safe_zip_import_rejects_checksum_traversal_and_uncovered_files(temp_sto
     """Verifies that checksums.sha256 with traversal paths, absolute paths, or unverified files are strictly rejected."""
     import hashlib
 
-    # 1. Traversal path in checksums.sha256 (../outside)
-    zip_traversal = tmp_path / "bad_checksum_traversal.zip"
-    manifest_str = json.dumps({"adapter_id": "test_traversal", "timeframe": "1h", "horizon": 24, "context_len": 256, "feature_set": "B", "feature_columns": ["close"], "best_val_loss": 0.01})
+    safetensors_bytes = b"DUMMY_SAFETENSORS_WEIGHTS"
+    config_bytes = json.dumps({"peft_type": "LORA", "r": 4}).encode("utf-8")
+    s_hash = hashlib.sha256(safetensors_bytes).hexdigest()
+    c_hash = hashlib.sha256(config_bytes).hexdigest()
+
+    base_manifest = {
+        "adapter_id": "test_traversal",
+        "timeframe": "1h",
+        "horizon": 24,
+        "context_len": 256,
+        "feature_set": "A",
+        "feature_columns": ["close"],
+        "base_model_repo": MODEL_REPO,
+        "base_model_revision": MODEL_REVISION,
+        "best_val_loss": 0.01,
+    }
+    manifest_str = json.dumps(base_manifest)
     m_hash = hashlib.sha256(manifest_str.encode("utf-8")).hexdigest()
 
+    base_checksums = (
+        f"{m_hash}  paxg_manifest.json\n"
+        f"{s_hash}  adapter_model.safetensors\n"
+        f"{c_hash}  adapter_config.json\n"
+    )
+
+    # 1. Traversal path in checksums.sha256 (../outside)
+    zip_traversal = tmp_path / "bad_checksum_traversal.zip"
     with zipfile.ZipFile(zip_traversal, "w") as zf:
         zf.writestr("paxg_manifest.json", manifest_str)
-        zf.writestr("checksums.sha256", f"{m_hash}  paxg_manifest.json\n1234567890abcdef  ../outside_file.txt\n")
+        zf.writestr("adapter_model.safetensors", safetensors_bytes)
+        zf.writestr("adapter_config.json", config_bytes)
+        zf.writestr("checksums.sha256", base_checksums + "1234567890abcdef  ../outside_file.txt\n")
 
     with pytest.raises(ValueError, match="Path traversal detected in checksums filename"):
         temp_store.import_adapter_zip(zip_traversal)
@@ -536,7 +582,9 @@ def test_safe_zip_import_rejects_checksum_traversal_and_uncovered_files(temp_sto
     zip_drive = tmp_path / "bad_checksum_drive.zip"
     with zipfile.ZipFile(zip_drive, "w") as zf:
         zf.writestr("paxg_manifest.json", manifest_str)
-        zf.writestr("checksums.sha256", f"{m_hash}  paxg_manifest.json\n1234567890abcdef  C:\\Windows\\system.ini\n")
+        zf.writestr("adapter_model.safetensors", safetensors_bytes)
+        zf.writestr("adapter_config.json", config_bytes)
+        zf.writestr("checksums.sha256", base_checksums + "1234567890abcdef  C:\\Windows\\system.ini\n")
 
     with pytest.raises(ValueError, match="Path traversal detected in checksums filename"):
         temp_store.import_adapter_zip(zip_drive)
@@ -545,7 +593,9 @@ def test_safe_zip_import_rejects_checksum_traversal_and_uncovered_files(temp_sto
     zip_unc = tmp_path / "bad_checksum_unc.zip"
     with zipfile.ZipFile(zip_unc, "w") as zf:
         zf.writestr("paxg_manifest.json", manifest_str)
-        zf.writestr("checksums.sha256", f"{m_hash}  paxg_manifest.json\n1234567890abcdef  \\\\server\\share\\evil.txt\n")
+        zf.writestr("adapter_model.safetensors", safetensors_bytes)
+        zf.writestr("adapter_config.json", config_bytes)
+        zf.writestr("checksums.sha256", base_checksums + "1234567890abcdef  \\\\server\\share\\evil.txt\n")
 
     with pytest.raises(ValueError, match="Path traversal detected in checksums filename"):
         temp_store.import_adapter_zip(zip_unc)
@@ -554,9 +604,11 @@ def test_safe_zip_import_rejects_checksum_traversal_and_uncovered_files(temp_sto
     zip_uncovered = tmp_path / "uncovered_file.zip"
     with zipfile.ZipFile(zip_uncovered, "w") as zf:
         zf.writestr("paxg_manifest.json", manifest_str)
+        zf.writestr("adapter_model.safetensors", safetensors_bytes)
+        zf.writestr("adapter_config.json", config_bytes)
         zf.writestr("secret_notes.txt", b"some unverified notes")
-        # checksums only mentions paxg_manifest.json, secret_notes.txt is unverified!
-        zf.writestr("checksums.sha256", f"{m_hash}  paxg_manifest.json\n")
+        # checksums only mentions manifest, safetensors, config; secret_notes.txt is unverified!
+        zf.writestr("checksums.sha256", base_checksums)
 
     with pytest.raises(ValueError, match="archive contains unverified files not covered by checksums"):
         temp_store.import_adapter_zip(zip_uncovered)
@@ -700,7 +752,8 @@ def test_safe_zip_import_strict_allowlist_and_pickle_rejection(tmp_path: Path):
         "context_len": 512,
         "feature_set": "A",
         "feature_columns": ["close"],
-        "base_model_repo": "google/timesfm-2.0-500m-pytorch",
+        "base_model_repo": MODEL_REPO,
+        "base_model_revision": MODEL_REVISION,
     }
     manifest_bytes = json.dumps(valid_manifest).encode("utf-8")
     m_hash = hashlib.sha256(manifest_bytes).hexdigest()
@@ -742,7 +795,8 @@ def test_safe_zip_import_uncompressed_size_limit_rejection(tmp_path: Path, monke
         "context_len": 512,
         "feature_set": "A",
         "feature_columns": ["close"],
-        "base_model_repo": "google/timesfm-2.0-500m-pytorch",
+        "base_model_repo": MODEL_REPO,
+        "base_model_revision": MODEL_REVISION,
     }
     manifest_bytes = json.dumps(valid_manifest).encode("utf-8")
     m_hash = hashlib.sha256(manifest_bytes).hexdigest()
@@ -762,44 +816,200 @@ def test_safe_zip_import_uncompressed_size_limit_rejection(tmp_path: Path, monke
 
 
 def test_safe_zip_import_static_compatibility_validation(tmp_path: Path):
-    """Verifies that manifests with incompatible parameters are rejected."""
+    """Verifies that manifests with incompatible parameters or missing mandatory files are rejected."""
     from paxg_lab.model.store import AdapterStore
 
     store = AdapterStore(tmp_path / "models")
 
-    def make_zip(filename: str, manifest: dict) -> Path:
+    def make_zip(
+        filename: str,
+        manifest: dict,
+        include_safetensors: bool = True,
+        include_config: bool = True,
+        custom_config: bytes | None = None,
+    ) -> Path:
         p = tmp_path / filename
         m_bytes = json.dumps(manifest).encode("utf-8")
-        h = hashlib.sha256(m_bytes).hexdigest()
+        s_bytes = b"DUMMY_SAFETENSORS_WEIGHTS"
+        c_bytes = custom_config if custom_config is not None else json.dumps({"peft_type": "LORA", "r": 4}).encode("utf-8")
+
+        lines = [f"{hashlib.sha256(m_bytes).hexdigest()}  paxg_manifest.json"]
+        if include_safetensors:
+            lines.append(f"{hashlib.sha256(s_bytes).hexdigest()}  adapter_model.safetensors")
+        if include_config:
+            lines.append(f"{hashlib.sha256(c_bytes).hexdigest()}  adapter_config.json")
+        checksums_content = "\n".join(lines) + "\n"
+
         with zipfile.ZipFile(p, "w") as zf:
             zf.writestr("paxg_manifest.json", m_bytes)
-            zf.writestr("checksums.sha256", f"{h}  paxg_manifest.json\n")
+            if include_safetensors:
+                zf.writestr("adapter_model.safetensors", s_bytes)
+            if include_config:
+                zf.writestr("adapter_config.json", c_bytes)
+            zf.writestr("checksums.sha256", checksums_content)
         return p
 
+    def_manifest = {
+        "adapter_id": "test_compat",
+        "timeframe": "1h",
+        "horizon": 24,
+        "context_len": 512,
+        "feature_set": "A",
+        "feature_columns": ["close"],
+        "base_model_repo": MODEL_REPO,
+        "base_model_revision": MODEL_REVISION,
+    }
+
     # 1. Invalid timeframe
-    bad_tf = make_zip("bad_tf.zip", {"adapter_id": "a1", "timeframe": "15m", "horizon": 24, "context_len": 512, "feature_set": "A", "feature_columns": ["close"], "base_model_repo": "google/timesfm-2.0-500m-pytorch"})
+    bad_tf = make_zip("bad_tf.zip", {**def_manifest, "timeframe": "15m"})
     with pytest.raises(ValueError, match=r"(Incompatible adapter timeframe|Unsupported timeframe).*15m"):
         store.import_adapter_zip(bad_tf)
 
     # 2. Mismatched horizon
-    bad_horizon = make_zip("bad_hz.zip", {"adapter_id": "a2", "timeframe": "1h", "horizon": 6, "context_len": 512, "feature_set": "A", "feature_columns": ["close"], "base_model_repo": "google/timesfm-2.0-500m-pytorch"})
+    bad_horizon = make_zip("bad_hz.zip", {**def_manifest, "horizon": 6})
     with pytest.raises(ValueError, match=r"(Incompatible adapter horizon|AdapterManifest horizon mismatch)"):
         store.import_adapter_zip(bad_horizon)
 
     # 3. Invalid context_len
-    bad_ctx = make_zip("bad_ctx.zip", {"adapter_id": "a3", "timeframe": "1h", "horizon": 24, "context_len": 999, "feature_set": "A", "feature_columns": ["close"], "base_model_repo": "google/timesfm-2.0-500m-pytorch"})
+    bad_ctx = make_zip("bad_ctx.zip", {**def_manifest, "context_len": 999})
     with pytest.raises(ValueError, match="Incompatible adapter context_len 999"):
         store.import_adapter_zip(bad_ctx)
 
     # 4. Invalid feature set
-    bad_feat = make_zip("bad_feat.zip", {"adapter_id": "a4", "timeframe": "4h", "horizon": 6, "context_len": 512, "feature_set": "D", "feature_columns": ["close"], "base_model_repo": "google/timesfm-2.0-500m-pytorch"})
+    bad_feat = make_zip("bad_feat.zip", {**def_manifest, "timeframe": "4h", "horizon": 6, "feature_set": "D"})
     with pytest.raises(ValueError, match="Incompatible adapter feature_set 'D'"):
         store.import_adapter_zip(bad_feat)
 
-    # 5. Incompatible base_model_repo
-    bad_base = make_zip("bad_base.zip", {"adapter_id": "a5", "timeframe": "4h", "horizon": 6, "context_len": 512, "feature_set": "A", "feature_columns": ["close"], "base_model_repo": "bert-base-uncased"})
-    with pytest.raises(ValueError, match="Incompatible base model 'bert-base-uncased'"):
-        store.import_adapter_zip(bad_base)
+    # 5. Feature columns mismatch with canonical FeatureSpec
+    bad_feat_cols = make_zip("bad_feat_cols.zip", {**def_manifest, "feature_set": "B", "feature_columns": ["close"]})
+    with pytest.raises(ValueError, match="Incompatible feature_columns for feature_set 'B'"):
+        store.import_adapter_zip(bad_feat_cols)
+
+    # 6. Feature columns wrong order
+    b_cols_reversed = list(reversed(FEATURE_SPECS["B"].columns))
+    bad_cols_order = make_zip("bad_cols_order.zip", {**def_manifest, "feature_set": "B", "feature_columns": b_cols_reversed})
+    with pytest.raises(ValueError, match="Incompatible feature_columns for feature_set 'B'"):
+        store.import_adapter_zip(bad_cols_order)
+
+    # 7. Incompatible base_model_repo (TimesFM 2.0 must be strictly rejected)
+    bad_base_2 = make_zip("bad_base_2.zip", {**def_manifest, "base_model_repo": "google/timesfm-2.0-500m-pytorch"})
+    with pytest.raises(ValueError, match="Incompatible base_model_repo 'google/timesfm-2.0-500m-pytorch'"):
+        store.import_adapter_zip(bad_base_2)
+
+    # 8. Non-TimesFM base model repo
+    bad_base_bert = make_zip("bad_base_bert.zip", {**def_manifest, "base_model_repo": "bert-base-uncased"})
+    with pytest.raises(ValueError, match="Incompatible base_model_repo 'bert-base-uncased'"):
+        store.import_adapter_zip(bad_base_bert)
+
+    # 9. Missing base_model_repo provenance
+    no_repo_manifest = {k: v for k, v in def_manifest.items() if k != "base_model_repo"}
+    bad_no_repo = make_zip("bad_no_repo.zip", no_repo_manifest)
+    with pytest.raises(ValueError, match="missing mandatory 'base_model_repo' provenance"):
+        store.import_adapter_zip(bad_no_repo)
+
+    # 10. Missing base_model_revision provenance
+    no_rev_manifest = {k: v for k, v in def_manifest.items() if k != "base_model_revision"}
+    bad_no_rev = make_zip("bad_no_rev.zip", no_rev_manifest)
+    with pytest.raises(ValueError, match="missing mandatory 'base_model_revision' provenance"):
+        store.import_adapter_zip(bad_no_rev)
+
+    # 11. Incompatible base_model_revision
+    bad_rev = make_zip("bad_rev.zip", {**def_manifest, "base_model_revision": "invalid_commit_hash_12345"})
+    with pytest.raises(ValueError, match="Incompatible base_model_revision 'invalid_commit_hash_12345'"):
+        store.import_adapter_zip(bad_rev)
+
+    # 12. Missing adapter_model.safetensors (empty adapter prevention)
+    missing_weights = make_zip("missing_weights.zip", def_manifest, include_safetensors=False)
+    with pytest.raises(ValueError, match="required adapter file 'adapter_model.safetensors' missing or empty"):
+        store.import_adapter_zip(missing_weights)
+
+    # 13. Missing adapter_config.json
+    missing_cfg = make_zip("missing_cfg.zip", def_manifest, include_config=False)
+    with pytest.raises(ValueError, match="required adapter file 'adapter_config.json' missing or empty"):
+        store.import_adapter_zip(missing_cfg)
+
+    # 14. Corrupted adapter_config.json
+    bad_cfg = make_zip("bad_cfg.zip", def_manifest, custom_config=b"NOT_A_VALID_JSON{")
+    with pytest.raises(ValueError, match="Corrupted or invalid 'adapter_config.json'"):
+        store.import_adapter_zip(bad_cfg)
+
+
+def test_safe_zip_import_minimal_valid_package_registers_only_after_success(tmp_path: Path):
+    """Verifies that a valid minimal package imports cleanly and updates registry only after verification."""
+    from paxg_lab.model.store import AdapterStore
+
+    models_dir = tmp_path / "models"
+    db_path = tmp_path / "test_paxg.db"
+    store = AdapterStore(base_dir=models_dir, db_path=db_path)
+
+    adapter_id = "paxg_1h_minimal_valid_pkg"
+    valid_manifest = {
+        "adapter_id": adapter_id,
+        "timeframe": "1h",
+        "horizon": 24,
+        "context_len": 256,
+        "feature_set": "A",
+        "feature_columns": ["close"],
+        "base_model_repo": MODEL_REPO,
+        "base_model_revision": MODEL_REVISION,
+        "best_val_loss": 0.015,
+    }
+    m_bytes = json.dumps(valid_manifest).encode("utf-8")
+    s_bytes = b"MINIMAL_VALID_SAFETENSORS_DATA"
+    c_bytes = json.dumps({"peft_type": "LORA", "r": 4, "lora_alpha": 8}).encode("utf-8")
+
+    m_hash = hashlib.sha256(m_bytes).hexdigest()
+    s_hash = hashlib.sha256(s_bytes).hexdigest()
+    c_hash = hashlib.sha256(c_bytes).hexdigest()
+
+    checksums_content = (
+        f"{m_hash}  paxg_manifest.json\n"
+        f"{s_hash}  adapter_model.safetensors\n"
+        f"{c_hash}  adapter_config.json\n"
+    )
+
+    pkg_zip = tmp_path / "valid_minimal_adapter.zip"
+    with zipfile.ZipFile(pkg_zip, "w") as zf:
+        zf.writestr("paxg_manifest.json", m_bytes)
+        zf.writestr("adapter_model.safetensors", s_bytes)
+        zf.writestr("adapter_config.json", c_bytes)
+        zf.writestr("checksums.sha256", checksums_content)
+
+    # 1. Before import: registry table does not have the adapter record
+    with sqlite3.connect(str(db_path)) as conn:
+        cur = conn.execute("SELECT 1 FROM adapter_registry WHERE adapter_id = ?;", (adapter_id,))
+        assert cur.fetchone() is None
+
+    # 2. Perform import
+    imported_id = store.import_adapter_zip(pkg_zip)
+    assert imported_id == adapter_id
+
+    # Verify row was created in DB
+    with sqlite3.connect(str(db_path)) as conn:
+        cur = conn.execute("SELECT 1 FROM adapter_registry WHERE adapter_id = ?;", (adapter_id,))
+        assert cur.fetchone() is not None
+
+    # 3. After import: canonical directory exists with all verified files
+    target_dir = store.get_adapter_path(adapter_id)
+    assert target_dir.is_dir()
+    assert (target_dir / "adapter_model.safetensors").exists()
+    assert (target_dir / "adapter_config.json").exists()
+    assert (target_dir / "paxg_manifest.json").exists()
+    assert (target_dir / "checksums.sha256").exists()
+
+    # 4. Registry metadata populated only after validation completed
+    meta_after = store.get_registry_metadata(adapter_id)
+    assert meta_after["adapter_id"] == adapter_id
+    assert meta_after["alias"] == adapter_id
+
+    # 5. Manifest load matches imported data
+    manifest = AdapterManifest.load_json(target_dir / "paxg_manifest.json")
+    assert manifest.adapter_id == adapter_id
+    assert manifest.base_model_repo == MODEL_REPO
+    assert manifest.base_model_revision == MODEL_REVISION
+    assert manifest.feature_columns == ["close"]
+    assert any(a.adapter_id == adapter_id for a in store.list_adapters())
+
 
 
 
