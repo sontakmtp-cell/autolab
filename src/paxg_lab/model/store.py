@@ -81,6 +81,95 @@ def compute_file_sha256(path: str | Path) -> str:
     return hasher.hexdigest()
 
 
+def validate_lora_weights_semantics(safetensors_path: Path, peft_cfg: dict) -> None:
+    """Validates that a safetensors file contains a valid, well-formed LoRA state dict
+    matching the configured rank r and target_modules."""
+    expected_r = peft_cfg.get("r")
+    target_modules = peft_cfg.get("target_modules", [])
+    if isinstance(target_modules, str):
+        target_modules = [target_modules]
+    target_modules_set = set(target_modules) if target_modules else set()
+
+    with safe_open(str(safetensors_path), framework="pt") as f:
+        keys = list(f.keys())
+        if not keys:
+            raise ValueError(f"Safetensors file '{safetensors_path.name}' contains no tensor keys.")
+
+        # Match LoRA parameter naming pattern, e.g.:
+        # base_model.model.transformer_stack.layers.0.seq_attn.query_proj.lora_A.weight
+        # base_model.model.transformer_stack.layers.0.seq_attn.query_proj.lora_A.default.weight
+        lora_pattern = re.compile(r"^(.*?)\.(lora_[AB])(?:\.[^.]+)?\.weight$")
+        lora_a_modules: dict[str, tuple[str, Any]] = {}
+        lora_b_modules: dict[str, tuple[str, Any]] = {}
+
+        for k in keys:
+            m = lora_pattern.match(k)
+            if not m:
+                raise ValueError(
+                    f"Weight key '{k}' does not conform to standard PEFT LoRA parameter naming pattern."
+                )
+            prefix, ab = m.group(1), m.group(2)
+            tensor = f.get_tensor(k)
+            shape = tensor.shape
+            if len(shape) != 2:
+                raise ValueError(
+                    f"LoRA parameter '{k}' must be a 2D weight matrix, got shape {shape}."
+                )
+            if ab == "lora_A":
+                lora_a_modules[prefix] = (k, shape)
+            else:
+                lora_b_modules[prefix] = (k, shape)
+
+        if not lora_a_modules or not lora_b_modules:
+            raise ValueError(
+                f"Adapter weights in '{safetensors_path.name}' do not contain both lora_A and lora_B tensors."
+            )
+
+        # Verify A and B pairs match and verify rank r
+        all_prefixes = set(lora_a_modules.keys()) | set(lora_b_modules.keys())
+        for prefix in all_prefixes:
+            if prefix not in lora_a_modules:
+                raise ValueError(f"Missing matching lora_A tensor for LoRA module: '{prefix}'")
+            if prefix not in lora_b_modules:
+                raise ValueError(f"Missing matching lora_B tensor for LoRA module: '{prefix}'")
+
+            k_a, shape_a = lora_a_modules[prefix]
+            k_b, shape_b = lora_b_modules[prefix]
+
+            if shape_a[0] != expected_r:
+                raise ValueError(
+                    f"Rank mismatch in '{k_a}': expected rank {expected_r}, got shape {shape_a}."
+                )
+            if shape_b[1] != expected_r:
+                raise ValueError(
+                    f"Rank mismatch in '{k_b}': expected rank {expected_r}, got shape {shape_b}."
+                )
+
+            # Check that module prefix targets one of the configured target_modules
+            if target_modules_set:
+                matched_target = any(
+                    prefix.endswith(f".{tm}") or prefix == tm or f".{tm}." in prefix
+                    for tm in target_modules_set
+                )
+                if not matched_target:
+                    raise ValueError(
+                        f"LoRA module '{prefix}' does not match any configured target_modules: {sorted(target_modules_set)}."
+                    )
+
+        # Verify all configured target_modules are covered in weights
+        if target_modules_set:
+            covered_targets = set()
+            for tm in target_modules_set:
+                for prefix in lora_a_modules.keys():
+                    if prefix.endswith(f".{tm}") or prefix == tm or f".{tm}." in prefix:
+                        covered_targets.add(tm)
+            missing_targets = target_modules_set - covered_targets
+            if missing_targets:
+                raise ValueError(
+                    f"Missing LoRA weights for configured target_modules: {sorted(missing_targets)}."
+                )
+
+
 class AdapterStore:
     """Manages atomic saving, loading, integrity verification, and cleanup of adapters."""
 
@@ -584,7 +673,12 @@ class AdapterStore:
                         zf.write(item, arcname=item.name)
         return out_path
 
-    def import_adapter_zip(self, zip_path: str | Path, overwrite: bool = False) -> str:
+    def import_adapter_zip(
+        self,
+        zip_path: str | Path,
+        overwrite: bool = False,
+        base_model: nn.Module | None = None,
+    ) -> str:
         """Safely imports an adapter from a zip file with path traversal, extension allowlist,
         decompression size limits, static compatibility checks, and SHA-256 verification."""
         zp = Path(zip_path)
@@ -712,6 +806,16 @@ class AdapterStore:
                 except Exception as err:
                     raise ValueError(f"Corrupted or invalid safetensors weights file '{sf.name}': {err}") from err
 
+            # 4.6. Validate semantic structure of LoRA PEFT weights (A/B pairs, rank r, target_modules)
+            validate_lora_weights_semantics(temp_dir / "adapter_model.safetensors", peft_cfg)
+
+            # 4.7. If base_model provided, test real load compatibility
+            if base_model is not None:
+                try:
+                    load_lora_adapter(base_model, temp_dir)
+                except Exception as err:
+                    raise ValueError(f"Failed to load adapter weights into base model: {err}") from err
+
             # 5. Check paxg_manifest.json and enforce strict base model provenance
             manifest_file = temp_dir / "paxg_manifest.json"
             try:
@@ -829,7 +933,7 @@ class AdapterStore:
                 uncovered_names = sorted([str(f.relative_to(temp_dir.resolve())) for f in uncovered_files])
                 raise ValueError(f"Import failed: archive contains unverified files not covered by checksums: {uncovered_names}")
 
-            # 9. Atomic move to canonical target
+            # 9. Atomic move to canonical target and register in DB
             backup_dir = None
             if target_dir.exists() and overwrite:
                 backup_dir = target_dir.parent / f".bak_replace_{adapter_id}_{int(time.time() * 1000)}"
@@ -839,18 +943,24 @@ class AdapterStore:
 
             try:
                 os.replace(temp_dir, target_dir)
+
+                # 10. Register in DB (strictly after validations and move have completed)
+                self.set_alias(adapter_id, adapter_id)
+
+                # 11. Success! Cleanup backup_dir only AFTER DB mutation has succeeded
                 if backup_dir and backup_dir.exists():
                     shutil.rmtree(backup_dir, ignore_errors=True)
+                return adapter_id
+
             except Exception:
+                # Rollback filesystem
                 if backup_dir and backup_dir.exists():
                     if target_dir.exists():
                         shutil.rmtree(target_dir, ignore_errors=True)
                     os.replace(backup_dir, target_dir)
+                elif target_dir.exists() and backup_dir is None:
+                    shutil.rmtree(target_dir, ignore_errors=True)
                 raise
-
-            # 10. Register in DB (strictly after all validations and move have completed)
-            self.set_alias(adapter_id, adapter_id)
-            return adapter_id
 
         except Exception:
             if temp_dir.exists():

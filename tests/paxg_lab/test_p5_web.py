@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
+import tempfile
 import time
 import zipfile
 
@@ -34,7 +35,20 @@ from paxg_lab.ui.state import (
     timestamp_to_vietnam_str,
 )
 
-VALID_SAFETENSORS_BYTES = safetensors.torch.save({"base_model.model.lora_A.weight": torch.zeros(1, 1)})
+def make_valid_lora_safetensors_bytes(
+    r: int = 4,
+    in_dim: int = 1280,
+    out_dim: int = 1280,
+    target_modules: tuple[str, ...] = ("query_proj", "value_proj"),
+) -> bytes:
+    tensors = {}
+    for tm in target_modules:
+        tensors[f"base_model.model.transformer_stack.layers.0.seq_attn.{tm}.lora_A.weight"] = torch.zeros(r, in_dim)
+        tensors[f"base_model.model.transformer_stack.layers.0.seq_attn.{tm}.lora_B.weight"] = torch.zeros(out_dim, r)
+    return safetensors.torch.save(tensors)
+
+
+VALID_SAFETENSORS_BYTES = make_valid_lora_safetensors_bytes(r=4)
 VALID_LORA_CONFIG = {
     "peft_type": "LORA",
     "r": 4,
@@ -1244,6 +1258,211 @@ def test_safe_zip_import_rejects_invalid_lora_config(tmp_path: Path):
     with sqlite3.connect(str(db_path)) as conn:
         cur = conn.execute("SELECT 1 FROM adapter_registry WHERE adapter_id = ?;", (manifest["adapter_id"],))
         assert cur.fetchone() is None
+
+
+def test_safe_zip_import_rejects_semantic_lora_weights_mismatches(tmp_path: Path):
+    """Verifies that safetensors weights with rank mismatch, missing lora_B, or wrong target
+    modules are rejected by semantic validation, and a full valid TimesFM3 adapter loads cleanly."""
+    models_dir = tmp_path / "models"
+    db_path = tmp_path / "test_paxg.db"
+    store = AdapterStore(base_dir=models_dir, db_path=db_path)
+
+    base_manifest = {
+        "adapter_id": "paxg_1h_semantic_test",
+        "timeframe": "1h",
+        "horizon": 24,
+        "context_len": 256,
+        "feature_set": "A",
+        "feature_columns": ["close"],
+        "base_model_repo": MODEL_REPO,
+        "base_model_revision": MODEL_REVISION,
+        "best_val_loss": 0.01,
+    }
+    m_bytes = json.dumps(base_manifest).encode("utf-8")
+    c_bytes = json.dumps(VALID_LORA_CONFIG).encode("utf-8")
+
+    def make_custom_zip(zip_name: str, tensor_dict: dict) -> Path:
+        s_bytes = safetensors.torch.save(tensor_dict)
+        chk = (
+            f"{hashlib.sha256(m_bytes).hexdigest()}  paxg_manifest.json\n"
+            f"{hashlib.sha256(s_bytes).hexdigest()}  adapter_model.safetensors\n"
+            f"{hashlib.sha256(c_bytes).hexdigest()}  adapter_config.json\n"
+        )
+        zpath = tmp_path / zip_name
+        with zipfile.ZipFile(zpath, "w") as zf:
+            zf.writestr("paxg_manifest.json", m_bytes)
+            zf.writestr("adapter_model.safetensors", s_bytes)
+            zf.writestr("adapter_config.json", c_bytes)
+            zf.writestr("checksums.sha256", chk)
+        return zpath
+
+    # 1. Rank mismatch: tensor has rank 2 but config expects rank 4
+    bad_rank_tensors = {
+        "base_model.model.transformer_stack.layers.0.seq_attn.query_proj.lora_A.weight": torch.zeros(2, 1280),
+        "base_model.model.transformer_stack.layers.0.seq_attn.query_proj.lora_B.weight": torch.zeros(1280, 4),
+        "base_model.model.transformer_stack.layers.0.seq_attn.value_proj.lora_A.weight": torch.zeros(4, 1280),
+        "base_model.model.transformer_stack.layers.0.seq_attn.value_proj.lora_B.weight": torch.zeros(1280, 4),
+    }
+    zip_bad_rank = make_custom_zip("bad_rank_tensors.zip", bad_rank_tensors)
+    with pytest.raises(ValueError, match="Rank mismatch"):
+        store.import_adapter_zip(zip_bad_rank)
+    assert not store.get_adapter_path(base_manifest["adapter_id"]).exists()
+
+    # 2. Missing lora_B for value_proj
+    missing_b_tensors = {
+        "base_model.model.transformer_stack.layers.0.seq_attn.query_proj.lora_A.weight": torch.zeros(4, 1280),
+        "base_model.model.transformer_stack.layers.0.seq_attn.query_proj.lora_B.weight": torch.zeros(1280, 4),
+        "base_model.model.transformer_stack.layers.0.seq_attn.value_proj.lora_A.weight": torch.zeros(4, 1280),
+    }
+    zip_missing_b = make_custom_zip("missing_b_tensors.zip", missing_b_tensors)
+    with pytest.raises(ValueError, match="Missing matching lora_B tensor"):
+        store.import_adapter_zip(zip_missing_b)
+    assert not store.get_adapter_path(base_manifest["adapter_id"]).exists()
+
+    # 3. Wrong target module (unconfigured module dense_h_to_4h)
+    wrong_mod_tensors = {
+        "base_model.model.transformer_stack.layers.0.dense_h_to_4h.lora_A.weight": torch.zeros(4, 1280),
+        "base_model.model.transformer_stack.layers.0.dense_h_to_4h.lora_B.weight": torch.zeros(1280, 4),
+        "base_model.model.transformer_stack.layers.0.seq_attn.value_proj.lora_A.weight": torch.zeros(4, 1280),
+        "base_model.model.transformer_stack.layers.0.seq_attn.value_proj.lora_B.weight": torch.zeros(1280, 4),
+    }
+    zip_wrong_mod = make_custom_zip("wrong_mod_tensors.zip", wrong_mod_tensors)
+    with pytest.raises(ValueError, match="does not match any configured target_modules"):
+        store.import_adapter_zip(zip_wrong_mod)
+    assert not store.get_adapter_path(base_manifest["adapter_id"]).exists()
+
+    # 4. Missing one of configured target modules (missing value_proj entirely)
+    missing_mod_tensors = {
+        "base_model.model.transformer_stack.layers.0.seq_attn.query_proj.lora_A.weight": torch.zeros(4, 1280),
+        "base_model.model.transformer_stack.layers.0.seq_attn.query_proj.lora_B.weight": torch.zeros(1280, 4),
+    }
+    zip_missing_mod = make_custom_zip("missing_mod_tensors.zip", missing_mod_tensors)
+    with pytest.raises(ValueError, match="Missing LoRA weights for configured target_modules"):
+        store.import_adapter_zip(zip_missing_mod)
+    assert not store.get_adapter_path(base_manifest["adapter_id"]).exists()
+
+    # 5. Positive case: Real TimesFM3 model load compatibility test
+    from timesfm import TimesFM3Torch
+    from paxg_lab.model.lora import build_lora_timesfm3, load_lora_adapter
+
+    base_model = TimesFM3Torch()
+    real_peft_model = build_lora_timesfm3(base_model, lora_r=4, lora_alpha=8)
+
+    real_adapter_id = "paxg_1h_real_loadable"
+    real_manifest_data = {**base_manifest, "adapter_id": real_adapter_id}
+    real_m_bytes = json.dumps(real_manifest_data).encode("utf-8")
+
+    with tempfile.TemporaryDirectory() as td_save:
+        real_peft_model.save_pretrained(td_save)
+        real_s_bytes = (Path(td_save) / "adapter_model.safetensors").read_bytes()
+        real_c_bytes = (Path(td_save) / "adapter_config.json").read_bytes()
+
+        real_chk = (
+            f"{hashlib.sha256(real_m_bytes).hexdigest()}  paxg_manifest.json\n"
+            f"{hashlib.sha256(real_s_bytes).hexdigest()}  adapter_model.safetensors\n"
+            f"{hashlib.sha256(real_c_bytes).hexdigest()}  adapter_config.json\n"
+        )
+        real_zip = tmp_path / "real_peft_package.zip"
+        with zipfile.ZipFile(real_zip, "w") as zf:
+            zf.writestr("paxg_manifest.json", real_m_bytes)
+            zf.writestr("adapter_model.safetensors", real_s_bytes)
+            zf.writestr("adapter_config.json", real_c_bytes)
+            zf.writestr("checksums.sha256", real_chk)
+
+    # Import with explicit base_model verification
+    fresh_base = TimesFM3Torch()
+    imported_id = store.import_adapter_zip(real_zip, base_model=fresh_base)
+    assert imported_id == real_adapter_id
+
+    # Verify adapter loads cleanly into TimesFM3 model without error
+    loaded_adapter = load_lora_adapter(fresh_base, store.get_adapter_path(imported_id))
+    assert loaded_adapter is not None
+
+
+def test_safe_zip_import_overwrite_rollback_on_sqlite_failure(tmp_path: Path, monkeypatch):
+    """Verifies that if SQLite registry update fails during overwrite=True, the original
+    adapter directory and metadata are 100% restored, and no temporary directories remain."""
+    models_dir = tmp_path / "models"
+    db_path = tmp_path / "test_paxg.db"
+    store = AdapterStore(base_dir=models_dir, db_path=db_path)
+
+    aid = "paxg_1h_rollback_test"
+    target_dir = store.get_adapter_path(aid)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Setup original adapter with marker and alias
+    (target_dir / "adapter_model.safetensors").write_bytes(VALID_SAFETENSORS_BYTES)
+    (target_dir / "adapter_config.json").write_text(json.dumps(VALID_LORA_CONFIG), encoding="utf-8")
+    orig_manifest = {
+        "adapter_id": aid,
+        "timeframe": "1h",
+        "horizon": 24,
+        "context_len": 256,
+        "feature_set": "A",
+        "feature_columns": ["close"],
+        "base_model_repo": MODEL_REPO,
+        "base_model_revision": MODEL_REVISION,
+        "best_val_loss": 0.05,
+    }
+    (target_dir / "paxg_manifest.json").write_text(json.dumps(orig_manifest), encoding="utf-8")
+    marker_file = target_dir / "original_marker.txt"
+    marker_file.write_text("ORIGINAL_MARKER_CONTENT", encoding="utf-8")
+
+    c_lines = []
+    for f in sorted(target_dir.iterdir()):
+        if f.is_file():
+            c_lines.append(f"{compute_file_sha256(f)}  {f.name}")
+    (target_dir / "checksums.sha256").write_text("\n".join(c_lines) + "\n", encoding="utf-8")
+
+    initial_alias = "Mô hình Gốc Không Đổi"
+    store.set_alias(aid, initial_alias)
+    assert store.get_alias(aid) == initial_alias
+
+    # 2. Prepare replacement zip for same aid with new loss
+    new_manifest = {**orig_manifest, "best_val_loss": 0.0001}
+    m_bytes = json.dumps(new_manifest).encode("utf-8")
+    s_bytes = VALID_SAFETENSORS_BYTES
+    c_bytes = json.dumps(VALID_LORA_CONFIG).encode("utf-8")
+    chk_str = (
+        f"{hashlib.sha256(m_bytes).hexdigest()}  paxg_manifest.json\n"
+        f"{hashlib.sha256(s_bytes).hexdigest()}  adapter_model.safetensors\n"
+        f"{hashlib.sha256(c_bytes).hexdigest()}  adapter_config.json\n"
+    )
+    replacement_zip = tmp_path / "rollback_replacement.zip"
+    with zipfile.ZipFile(replacement_zip, "w") as zf:
+        zf.writestr("paxg_manifest.json", m_bytes)
+        zf.writestr("adapter_model.safetensors", s_bytes)
+        zf.writestr("adapter_config.json", c_bytes)
+        zf.writestr("checksums.sha256", chk_str)
+
+    # 3. Monkeypatch set_alias to simulate database failure (DB locked / disk error)
+    def failing_set_alias(adapter_id: str, alias: str):
+        raise sqlite3.OperationalError("Simulated DB error: database is locked")
+
+    monkeypatch.setattr(store, "set_alias", failing_set_alias)
+
+    # 4. Attempt overwrite import -> must raise OperationalError
+    with pytest.raises(sqlite3.OperationalError, match="Simulated DB error"):
+        store.import_adapter_zip(replacement_zip, overwrite=True)
+
+    # 5. Assert atomic rollback: original files and marker are completely restored!
+    assert target_dir.exists()
+    assert marker_file.exists()
+    assert marker_file.read_text(encoding="utf-8") == "ORIGINAL_MARKER_CONTENT"
+
+    restored_manifest = json.loads((target_dir / "paxg_manifest.json").read_text(encoding="utf-8"))
+    assert restored_manifest["best_val_loss"] == 0.05
+
+    # 6. Assert no temporary backup or import directories were left behind
+    backup_dirs = [d for d in models_dir.iterdir() if d.name.startswith(".bak_replace_")]
+    assert len(backup_dirs) == 0, f"Lingering backup dirs: {backup_dirs}"
+
+    tmp_import_dirs = [d for d in models_dir.iterdir() if d.name.startswith(".tmp_import_")]
+    assert len(tmp_import_dirs) == 0, f"Lingering tmp_import dirs: {tmp_import_dirs}"
+
+    # 7. Assert registry metadata remains unchanged
+    assert store.get_alias(aid) == initial_alias
+
 
 
 
