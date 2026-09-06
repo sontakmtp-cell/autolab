@@ -36,35 +36,50 @@ class SplitPlan:
 def calculate_split_plan(
     total_candles: int,
     timeframe: str = "1h",
+    custom_test_start: int | None = None,
+    custom_test_end: int | None = None,
 ) -> SplitPlan:
     """Calculates leak-free temporal split boundaries according to plan specification.
 
     Specification:
-      - 90 days test (locked verification)
-      - 90 days prior split into 3 evaluation folds (30 days each)
+      - 90 days test (locked verification) or custom fresh interval (>= 20 blocks)
+      - Evaluation history prior to test split into 3 evaluation folds
       - Prior to each evaluation fold is training, with last 14 days for early stopping
       - Purge buffer between segments equals the timeframe horizon (24 for 1h, 6 for 4h)
     """
     horizon = get_horizon_for_timeframe(timeframe)
     candles_per_day = 24 if timeframe == "1h" else 6
 
-    test_len = 90 * candles_per_day
-    eval_fold_len = 30 * candles_per_day
-    early_stop_len = 14 * candles_per_day
-    total_eval_len = 3 * eval_fold_len  # 90 days
+    if custom_test_start is not None:
+        test_start = int(custom_test_start)
+        test_end = int(custom_test_end) if custom_test_end is not None else total_candles
+        eval_fold_len = 30 * candles_per_day
+        early_stop_len = 14 * candles_per_day
+        total_eval_len = 3 * eval_fold_len
+        eval_available = test_start - horizon
+        if eval_available < total_eval_len + early_stop_len:
+            scale_ratio = max(eval_available / (total_eval_len + early_stop_len + horizon), 0.2)
+            eval_fold_len = max(int(eval_fold_len * scale_ratio), 5 * candles_per_day)
+            early_stop_len = max(int(early_stop_len * scale_ratio), 2 * candles_per_day)
+            total_eval_len = 3 * eval_fold_len
+        eval_total_start = max(0, test_start - total_eval_len)
+    else:
+        test_len = 90 * candles_per_day
+        eval_fold_len = 30 * candles_per_day
+        early_stop_len = 14 * candles_per_day
+        total_eval_len = 3 * eval_fold_len  # 90 days
 
-    min_required = test_len + total_eval_len + early_stop_len + 2 * horizon
-    if total_candles < min_required:
-        # If total history is shorter, scale proportionally while preserving rules
-        scale_ratio = total_candles / min_required
-        test_len = max(int(test_len * scale_ratio), 30 * candles_per_day)
-        eval_fold_len = max(int(eval_fold_len * scale_ratio), 10 * candles_per_day)
-        early_stop_len = max(int(early_stop_len * scale_ratio), 5 * candles_per_day)
+        min_required = test_len + total_eval_len + early_stop_len + 2 * horizon
+        if total_candles < min_required:
+            # If total history is shorter, scale proportionally while preserving rules
+            scale_ratio = total_candles / min_required
+            test_len = max(int(test_len * scale_ratio), 30 * candles_per_day)
+            eval_fold_len = max(int(eval_fold_len * scale_ratio), 10 * candles_per_day)
+            early_stop_len = max(int(early_stop_len * scale_ratio), 5 * candles_per_day)
 
-    test_start = total_candles - test_len
-    test_end = total_candles
-
-    eval_total_start = test_start - (3 * eval_fold_len)
+        test_start = total_candles - test_len
+        test_end = total_candles
+        eval_total_start = test_start - (3 * eval_fold_len)
 
     folds = []
     for f in range(3):

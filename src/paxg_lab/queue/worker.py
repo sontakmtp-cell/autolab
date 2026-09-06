@@ -531,6 +531,11 @@ class GPUWorker:
                 current_phase = step_res.get("phase")
                 auto_state = self.storage.get_auto_run_state(timeframe)
 
+                # Check if auto run was stopped by user
+                if self.stop_event.is_set() or auto_state == AutoRunState.STOPPED:
+                    logger.info("Auto-run for %s is STOPPED or cancelled; skipping next step submission.", timeframe)
+                    return {"status": "cancelled", "message": "Auto-run stopped by user"}
+
                 # If tuning cycle has remaining steps and auto run is active, submit next step to queue
                 if current_phase != "WAITING_DATA" and auto_state in (AutoRunState.SEARCHING, AutoRunState.VALIDATING):
                     next_job_id = f"auto_step_{timeframe}_{int(time.time() * 1000)}"

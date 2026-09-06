@@ -85,6 +85,27 @@ class P6RunResult:
         return asdict(self)
 
 
+def get_top_unique_specs(study: optuna.Study, timeframe: str, top_n: int = 3) -> list[TrainSpec]:
+    """Extracts up to top_n unique hyperparameter configurations from completed study trials."""
+    completed = [t for t in study.trials if t.state == TrialState.COMPLETE and t.value is not None]
+    completed.sort(key=lambda t: float(t.value), reverse=True)
+    unique_specs: list[TrainSpec] = []
+    seen_params: set[tuple] = set()
+    for t in completed:
+        spec = suggest_trial_spec(t, timeframe=timeframe, seed=42)
+        key = (
+            spec.context_len, spec.lora_r, spec.lora_alpha, spec.learning_rate,
+            spec.lora_dropout, spec.weight_decay, spec.feature_set, str(spec.history_days),
+            spec.extended_targets,
+        )
+        if key not in seen_params:
+            seen_params.add(key)
+            unique_specs.append(spec)
+        if len(unique_specs) >= top_n:
+            break
+    return unique_specs
+
+
 class AutonomousTuningProtocol:
     """Coordinates autonomous Optuna search, multi-seed validation, and winner gatekeeping."""
 
@@ -111,10 +132,116 @@ class AutonomousTuningProtocol:
         self.startup_trials = startup_trials
         self.patience = patience
 
+        # Check if there is a previously consumed verification range
+        last_range = self.job_storage.get_latest_consumed_locked_range(self.timeframe)
+        custom_test_start = None
+        if last_range is not None:
+            _, last_end_ms = last_range
+            ts_arr = np.asarray(snapshot.timestamps)
+            after_idxs = np.where(ts_arr >= last_end_ms)[0]
+            if len(after_idxs) > 0:
+                custom_test_start = int(after_idxs[0])
+
         self.split_plan = calculate_split_plan(
             total_candles=len(snapshot.features_a),
             timeframe=self.timeframe,
+            custom_test_start=custom_test_start,
         )
+
+    def run_trial_fold_evaluation(
+        self,
+        spec: TrainSpec,
+        fold_id: int,
+        base_reference_report: ScoreReport,
+        custom_trainer_fn: Callable[[TrainSpec], Any] | None = None,
+        custom_eval_fn: Callable[[Any, TrainSpec], ScoreReport] | None = None,
+        fast_dev_mode: bool = False,
+        is_cancelled_func: Callable[[], bool] | None = None,
+    ) -> tuple[float, int, float]:
+        """Trains and evaluates a candidate spec on a single evaluation fold.
+
+        Returns:
+            Tuple of (composite_loss, best_epoch, val_loss).
+        """
+        if custom_eval_fn is not None:
+            report = custom_eval_fn(self.snapshot, spec)
+            fm = report.get_fold_metric(fold_id)
+            loss = fm.composite_loss if fm else 0.05
+            return float(loss), 2, 0.05
+
+        features_df = self.snapshot.to_dataframe(spec.feature_set)
+        features = self.snapshot.get_features(spec.feature_set)
+        targets = self.snapshot.features_a[:, 0]
+        timestamps = self.snapshot.timestamps
+
+        from timesfm3 import TimesFM3Torch
+
+        fold = next((f for f in self.split_plan.eval_folds if f.fold_id == fold_id), None)
+        if fold is None:
+            raise ValueError(f"Unknown fold_id {fold_id}")
+
+        if is_cancelled_func is not None and is_cancelled_func():
+            raise InterruptedError(f"Trial execution on fold {fold_id} cancelled by user request.")
+
+        base_model = TimesFM3Torch.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
+
+        eval_spec = TrainSpec.from_dict(spec.to_dict())
+        if fast_dev_mode:
+            eval_spec.max_epochs = 1
+            eval_spec.max_samples_per_epoch = 64
+
+        def check_cancel(record: dict[str, Any] | None = None) -> bool:
+            if is_cancelled_func is not None and is_cancelled_func():
+                return False
+            return True
+
+        trainer = LoRATrainer(base_model=base_model, spec=eval_spec)
+        train_res = trainer.train(
+            features_df=features_df,
+            snapshot_hash=self.snapshot.metadata.sha256,
+            fold_id=fold.fold_id,
+            progress_callback=check_cancel,
+        )
+
+        if is_cancelled_func is not None and is_cancelled_func():
+            raise InterruptedError(f"Trial execution on fold {fold_id} cancelled by user request.")
+
+        trial_adapter_id = f"trial_tmp_{self.timeframe}_f{fold.fold_id}_{int(time.time()*1000)}"
+        manifest = train_res.manifest
+        manifest.adapter_id = trial_adapter_id
+        saved_dir = self.store.save_adapter(
+            peft_model=train_res.trained_model,
+            manifest=manifest,
+            base_model=base_model,
+            smoke_test=False,
+        )
+
+        predictor = TimesFM3Predictor(adapter_path=saved_dir)
+        engine = BacktestEngine(predictor=predictor)
+        base_m = base_reference_report.get_fold_metric(fold.fold_id)
+        base_w_mae = base_m.weighted_mae if base_m else None
+        base_w_pinball = base_m.weighted_pinball if base_m else None
+
+        f_metric, _, _, _, _, _ = engine.evaluate_fold(
+            features=features,
+            targets=targets,
+            timestamps=timestamps,
+            timeframe=self.timeframe,
+            start_idx=fold.eval_start,
+            end_idx=fold.eval_end,
+            context_len=spec.context_len,
+            batch_size=16,
+            fold_id=fold.fold_id,
+            base_weighted_mae=base_w_mae,
+            base_weighted_pinball=base_w_pinball,
+            progress_callback=check_cancel,
+        )
+        composite_loss = float(f_metric.composite_loss)
+        best_epoch = int(train_res.best_epoch)
+        val_loss = float(train_res.best_val_loss)
+
+        self.store.delete_adapter(trial_adapter_id, use_trash=False)
+        return composite_loss, best_epoch, val_loss
 
     def run_trial_evaluation(
         self,
@@ -137,79 +264,26 @@ class AutonomousTuningProtocol:
             report = custom_eval_fn(self.snapshot, spec)
             return float(report.score), 2, 0.05
 
-        features_df = self.snapshot.to_dataframe(spec.feature_set)
-        features = self.snapshot.get_features(spec.feature_set)
-        targets = self.snapshot.features_a[:, 0]
-        timestamps = self.snapshot.timestamps
-
-        from timesfm3 import TimesFM3Torch
-
         fold_losses = []
         best_epochs = []
         val_losses = []
-
-        def check_cancel(record: dict[str, Any] | None = None) -> bool:
-            if is_cancelled_func is not None and is_cancelled_func():
-                return False
-            return True
 
         for fold in self.split_plan.eval_folds:
             if is_cancelled_func is not None and is_cancelled_func():
                 raise InterruptedError("Trial execution cancelled by user request.")
 
-            base_model = TimesFM3Torch.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
-
-            eval_spec = TrainSpec.from_dict(spec.to_dict())
-            if fast_dev_mode:
-                eval_spec.max_epochs = 1
-                eval_spec.max_samples_per_epoch = 64
-
-            trainer = LoRATrainer(base_model=base_model, spec=eval_spec)
-            train_res = trainer.train(
-                features_df=features_df,
-                snapshot_hash=self.snapshot.metadata.sha256,
+            loss, b_epoch, val_loss = self.run_trial_fold_evaluation(
+                spec=spec,
                 fold_id=fold.fold_id,
-                progress_callback=check_cancel,
+                base_reference_report=base_reference_report,
+                custom_trainer_fn=custom_trainer_fn,
+                custom_eval_fn=custom_eval_fn,
+                fast_dev_mode=fast_dev_mode,
+                is_cancelled_func=is_cancelled_func,
             )
-
-            if is_cancelled_func is not None and is_cancelled_func():
-                raise InterruptedError("Trial execution cancelled by user request.")
-
-            trial_adapter_id = f"trial_tmp_{self.timeframe}_f{fold.fold_id}_{int(time.time()*1000)}"
-            manifest = train_res.manifest
-            manifest.adapter_id = trial_adapter_id
-            saved_dir = self.store.save_adapter(
-                peft_model=train_res.trained_model,
-                manifest=manifest,
-                base_model=base_model,
-                smoke_test=False,
-            )
-
-            predictor = TimesFM3Predictor(adapter_path=saved_dir)
-            engine = BacktestEngine(predictor=predictor)
-            base_m = base_reference_report.get_fold_metric(fold.fold_id)
-            base_w_mae = base_m.weighted_mae if base_m else None
-            base_w_pinball = base_m.weighted_pinball if base_m else None
-
-            f_metric, _, _, _, _, _ = engine.evaluate_fold(
-                features=features,
-                targets=targets,
-                timestamps=timestamps,
-                timeframe=self.timeframe,
-                start_idx=fold.eval_start,
-                end_idx=fold.eval_end,
-                context_len=spec.context_len,
-                batch_size=16,
-                fold_id=fold.fold_id,
-                base_weighted_mae=base_w_mae,
-                base_weighted_pinball=base_w_pinball,
-                progress_callback=check_cancel,
-            )
-            fold_losses.append(f_metric.composite_loss)
-            best_epochs.append(train_res.best_epoch)
-            val_losses.append(train_res.best_val_loss)
-
-            self.store.delete_adapter(trial_adapter_id, use_trash=False)
+            fold_losses.append(loss)
+            best_epochs.append(b_epoch)
+            val_losses.append(val_loss)
 
         score_v1 = compute_score_v1(fold_losses)
         median_epoch = int(np.round(np.median(best_epochs))) if best_epochs else 2
@@ -364,6 +438,7 @@ class AutonomousTuningProtocol:
                     candidate_adapter_path=candidate_adapter_path,
                     store=self.store,
                     batch_size=16,
+                    split_plan=self.split_plan,
                     storage=self.job_storage,
                     is_cancelled_func=is_cancelled_func,
                 )
@@ -449,6 +524,9 @@ class AutonomousTuningProtocol:
         is_cancelled_func: Callable[[], bool] | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         fast_dev_mode: bool = False,
+        custom_trainer_fn: Callable[[TrainSpec], Any] | None = None,
+        custom_eval_fn: Callable[[Any, TrainSpec], ScoreReport] | None = None,
+        custom_test_eval_fn: Any = None,
     ) -> dict[str, Any]:
         """Executes a single bounded step of the autonomous tuning cycle."""
         limit_trials = max_trials or self.max_trials
@@ -467,10 +545,13 @@ class AutonomousTuningProtocol:
             )
             state = self.job_storage.get_auto_tune_run(self.timeframe)
             if self.job_storage.get_auto_run_state(self.timeframe) != AutoRunState.STOPPED:
-                self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.SEARCHING)
+                self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.SEARCHING, allow_unstop=False)
 
         phase = state.get("phase", "BASELINE")
         current_trial = int(state.get("current_trial", 0))
+
+        if self.job_storage.get_auto_run_state(self.timeframe) == AutoRunState.STOPPED:
+            raise InterruptedError("Auto-run is STOPPED by user.")
 
         if is_cancelled_func is not None and is_cancelled_func():
             raise InterruptedError(f"Step execution in phase '{phase}' cancelled by user request.")
@@ -478,9 +559,32 @@ class AutonomousTuningProtocol:
         # Phase 1: BASELINE
         if phase == "BASELINE":
             logger.info("Executing step: BASELINE for %s", self.timeframe)
+            if self.job_storage.get_auto_run_state(self.timeframe) == AutoRunState.STOPPED:
+                raise InterruptedError("Auto-run is STOPPED by user.")
             if self.job_storage.get_auto_run_state(self.timeframe) != AutoRunState.STOPPED:
-                self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.SEARCHING)
-            self.get_or_compute_base_report(is_cancelled_func=is_cancelled_func, progress_callback=progress_callback)
+                self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.SEARCHING, allow_unstop=False)
+            if custom_eval_fn is not None:
+                try:
+                    self.get_or_compute_base_report(is_cancelled_func=is_cancelled_func, progress_callback=progress_callback)
+                except Exception:
+                    pass
+            else:
+                self.get_or_compute_base_report(is_cancelled_func=is_cancelled_func, progress_callback=progress_callback)
+
+            step_ms = 3600 * 1000 if self.timeframe == "1h" else 4 * 3600 * 1000
+            test_start_ms = int(self.snapshot.timestamps[self.split_plan.test_start])
+            if self.split_plan.test_end < len(self.snapshot.timestamps):
+                test_end_ms = int(self.snapshot.timestamps[self.split_plan.test_end])
+            else:
+                test_end_ms = int(self.snapshot.timestamps[self.split_plan.test_end - 1]) + step_ms
+
+            test_range_info = {
+                "test_start_idx": self.split_plan.test_start,
+                "test_end_idx": self.split_plan.test_end,
+                "test_start_time_ms": test_start_ms,
+                "test_end_time_ms": test_end_ms,
+            }
+
             self.job_storage.save_auto_tune_run(
                 timeframe=self.timeframe,
                 snapshot_path=snap_path,
@@ -488,14 +592,25 @@ class AutonomousTuningProtocol:
                 phase="TRIAL",
                 current_trial=0,
                 max_trials=limit_trials,
+                current_fold=1,
+                selected_test_range_json=json.dumps(test_range_info),
             )
             return self.job_storage.get_auto_tune_run(self.timeframe) or {}
 
         # Phase 2: TRIAL
         elif phase == "TRIAL":
+            if self.job_storage.get_auto_run_state(self.timeframe) == AutoRunState.STOPPED:
+                raise InterruptedError("Auto-run is STOPPED by user.")
             if self.job_storage.get_auto_run_state(self.timeframe) != AutoRunState.STOPPED:
-                self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.SEARCHING)
-            base_report = self.get_or_compute_base_report(is_cancelled_func=is_cancelled_func, progress_callback=progress_callback)
+                self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.SEARCHING, allow_unstop=False)
+
+            if custom_eval_fn is not None:
+                try:
+                    base_report = self.get_or_compute_base_report(is_cancelled_func=is_cancelled_func, progress_callback=progress_callback)
+                except Exception:
+                    base_report = custom_eval_fn(self.snapshot, None)
+            else:
+                base_report = self.get_or_compute_base_report(is_cancelled_func=is_cancelled_func, progress_callback=progress_callback)
             optimizer = OptunaTPEOptimizer(
                 timeframe=self.timeframe,
                 snapshot=self.snapshot,
@@ -516,54 +631,13 @@ class AutonomousTuningProtocol:
             early_stop_cb.sync_from_study(study)
             completed_trials = len([t for t in study.trials if t.state == TrialState.COMPLETE])
 
-            def eval_trial(spec: TrainSpec, trial: optuna.Trial) -> float:
-                if is_cancelled_func is not None and is_cancelled_func():
-                    raise InterruptedError(f"Trial #{trial.number} cancelled by user request.")
-                if progress_callback:
-                    pct = 10.0 + (trial.number / limit_trials) * 50.0
-                    progress_callback({
-                        "message": f"Evaluating Trial #{trial.number}/{limit_trials} across 3 eval folds...",
-                        "progress_pct": min(pct, 60.0),
-                    })
-                score, _, _ = self.run_trial_evaluation(
-                    spec=spec,
-                    base_reference_report=base_report,
-                    fast_dev_mode=fast_dev_mode,
-                    is_cancelled_func=is_cancelled_func,
-                )
-                return score
-
-            def objective(trial: optuna.Trial) -> float:
-                spec = suggest_trial_spec(trial, timeframe=self.timeframe, seed=optimizer.seed)
-                trial.set_user_attr("timeframe", self.timeframe)
-                trial.set_user_attr("snapshot_sha256", self.snapshot.metadata.sha256)
-                trial.set_user_attr("context_len", spec.context_len)
-                trial.set_user_attr("lora_r", spec.lora_r)
-                trial.set_user_attr("lora_alpha", spec.lora_alpha)
-                trial.set_user_attr("learning_rate", spec.learning_rate)
-                trial.set_user_attr("lora_dropout", spec.lora_dropout)
-                trial.set_user_attr("weight_decay", spec.weight_decay)
-                trial.set_user_attr("feature_set", spec.feature_set)
-                trial.set_user_attr("history_days", str(spec.history_days))
-                trial.set_user_attr("extended_targets", spec.extended_targets)
-                score = eval_trial(spec, trial)
-                trial.set_user_attr("score_v1", score)
-                return score
-
-            # If stagnation reached or limit already met, advance immediately without executing extra trial
+            # Check if search phase is already completed
             if early_stop_cb.stopped_early or completed_trials >= limit_trials:
-                is_finished = True
-            else:
-                # Execute exactly 1 trial in this bounded step
-                study.optimize(objective, n_trials=1, callbacks=[early_stop_cb])
-                completed_trials = len([t for t in study.trials if t.state == TrialState.COMPLETE])
-                logger.info("Completed trial step for %s: %d completed trials so far.", self.timeframe, completed_trials)
-                is_finished = (completed_trials >= limit_trials) or early_stop_cb.stopped_early
-
-            # Check if search is complete
-            if is_finished and len(study.trials) > 0:
-                best_t = study.best_trial
-                best_spec = suggest_trial_spec(best_t, timeframe=self.timeframe, seed=42)
+                top_specs = get_top_unique_specs(study, timeframe=self.timeframe, top_n=3)
+                best_t = study.best_trial if len(study.trials) > 0 else None
+                best_val = study.best_value if len(study.trials) > 0 else None
+                best_num = best_t.number if best_t else None
+                best_spec = top_specs[0] if top_specs else suggest_trial_spec(best_t, timeframe=self.timeframe, seed=42)
                 self.job_storage.save_auto_tune_run(
                     timeframe=self.timeframe,
                     snapshot_path=snap_path,
@@ -571,14 +645,69 @@ class AutonomousTuningProtocol:
                     phase="MULTI_SEED",
                     current_trial=completed_trials,
                     max_trials=limit_trials,
-                    best_trial_num=best_t.number,
-                    best_score=best_t.value,
+                    best_trial_num=best_num,
+                    best_score=best_val,
                     best_spec_json=json.dumps(best_spec.to_dict()),
+                    top_specs_json=json.dumps([s.to_dict() for s in top_specs]),
+                    current_fold=1,
+                    intermediate_fold_results_json=None,
+                    multi_seed_config_idx=0,
+                    multi_seed_seed_idx=0,
+                    multi_seed_fold_idx=1,
+                    multi_seed_evaluations_json=json.dumps([]),
                 )
-                self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.VALIDATING)
+                if self.job_storage.get_auto_run_state(self.timeframe) != AutoRunState.STOPPED:
+                    self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.VALIDATING, allow_unstop=False)
+                return self.job_storage.get_auto_tune_run(self.timeframe) or {}
+
+            current_fold = int(state.get("current_fold") or 1)
+            inter_data_raw = state.get("intermediate_fold_results_json")
+            inter_data = json.loads(inter_data_raw) if inter_data_raw else None
+
+            if inter_data is None or inter_data.get("spec") is None:
+                trial = study.ask()
+                trial_num = trial.number
+                spec = suggest_trial_spec(trial, timeframe=self.timeframe, seed=optimizer.seed)
+                inter_data = {
+                    "trial_number": trial_num,
+                    "spec": spec.to_dict(),
+                    "fold_losses": [],
+                    "best_epochs": [],
+                    "val_losses": [],
+                }
+                current_fold = 1
             else:
-                best_val = study.best_value if len(study.trials) > 0 else None
-                best_num = study.best_trial.number if len(study.trials) > 0 else None
+                spec = TrainSpec.from_dict(inter_data["spec"])
+
+            if is_cancelled_func is not None and is_cancelled_func():
+                raise InterruptedError(f"Step execution cancelled by user request before fold {current_fold}.")
+
+            if progress_callback:
+                pct = 10.0 + (completed_trials / limit_trials) * 50.0 + (current_fold / 3.0) * (50.0 / limit_trials)
+                progress_callback({
+                    "message": f"Evaluating Trial #{inter_data['trial_number']}/{limit_trials}, Fold {current_fold}/3...",
+                    "progress_pct": min(pct, 60.0),
+                })
+
+            # Execute single bounded fold evaluation
+            loss, b_epoch, val_loss = self.run_trial_fold_evaluation(
+                spec=spec,
+                fold_id=current_fold,
+                base_reference_report=base_report,
+                custom_trainer_fn=custom_trainer_fn,
+                custom_eval_fn=custom_eval_fn,
+                fast_dev_mode=fast_dev_mode,
+                is_cancelled_func=is_cancelled_func,
+            )
+            inter_data["fold_losses"].append(loss)
+            inter_data["best_epochs"].append(b_epoch)
+            inter_data["val_losses"].append(val_loss)
+
+            if is_cancelled_func is not None and is_cancelled_func():
+                raise InterruptedError(f"Step execution cancelled by user request after fold {current_fold}.")
+
+            if current_fold < 3:
+                # Advance to next fold for next bounded job
                 self.job_storage.save_auto_tune_run(
                     timeframe=self.timeframe,
                     snapshot_path=snap_path,
@@ -586,46 +715,256 @@ class AutonomousTuningProtocol:
                     phase="TRIAL",
                     current_trial=completed_trials,
                     max_trials=limit_trials,
-                    best_trial_num=best_num,
-                    best_score=best_val,
+                    current_fold=current_fold + 1,
+                    intermediate_fold_results_json=json.dumps(inter_data),
                 )
+            else:
+                # Fold 3 complete -> finish trial in Optuna
+                score_v1 = float(compute_score_v1(inter_data["fold_losses"]))
+                t_num = int(inter_data["trial_number"])
+                trial = [t for t in study.trials if t.number == t_num][0]
+                study.tell(trial, score_v1)
+                trial.set_user_attr("timeframe", self.timeframe)
+                trial.set_user_attr("snapshot_sha256", self.snapshot.metadata.sha256)
+                trial.set_user_attr("score_v1", score_v1)
+                early_stop_cb.sync_from_study(study)
+                new_completed = len([t for t in study.trials if t.state == TrialState.COMPLETE])
+
+                is_finished = (new_completed >= limit_trials) or early_stop_cb.stopped_early
+                if is_finished:
+                    top_specs = get_top_unique_specs(study, timeframe=self.timeframe, top_n=3)
+                    best_t = study.best_trial
+                    best_val = study.best_value
+                    best_num = best_t.number if best_t else None
+                    best_spec = top_specs[0] if top_specs else suggest_trial_spec(best_t, timeframe=self.timeframe, seed=42)
+                    self.job_storage.save_auto_tune_run(
+                        timeframe=self.timeframe,
+                        snapshot_path=snap_path,
+                        snapshot_hash=snap_hash,
+                        phase="MULTI_SEED",
+                        current_trial=new_completed,
+                        max_trials=limit_trials,
+                        best_trial_num=best_num,
+                        best_score=best_val,
+                        best_spec_json=json.dumps(best_spec.to_dict()),
+                        top_specs_json=json.dumps([s.to_dict() for s in top_specs]),
+                        current_fold=1,
+                        intermediate_fold_results_json=None,
+                        multi_seed_config_idx=0,
+                        multi_seed_seed_idx=0,
+                        multi_seed_fold_idx=1,
+                        multi_seed_evaluations_json=json.dumps([]),
+                    )
+                    if self.job_storage.get_auto_run_state(self.timeframe) != AutoRunState.STOPPED:
+                        self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.VALIDATING, allow_unstop=False)
+                else:
+                    best_val = study.best_value if len(study.trials) > 0 else None
+                    best_num = study.best_trial.number if len(study.trials) > 0 else None
+                    self.job_storage.save_auto_tune_run(
+                        timeframe=self.timeframe,
+                        snapshot_path=snap_path,
+                        snapshot_hash=snap_hash,
+                        phase="TRIAL",
+                        current_trial=new_completed,
+                        max_trials=limit_trials,
+                        best_trial_num=best_num,
+                        best_score=best_val,
+                        current_fold=1,
+                        intermediate_fold_results_json=None,
+                    )
             return self.job_storage.get_auto_tune_run(self.timeframe) or {}
 
         # Phase 3: MULTI_SEED
         elif phase == "MULTI_SEED":
             logger.info("Executing step: MULTI_SEED for %s", self.timeframe)
-            self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.VALIDATING)
-            base_report = self.get_or_compute_base_report(is_cancelled_func=is_cancelled_func, progress_callback=progress_callback)
-            best_spec_dict = json.loads(state.get("best_spec_json") or "{}")
-            best_spec = TrainSpec.from_dict(best_spec_dict)
+            if self.job_storage.get_auto_run_state(self.timeframe) == AutoRunState.STOPPED:
+                raise InterruptedError("Auto-run is STOPPED by user.")
+            if self.job_storage.get_auto_run_state(self.timeframe) != AutoRunState.STOPPED:
+                self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.VALIDATING, allow_unstop=False)
+
+            if custom_eval_fn is not None:
+                try:
+                    base_report = self.get_or_compute_base_report(is_cancelled_func=is_cancelled_func, progress_callback=progress_callback)
+                except Exception:
+                    base_report = custom_eval_fn(self.snapshot, None)
+            else:
+                base_report = self.get_or_compute_base_report(is_cancelled_func=is_cancelled_func, progress_callback=progress_callback)
+
+            # Load top unique specs
+            top_specs_raw = state.get("top_specs_json")
+            if top_specs_raw:
+                top_specs = [TrainSpec.from_dict(d) for d in json.loads(top_specs_raw)]
+            else:
+                best_dict = json.loads(state.get("best_spec_json") or "{}")
+                top_specs = [TrainSpec.from_dict(best_dict)] if best_dict else []
+
+            if not top_specs:
+                top_specs = [TrainSpec(timeframe=self.timeframe, horizon=get_horizon_for_timeframe(self.timeframe))]
+
+            config_idx = int(state.get("multi_seed_config_idx") or 0)
+            seed_idx = int(state.get("multi_seed_seed_idx") or 0)
+            fold_idx = int(state.get("multi_seed_fold_idx") or 1)
+
+            evals_raw = state.get("multi_seed_evaluations_json")
+            evals = json.loads(evals_raw) if evals_raw else []
+            if not evals or len(evals) != len(top_specs):
+                evals = [
+                    {
+                        "config_idx": i,
+                        "seed_scores": {},
+                        "seed_best_epochs": {},
+                        "current_fold_losses": [],
+                        "current_best_epochs": [],
+                        "current_val_losses": [],
+                    }
+                    for i in range(len(top_specs))
+                ]
+
+            current_spec = top_specs[config_idx]
+            current_seed = SEEDS_MULTI_RUN[seed_idx]
+            seed_spec = TrainSpec.from_dict(current_spec.to_dict())
+            seed_spec.seed = current_seed
+
+            if is_cancelled_func is not None and is_cancelled_func():
+                raise InterruptedError(f"Multi-seed step cancelled before config {config_idx+1}, seed {current_seed}, fold {fold_idx}.")
 
             if progress_callback:
-                progress_callback({"message": "Running multi-seed verification across seeds [42, 123, 2026]...", "progress_pct": 65.0})
+                progress_callback({
+                    "message": f"Multi-seed verification: Config {config_idx+1}/{len(top_specs)}, Seed {current_seed}, Fold {fold_idx}/3...",
+                    "progress_pct": 65.0 + (config_idx * 3 + seed_idx) * 2.0,
+                })
 
-            multi_seed_res = self.run_multi_seed_verification(
-                best_spec=best_spec,
+            # Execute single fold
+            loss, b_epoch, val_loss = self.run_trial_fold_evaluation(
+                spec=seed_spec,
+                fold_id=fold_idx,
                 base_reference_report=base_report,
+                custom_trainer_fn=custom_trainer_fn,
+                custom_eval_fn=custom_eval_fn,
                 fast_dev_mode=fast_dev_mode,
                 is_cancelled_func=is_cancelled_func,
             )
+            evals[config_idx]["current_fold_losses"].append(loss)
+            evals[config_idx]["current_best_epochs"].append(b_epoch)
+            evals[config_idx]["current_val_losses"].append(val_loss)
 
-            self.job_storage.save_auto_tune_run(
-                timeframe=self.timeframe,
-                snapshot_path=snap_path,
-                snapshot_hash=snap_hash,
-                phase="FINAL_FIT",
-                current_trial=current_trial,
-                best_epoch=multi_seed_res.median_best_epoch,
-                multi_seed_results_json=json.dumps(multi_seed_res.to_dict()),
-            )
+            if is_cancelled_func is not None and is_cancelled_func():
+                raise InterruptedError(f"Multi-seed step cancelled after config {config_idx+1}, seed {current_seed}, fold {fold_idx}.")
+
+            if fold_idx < 3:
+                # Next fold of same seed
+                self.job_storage.save_auto_tune_run(
+                    timeframe=self.timeframe,
+                    snapshot_path=snap_path,
+                    snapshot_hash=snap_hash,
+                    phase="MULTI_SEED",
+                    current_trial=current_trial,
+                    max_trials=limit_trials,
+                    multi_seed_config_idx=config_idx,
+                    multi_seed_seed_idx=seed_idx,
+                    multi_seed_fold_idx=fold_idx + 1,
+                    multi_seed_evaluations_json=json.dumps(evals),
+                )
+            else:
+                # All 3 folds done for current_seed
+                seed_score = float(compute_score_v1(evals[config_idx]["current_fold_losses"]))
+                seed_epoch = int(np.round(np.median(evals[config_idx]["current_best_epochs"])))
+                s_key = str(current_seed)
+                evals[config_idx]["seed_scores"][s_key] = seed_score
+                evals[config_idx]["seed_best_epochs"][s_key] = seed_epoch
+                evals[config_idx]["current_fold_losses"] = []
+                evals[config_idx]["current_best_epochs"] = []
+                evals[config_idx]["current_val_losses"] = []
+
+                if seed_idx < len(SEEDS_MULTI_RUN) - 1:
+                    # Advance to next seed for this config
+                    self.job_storage.save_auto_tune_run(
+                        timeframe=self.timeframe,
+                        snapshot_path=snap_path,
+                        snapshot_hash=snap_hash,
+                        phase="MULTI_SEED",
+                        current_trial=current_trial,
+                        max_trials=limit_trials,
+                        multi_seed_config_idx=config_idx,
+                        multi_seed_seed_idx=seed_idx + 1,
+                        multi_seed_fold_idx=1,
+                        multi_seed_evaluations_json=json.dumps(evals),
+                    )
+                elif config_idx < len(top_specs) - 1:
+                    # Advance to next config
+                    self.job_storage.save_auto_tune_run(
+                        timeframe=self.timeframe,
+                        snapshot_path=snap_path,
+                        snapshot_hash=snap_hash,
+                        phase="MULTI_SEED",
+                        current_trial=current_trial,
+                        max_trials=limit_trials,
+                        multi_seed_config_idx=config_idx + 1,
+                        multi_seed_seed_idx=0,
+                        multi_seed_fold_idx=1,
+                        multi_seed_evaluations_json=json.dumps(evals),
+                    )
+                else:
+                    # All configs and all seeds evaluated!
+                    ranked_configs = []
+                    for idx, entry in enumerate(evals):
+                        scores = [float(entry["seed_scores"].get(str(s), 0.0)) for s in SEEDS_MULTI_RUN]
+                        epochs = [int(entry["seed_best_epochs"].get(str(s), 2)) for s in SEEDS_MULTI_RUN]
+                        med_score = float(np.median(scores))
+                        med_epoch = int(np.round(np.median(epochs)))
+                        min_score = float(np.min(scores))
+                        ranked_configs.append({
+                            "config_idx": idx,
+                            "spec": top_specs[idx],
+                            "median_score": med_score,
+                            "median_epoch": med_epoch,
+                            "min_score": min_score,
+                            "scores": scores,
+                            "best_epochs": epochs,
+                        })
+
+                    # Rank by median_score desc, min_score desc, config_idx asc
+                    ranked_configs.sort(key=lambda c: (c["median_score"], c["min_score"], -c["config_idx"]), reverse=True)
+                    winner = ranked_configs[0]
+                    best_spec = winner["spec"]
+                    best_epoch = winner["median_epoch"]
+
+                    multi_seed_summary = MultiSeedEvalSummary(
+                        seeds=list(SEEDS_MULTI_RUN),
+                        scores=winner["scores"],
+                        best_epochs=winner["best_epochs"],
+                        median_score=winner["median_score"],
+                        median_best_epoch=best_epoch,
+                    )
+                    logger.info(
+                        "Multi-seed completed across %d configs. Selected winner config #%d with median_score=%.2f, median_epoch=%d",
+                        len(top_specs), winner["config_idx"] + 1, winner["median_score"], best_epoch,
+                    )
+
+                    self.job_storage.save_auto_tune_run(
+                        timeframe=self.timeframe,
+                        snapshot_path=snap_path,
+                        snapshot_hash=snap_hash,
+                        phase="FINAL_FIT",
+                        current_trial=current_trial,
+                        max_trials=limit_trials,
+                        best_spec_json=json.dumps(best_spec.to_dict()),
+                        best_epoch=best_epoch,
+                        best_score=winner["median_score"],
+                        multi_seed_results_json=json.dumps(multi_seed_summary.to_dict()),
+                    )
             return self.job_storage.get_auto_tune_run(self.timeframe) or {}
 
         # Phase 4: FINAL_FIT
         elif phase == "FINAL_FIT":
             logger.info("Executing step: FINAL_FIT for %s", self.timeframe)
-            self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.VALIDATING)
+            if self.job_storage.get_auto_run_state(self.timeframe) == AutoRunState.STOPPED:
+                raise InterruptedError("Auto-run is STOPPED by user.")
+            if self.job_storage.get_auto_run_state(self.timeframe) != AutoRunState.STOPPED:
+                self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.VALIDATING, allow_unstop=False)
             if is_cancelled_func is not None and is_cancelled_func():
                 raise InterruptedError(f"Step execution in phase '{phase}' cancelled by user request.")
+
             best_spec_dict = json.loads(state.get("best_spec_json") or "{}")
             best_spec = TrainSpec.from_dict(best_spec_dict)
             best_epoch = int(state.get("best_epoch") or 2)
@@ -636,6 +975,7 @@ class AutonomousTuningProtocol:
             cand_id, cand_manifest, cand_path = self.train_final_candidate(
                 candidate_spec=best_spec,
                 best_epoch=best_epoch,
+                custom_trainer_fn=custom_trainer_fn,
                 fast_dev_mode=fast_dev_mode,
                 is_cancelled_func=is_cancelled_func,
                 progress_callback=progress_callback,
@@ -658,10 +998,20 @@ class AutonomousTuningProtocol:
         # Phase 5: LOCKED_VERIFICATION
         elif phase == "LOCKED_VERIFICATION":
             logger.info("Executing step: LOCKED_VERIFICATION for %s", self.timeframe)
-            self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.VALIDATING)
+            if self.job_storage.get_auto_run_state(self.timeframe) == AutoRunState.STOPPED:
+                raise InterruptedError("Auto-run is STOPPED by user.")
+            if self.job_storage.get_auto_run_state(self.timeframe) != AutoRunState.STOPPED:
+                self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.VALIDATING, allow_unstop=False)
             if is_cancelled_func is not None and is_cancelled_func():
                 raise InterruptedError(f"Step execution in phase '{phase}' cancelled by user request.")
-            base_report = self.get_or_compute_base_report(is_cancelled_func=is_cancelled_func, progress_callback=progress_callback)
+
+            if custom_eval_fn is not None:
+                try:
+                    base_report = self.get_or_compute_base_report(is_cancelled_func=is_cancelled_func, progress_callback=progress_callback)
+                except Exception:
+                    base_report = custom_eval_fn(self.snapshot, None)
+            else:
+                base_report = self.get_or_compute_base_report(is_cancelled_func=is_cancelled_func, progress_callback=progress_callback)
             cand_id = state.get("final_candidate_id")
             cand_path = Path(state.get("final_candidate_path") or "")
             cand_manifest = AdapterManifest.load_json(cand_path / "paxg_manifest.json")
@@ -673,6 +1023,7 @@ class AutonomousTuningProtocol:
                 candidate_manifest=cand_manifest,
                 candidate_adapter_path=cand_path,
                 base_reference_report=base_report,
+                custom_test_eval_fn=custom_test_eval_fn,
                 is_cancelled_func=is_cancelled_func,
             )
 
@@ -680,7 +1031,7 @@ class AutonomousTuningProtocol:
                 raise InterruptedError(f"Step execution in phase '{phase}' cancelled by user request.")
 
             # Complete cycle -> transition to WAITING_DATA
-            self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.WAITING_DATA)
+            self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.WAITING_DATA, allow_unstop=False)
             self.job_storage.save_auto_tune_run(
                 timeframe=self.timeframe,
                 snapshot_path=snap_path,
@@ -706,6 +1057,9 @@ class AutonomousTuningProtocol:
         is_cancelled_func: Callable[[], bool] | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         fast_dev_mode: bool = False,
+        custom_trainer_fn: Callable[[TrainSpec], Any] | None = None,
+        custom_eval_fn: Callable[[Any, TrainSpec], ScoreReport] | None = None,
+        custom_test_eval_fn: Any = None,
     ) -> P6RunResult:
         """Executes a full autonomous tuning cycle by looping execute_step until WAITING_DATA."""
         limit_trials = max_trials or self.max_trials
@@ -723,6 +1077,9 @@ class AutonomousTuningProtocol:
                 is_cancelled_func=is_cancelled_func,
                 progress_callback=progress_callback,
                 fast_dev_mode=fast_dev_mode,
+                custom_trainer_fn=custom_trainer_fn,
+                custom_eval_fn=custom_eval_fn,
+                custom_test_eval_fn=custom_test_eval_fn,
             )
             if st.get("phase") == "WAITING_DATA":
                 break

@@ -125,6 +125,7 @@ class OptunaTPEOptimizer:
         patience: int = 12,
         min_delta: float = 0.5,
         seed: int = 42,
+        study_name: str | None = None,
     ):
         self.timeframe = str(timeframe).lower().strip()
         if self.timeframe not in ("1h", "4h"):
@@ -139,13 +140,13 @@ class OptunaTPEOptimizer:
         self.min_delta = min_delta
         self.seed = seed
 
-        # Study name locked to timeframe and snapshot hash
+        # Study name locked to timeframe and snapshot hash (or custom name if specified)
         snap_hash = snapshot.metadata.sha256[:8]
-        self.study_name = f"study_{self.timeframe}_{snap_hash}"
+        self.study_name = study_name or f"study_{self.timeframe}_{snap_hash}"
         self.storage_url = f"sqlite:///{self.db_path.resolve()}"
 
-    def create_or_load_study(self) -> optuna.Study:
-        """Initializes or resumes persistent Optuna study."""
+    def create_or_load_study(self, repropose_prior: bool = True) -> optuna.Study:
+        """Initializes or resumes persistent Optuna study, re-proposing prior top params on new snapshots."""
         sampler = TPESampler(
             n_startup_trials=self.startup_trials,
             seed=self.seed,
@@ -158,6 +159,29 @@ class OptunaTPEOptimizer:
             direction="maximize",
             sampler=sampler,
         )
+        if repropose_prior and len(study.trials) == 0:
+            try:
+                all_studies = optuna.get_all_study_summaries(storage=self.storage_url)
+                prior_studies = [
+                    s for s in all_studies
+                    if s.study_name != self.study_name and (
+                        s.study_name.startswith(f"study_{self.timeframe}_") or self.timeframe in s.study_name
+                    )
+                ]
+                if not prior_studies:
+                    prior_studies = [s for s in all_studies if s.study_name != self.study_name]
+
+                for p_summary in prior_studies:
+                    if p_summary.best_trial is not None and p_summary.best_trial.params:
+                        logger.info(
+                            "Re-proposing prior best trial params from %s into new study %s",
+                            p_summary.study_name, self.study_name,
+                        )
+                        study.enqueue_trial(p_summary.best_trial.params)
+                        break
+            except Exception as e:
+                logger.warning("Could not re-propose prior study params: %s", e)
+
         return study
 
     def optimize(

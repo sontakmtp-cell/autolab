@@ -42,8 +42,10 @@ class GPUScheduler:
         heartbeat_timeout: float = 30.0,
         poll_interval: float = 0.5,
         acquire_coordinator_lock: bool = True,
+        snapshots_dir: Path | str | None = None,
     ):
         self.db_path = Path(db_path)
+        self.snapshots_dir = Path(snapshots_dir) if snapshots_dir is not None else None
         self.storage = GPUJobStorage(self.db_path)
         self.heartbeat_timeout = heartbeat_timeout
         self.poll_interval = poll_interval
@@ -516,18 +518,21 @@ class GPUScheduler:
             return False
 
     def _check_auto_tune_data_wakeup(self) -> None:
-        """Checks if timeframes in WAITING_DATA have accumulated >= 7 days of new data.
+        """Checks if timeframes in WAITING_DATA have accumulated enough new data for a new cycle.
 
-        If >= 7 days of new candles have arrived since the last completed auto run
-        (168 candles for 1h, 42 candles for 4h), resets the auto run and enqueues a new
-        AUTO_TRIAL step, transitioning state back to SEARCHING.
+        Per PLAN 3.5/3.6:
+        - First cycle can use standard 90-day test set.
+        - Subsequent cycles must verify on unseen post-lock data starting strictly after
+          the latest consumed verification end time, with >= 20 independent 24-hour blocks
+          (480 candles for 1h, 120 candles for 4h).
+        - 7 days (168 candles 1h / 42 candles 4h) is only the minimum wait before checking;
+          if < 20 blocks are available after the prior exam, the timeframe remains in WAITING_DATA.
         """
-        thresholds = {"1h": 168, "4h": 42}
-        snap_dir = Path("var/paxg_lab/snapshots")
+        snap_dir = self.snapshots_dir or Path("var/paxg_lab/snapshots")
         if not snap_dir.exists():
             return
 
-        for tf, req_new_candles in thresholds.items():
+        for tf in ("1h", "4h"):
             try:
                 auto_state = self.storage.get_auto_run_state(tf)
                 if auto_state != AutoRunState.WAITING_DATA:
@@ -537,19 +542,12 @@ class GPUScheduler:
                 if any(j.status in (JobStatus.QUEUED.value, JobStatus.RUNNING.value) for j in recent):
                     continue
 
-                run_state = self.storage.get_auto_tune_run(tf)
-                if not run_state:
-                    continue
-
-                last_consumed = run_state.get("last_consumed_candles")
-                if last_consumed is None:
-                    continue
-
                 candidates = sorted(snap_dir.glob(f"paxgusdt_{tf}_*"))
                 if not candidates:
                     continue
                 latest_snap = candidates[-1]
                 meta_file = latest_snap / "metadata.json"
+                ts_file = latest_snap / "timestamps.npy"
                 if not meta_file.exists():
                     continue
 
@@ -557,25 +555,59 @@ class GPUScheduler:
                     meta = json.load(f)
                 curr_candles = meta.get("total_candles", 0)
 
-                new_candles = curr_candles - last_consumed
-                if new_candles >= req_new_candles:
+                run_state = self.storage.get_auto_tune_run(tf)
+                last_consumed = run_state.get("last_consumed_candles") if run_state else None
+                last_range = self.storage.get_latest_consumed_locked_range(tf)
+
+                candles_per_24h = 24 if tf == "1h" else 6
+                min_exam_candles = 20 * candles_per_24h  # >= 20 independent 24h blocks (480 for 1h, 120 for 4h)
+                min_wait_candles = 7 * candles_per_24h   # 7-day minimum wait (168 for 1h, 42 for 4h)
+
+                if last_range is not None:
+                    # Subsequent cycle: check candles strictly after last_end_time_ms
+                    _, last_end_ms = last_range
+                    if ts_file.exists():
+                        import numpy as np
+                        ts = np.load(ts_file)
+                        after_count = int(np.sum(ts >= last_end_ms))
+                    else:
+                        # Fallback estimate from candle count difference
+                        diff = curr_candles - (last_consumed or 0)
+                        after_count = diff
+
+                    if after_count < min_exam_candles:
+                        # Not enough unseen data for >= 20 24h blocks yet; remain in WAITING_DATA
+                        continue
+
                     logger.info(
-                        "Auto wake-up: %s has %d new candles (>= threshold %d). Requeuing auto tune.",
-                        tf, new_candles, req_new_candles,
+                        "Auto wake-up: %s has %d unseen post-lock candles (>= required 20 blocks = %d). Requeuing auto tune.",
+                        tf, after_count, min_exam_candles,
                     )
-                    self.storage.reset_auto_tune_run(tf)
-                    self.storage.set_auto_run_state(tf, AutoRunState.SEARCHING)
-                    auto_job = JobSpec(
-                        job_id=f"auto_step_{tf}_{int(time.time() * 1000)}",
-                        job_type=JobType.AUTO_TRIAL.value,
-                        timeframe=tf,
-                        priority=JobPriority.AUTO.value,
-                        payload={"timeframe": tf, "snapshot_path": str(latest_snap)},
-                        timeout_seconds=1200.0,
-                    )
-                    self.storage.submit_job(auto_job)
+                else:
+                    # First cycle without prior consumed range: check 7-day or standard threshold
+                    if last_consumed is not None:
+                        new_candles = curr_candles - last_consumed
+                        if new_candles < min_wait_candles:
+                            continue
+
+                # Trigger new cycle
+                self.storage.reset_auto_tune_run(tf)
+                self.storage.set_auto_run_state(tf, AutoRunState.SEARCHING, allow_unstop=True)
+                auto_job = JobSpec(
+                    job_id=f"auto_step_{tf}_{int(time.time() * 1000)}",
+                    job_type=JobType.AUTO_TRIAL.value,
+                    timeframe=tf,
+                    priority=JobPriority.AUTO.value,
+                    payload={
+                        "timeframe": tf,
+                        "snapshot_path": str(latest_snap),
+                    },
+                    timeout_seconds=1200.0,
+                )
+                self.storage.submit_job(auto_job)
+                logger.info("Auto wake-up: enqueued fresh auto-tune job '%s' for %s.", auto_job.job_id, tf)
             except Exception as exc:
-                logger.warning("Error checking auto tune data wakeup for %s: %s", tf, exc)
+                logger.warning("Error checking auto wake-up for %s: %s", tf, exc)
 
     def _handle_oom_retry_if_needed(self, job: JobSpec) -> str | None:
         """Handles CUDA OOM failures according to job-type and priority-specific policies.
@@ -810,10 +842,10 @@ class GPUScheduler:
         """
         logger.info("Starting auto run for timeframe: %s", timeframe or "all")
         if timeframe in ("1h", "4h"):
-            self.storage.set_auto_run_state(timeframe, AutoRunState.SEARCHING)
+            self.storage.set_auto_run_state(timeframe, AutoRunState.SEARCHING, allow_unstop=True)
         else:
-            self.storage.set_auto_run_state("1h", AutoRunState.SEARCHING)
-            self.storage.set_auto_run_state("4h", AutoRunState.SEARCHING)
+            self.storage.set_auto_run_state("1h", AutoRunState.SEARCHING, allow_unstop=True)
+            self.storage.set_auto_run_state("4h", AutoRunState.SEARCHING, allow_unstop=True)
 
     def resume_auto_run(self, timeframe: str | None = None) -> None:
         """Alias for start_auto_run."""

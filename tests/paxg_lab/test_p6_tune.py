@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import time
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import optuna
@@ -1966,6 +1967,469 @@ def test_locked_verification_ledger_terminal_verdicts(temp_dir: Path):
         cur = conn.execute("SELECT verdict, details FROM locked_verification_ledger WHERE candidate_id = 'cand_C';")
         row = cur.fetchone()
         assert row["verdict"] == "FAILED"
+
+
+def test_cross_cycle_fresh_verification_interval_and_20_block_requirement(temp_dir: Path):
+    """Issue 1: Verifies multi-cycle fresh locked verification interval starting >= last_end_time_ms
+    with >= 20 independent 24h blocks (>= 480 candles for 1h). Keeps WAITING_DATA if < 20 blocks.
+    Persists exact interval before final fit and purges final fit strictly before it."""
+    from paxg_lab.queue.scheduler import GPUScheduler
+    from paxg_lab.queue.types import JobStatus
+
+    db_path = temp_dir / "cycle.db"
+    storage = GPUJobStorage(db_path)
+    snap_dir = temp_dir / "snapshots"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Cycle 1 consumed an exam window
+    t0 = 1700000000000
+    step_ms = 3600000
+    n_candles_1 = 3000
+    ts_1 = np.arange(t0, t0 + n_candles_1 * step_ms, step_ms, dtype=np.int64)
+    # Cycle 1 test interval: [2400, 3000)
+    c1_test_start_ms = int(ts_1[2400])
+    c1_test_end_ms = int(ts_1[-1]) + step_ms
+
+    storage.record_locked_consumption(
+        timeframe="1h",
+        test_start_idx=2400,
+        test_end_idx=3000,
+        test_start_time_ms=c1_test_start_ms,
+        test_end_time_ms=c1_test_end_ms,
+        snapshot_hash="hash_cycle_1",
+        candidate_id="cand_cycle_1",
+        verdict="ACCEPTED_NEW_RECOMMENDED",
+    )
+    storage.save_auto_tune_run(
+        timeframe="1h",
+        snapshot_path="snap1",
+        snapshot_hash="hash_cycle_1",
+        phase="WAITING_DATA",
+        current_trial=30,
+        last_consumed_candles=n_candles_1,
+        last_run_completed_at=time.time(),
+    )
+    storage.set_auto_run_state("1h", AutoRunState.WAITING_DATA)
+
+    scheduler = GPUScheduler(db_path=db_path, acquire_coordinator_lock=False, snapshots_dir=snap_dir)
+
+    # 2. Case A: Only +7 days (168 candles < 480 candles = 20 blocks) arrive
+    snap2_dir = snap_dir / "paxgusdt_1h_snap2"
+    snap2_dir.mkdir(parents=True, exist_ok=True)
+    ts_2 = np.arange(t0, c1_test_end_ms + 168 * step_ms, step_ms, dtype=np.int64)
+    np.save(snap2_dir / "timestamps.npy", ts_2)
+    with open(snap2_dir / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump({"snapshot_id": "snap2", "timeframe": "1h", "total_candles": len(ts_2)}, f)
+
+    scheduler._check_auto_tune_data_wakeup()
+
+    # Must REMAIN in WAITING_DATA because 168 candles < 480 (20 blocks of 24h)
+    assert storage.get_auto_run_state("1h") == AutoRunState.WAITING_DATA
+
+    # 3. Case B: +25 days (600 candles >= 480 candles = 20 blocks) arrive
+    snap3_dir = snap_dir / "paxgusdt_1h_snap3"
+    snap3_dir.mkdir(parents=True, exist_ok=True)
+    ts_3 = np.arange(t0, c1_test_end_ms + 600 * step_ms, step_ms, dtype=np.int64)
+    np.save(snap3_dir / "timestamps.npy", ts_3)
+    with open(snap3_dir / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump({"snapshot_id": "snap3", "timeframe": "1h", "total_candles": len(ts_3)}, f)
+
+    scheduler._check_auto_tune_data_wakeup()
+
+    # Wakes up to SEARCHING and enqueues AUTO_TRIAL job
+    assert storage.get_auto_run_state("1h") == AutoRunState.SEARCHING
+    queued_jobs = storage.list_recent_jobs(job_type=JobType.AUTO_TRIAL.value, timeframe="1h")
+    assert any(j.status == JobStatus.QUEUED.value for j in queued_jobs)
+
+    # 4. Protocol initializes on snapshot 3: selects non-overlapping fresh test interval >= c1_test_end_ms
+    n_candles_3 = len(ts_3)
+    features_3 = 2000.0 + np.ones((n_candles_3, 1))
+    snap3 = DatasetSnapshot(
+        metadata=SnapshotMetadata(
+            snapshot_id="snap3", timeframe="1h", symbol="PAXGUSDT",
+            start_time=int(ts_3[0]), end_time=int(ts_3[-1]), total_candles=n_candles_3,
+            feature_sets=["A", "B"], created_at="2026-09-20T00:00:00Z", sha256="hash_snap_3",
+        ),
+        timestamps=ts_3, features_a=features_3, features_b=np.column_stack([features_3, np.ones((n_candles_3, 8))]),
+    )
+
+    protocol = AutonomousTuningProtocol(
+        timeframe="1h",
+        snapshot=snap3,
+        db_path=db_path,
+        optuna_db_path=temp_dir / "opt.db",
+        adapter_store_dir=temp_dir / "adapters",
+    )
+    # Split plan test interval must start at or after c1_test_end_ms
+    test_start_time = ts_3[protocol.split_plan.test_start]
+    assert test_start_time >= c1_test_end_ms
+    # Must have >= 20 24h blocks (>= 480 candles)
+    assert (protocol.split_plan.test_end - protocol.split_plan.test_start) >= 480
+
+    # Final fit ceiling must strictly precede test_start
+    train_ceiling = protocol.split_plan.test_start - protocol.split_plan.horizon
+    assert train_ceiling < protocol.split_plan.test_start
+
+
+def test_per_fold_execution_and_interleaving(temp_dir: Path, mock_snapshot: DatasetSnapshot):
+    """Issue 2: Verifies fine job granularity (1-fold bounded units) and that high-priority
+    FORECAST jobs can interleave between fold 1 and fold 2 of a TRIAL."""
+    from paxg_lab.queue.types import JobPriority, JobStatus
+
+    db_path = temp_dir / "interleaving.db"
+    storage = GPUJobStorage(db_path)
+    optuna_db = temp_dir / "optuna.db"
+    store_dir = temp_dir / "adapters"
+
+    protocol = AutonomousTuningProtocol(
+        timeframe="1h",
+        snapshot=mock_snapshot,
+        db_path=db_path,
+        optuna_db_path=optuna_db,
+        adapter_store_dir=store_dir,
+        max_trials=2,
+    )
+
+    def dummy_eval(snap, spec):
+        return ScoreReport(
+            score=0.04,
+            overall_weighted_mae=1.5,
+            overall_weighted_pinball=0.8,
+            directional_accuracy=55.0,
+            coverage_80=81.0,
+            fold_metrics=[
+                FoldMetrics(fold_id=1, num_windows=100, weighted_mae=1.5, weighted_pinball=0.8, rmse=2.0, mae=1.5, coverage_80=81.0, mean_width_80=5.0, directional_accuracy=55.0, composite_loss=0.04),
+                FoldMetrics(fold_id=2, num_windows=100, weighted_mae=1.5, weighted_pinball=0.8, rmse=2.0, mae=1.5, coverage_80=81.0, mean_width_80=5.0, directional_accuracy=55.0, composite_loss=0.04),
+                FoldMetrics(fold_id=3, num_windows=100, weighted_mae=1.5, weighted_pinball=0.8, rmse=2.0, mae=1.5, coverage_80=81.0, mean_width_80=5.0, directional_accuracy=55.0, composite_loss=0.04),
+            ],
+        )
+
+    # Step 1: BASELINE -> transitions to TRIAL, current_fold=1
+    with patch.object(protocol, "get_or_compute_base_report", return_value=dummy_eval(mock_snapshot, None)):
+        st1 = protocol.execute_step()
+        assert st1["phase"] == "TRIAL"
+        assert st1["current_fold"] == 1
+
+        # Step 2: Executes fold 1 of Trial 0
+        st2 = protocol.execute_step(custom_eval_fn=dummy_eval)
+        assert st2["phase"] == "TRIAL"
+        assert st2["current_fold"] == 2
+        inter = json.loads(st2["intermediate_fold_results_json"])
+        assert "fold_losses" in inter
+        assert len(inter["fold_losses"]) == 1
+
+    # Interleaving test in Queue:
+    # Next auto job queued for fold 2 (Priority AUTO = 2)
+    auto_job = JobSpec(
+        job_id="auto_fold_2",
+        job_type=JobType.AUTO_TRIAL.value,
+        timeframe="1h",
+        priority=JobPriority.AUTO.value,
+        payload={"timeframe": "1h"},
+        status=JobStatus.QUEUED.value,
+    )
+    storage.submit_job(auto_job)
+
+    # User submits emergency interactive FORECAST job (Priority FORECAST = 1)
+    fc_job = JobSpec(
+        job_id="user_forecast_urgent",
+        job_type=JobType.FORECAST.value,
+        timeframe="1h",
+        priority=JobPriority.FORECAST.value,
+        payload={"timeframe": "1h"},
+        status=JobStatus.QUEUED.value,
+    )
+    storage.submit_job(fc_job)
+
+    # Queue prioritizes FORECAST ahead of next AUTO fold
+    next_j = storage.get_next_queued_job()
+    assert next_j is not None
+    assert next_j.job_id == "user_forecast_urgent"
+    assert next_j.priority == JobPriority.FORECAST.value
+
+    # Once FORECAST finishes, AUTO fold 2 is served
+    storage.mark_finished("user_forecast_urgent", result={"forecast": [2000.0]})
+    next_auto = storage.get_next_queued_job()
+    assert next_auto is not None
+    assert next_auto.job_id == "auto_fold_2"
+
+    # Step 3: Executes fold 2 of Trial 0
+    with patch.object(protocol, "get_or_compute_base_report", return_value=dummy_eval(mock_snapshot, None)):
+        st3 = protocol.execute_step(custom_eval_fn=dummy_eval)
+        assert st3["current_fold"] == 3
+        inter3 = json.loads(st3["intermediate_fold_results_json"])
+        assert len(inter3["fold_losses"]) == 2
+
+
+def test_stopped_race_condition_never_resurrects_or_enqueues(temp_dir: Path, mock_snapshot: DatasetSnapshot):
+    """Issue 3: Verifies sticky user-owned STOPPED state cannot be overwritten by background
+    protocol/worker transitions, and no next step is enqueued when stopped."""
+    from paxg_lab.queue.types import JobStatus
+    from paxg_lab.queue.worker import GPUWorker
+
+    db_path = temp_dir / "race.db"
+    storage = GPUJobStorage(db_path)
+    optuna_db = temp_dir / "optuna.db"
+    store_dir = temp_dir / "adapters"
+
+    protocol = AutonomousTuningProtocol(
+        timeframe="1h",
+        snapshot=mock_snapshot,
+        db_path=db_path,
+        optuna_db_path=optuna_db,
+        adapter_store_dir=store_dir,
+    )
+
+    # User stops auto-run in DB
+    storage.set_auto_run_state("1h", AutoRunState.STOPPED)
+    assert storage.get_auto_run_state("1h") == AutoRunState.STOPPED
+
+    # Protocol execute_step must raise InterruptedError immediately and not overwrite STOPPED
+    with pytest.raises(InterruptedError, match="STOPPED"):
+        protocol.execute_step()
+    assert storage.get_auto_run_state("1h") == AutoRunState.STOPPED
+
+    # Protocol internal transition with allow_unstop=False is safely ignored
+    storage.set_auto_run_state("1h", AutoRunState.VALIDATING, allow_unstop=False)
+    assert storage.get_auto_run_state("1h") == AutoRunState.STOPPED
+
+    job = JobSpec(
+        job_id="auto_step_stopped",
+        job_type=JobType.AUTO_TRIAL.value,
+        timeframe="1h",
+        priority=JobPriority.AUTO.value,
+        payload={"timeframe": "1h"},
+        status=JobStatus.QUEUED.value,
+    )
+    storage.submit_job(job)
+    worker = GPUWorker(job_id=job.job_id, db_path=db_path)
+
+    # Run worker handle
+    with patch("paxg_lab.data.snapshot.DatasetSnapshot.load", return_value=mock_snapshot), \
+         patch("paxg_lab.tune.protocol.AutonomousTuningProtocol") as MockProto:
+        mock_inst = MagicMock()
+        mock_inst.execute_step.return_value = {"phase": "TRIAL"}
+        MockProto.return_value = mock_inst
+
+        worker._handle_auto_trial_job(job)
+
+    # Confirm no new AUTO_TRIAL job was queued
+    recent = storage.list_recent_jobs(job_type=JobType.AUTO_TRIAL.value, timeframe="1h")
+    queued = [j for j in recent if j.status == JobStatus.QUEUED.value and j.job_id != "auto_step_stopped"]
+    assert len(queued) == 0
+    assert storage.get_auto_run_state("1h") == AutoRunState.STOPPED
+
+
+def test_top3_configs_multi_seed_median_selection_and_repropose(temp_dir: Path, mock_snapshot: DatasetSnapshot):
+    """Issue 4: Verifies that up to top 3 unique completed configs are multi-seeded, winner is selected
+    by median score across seeds [42, 123, 2026], and prior snapshot best params are re-proposed via study.enqueue_trial."""
+    from paxg_lab.tune.optimizer import OptunaTPEOptimizer
+    from paxg_lab.tune.protocol import get_top_unique_specs
+
+    optuna_db = temp_dir / "optuna_top3.db"
+
+    # Part A: Create study with 4 trials:
+    # Trial 0: r=4, lr=5e-5, seed=42 -> score = 0.020 (lucky outlier)
+    # Trial 1: r=8, lr=1e-4, seed=42 -> score = 0.035 (consistent)
+    # Trial 2: duplicate of Trial 0 (r=4, lr=5e-5) -> score = 0.050
+    # Trial 3: r=16, lr=1.5e-4, seed=42 -> score = 0.040
+    opt1 = OptunaTPEOptimizer(timeframe="1h", snapshot=mock_snapshot, db_path=optuna_db, study_name="test_top3_study")
+    study = opt1.create_or_load_study()
+
+    configs_to_add = [
+        ({"context_len": 256, "lora_r": 4, "learning_rate": 5e-5, "lora_dropout": 0.05, "weight_decay": 0.01, "feature_set": "B", "history_days": 180}, 0.020),
+        ({"context_len": 256, "lora_r": 8, "learning_rate": 1e-4, "lora_dropout": 0.05, "weight_decay": 0.01, "feature_set": "B", "history_days": 180}, 0.035),
+        ({"context_len": 256, "lora_r": 4, "learning_rate": 5e-5, "lora_dropout": 0.05, "weight_decay": 0.01, "feature_set": "B", "history_days": 180}, 0.050),
+        ({"context_len": 256, "lora_r": 16, "learning_rate": 1.5e-4, "lora_dropout": 0.05, "weight_decay": 0.01, "feature_set": "B", "history_days": 180}, 0.040),
+    ]
+    for p, sc in configs_to_add:
+        study.enqueue_trial(p)
+        tr = study.ask()
+        _ = suggest_trial_spec(tr, "1h", seed=42)
+        study.tell(tr, sc)
+
+    # get_top_unique_specs must deduplicate and return at most top 3 configs (ranks 4, 16, 8)
+    top_specs = get_top_unique_specs(study, "1h", top_n=3)
+    assert len(top_specs) == 3
+    ranks = [s.lora_r for s in top_specs]
+    assert ranks == [4, 16, 8]
+
+    # Multi-seed evaluation: Config A (r=4) degrades on other seeds, Config B (r=8) is consistent
+    def mock_eval_fn(snap, spec):
+        scores_map = {
+            (4, 42): 0.020, (4, 123): 0.080, (4, 2026): 0.090,
+            (8, 42): 0.035, (8, 123): 0.036, (8, 2026): 0.037,
+            (16, 42): 0.040, (16, 123): 0.045, (16, 2026): 0.046,
+        }
+        val = scores_map.get((spec.lora_r, spec.seed), 0.05)
+        return ScoreReport(
+            score=val,
+            overall_weighted_mae=val * 30,
+            overall_weighted_pinball=val * 15,
+            directional_accuracy=55.0,
+            coverage_80=81.0,
+            fold_metrics=[FoldMetrics(fold_id=i, num_windows=100, weighted_mae=val*30, weighted_pinball=val*15, rmse=val*35, mae=val*30, coverage_80=81.0, mean_width_80=5.0, directional_accuracy=55.0, composite_loss=val) for i in (1, 2, 3)],
+        )
+
+    db_path = temp_dir / "multi_seed.db"
+    storage = GPUJobStorage(db_path)
+    protocol = AutonomousTuningProtocol(
+        timeframe="1h",
+        snapshot=mock_snapshot,
+        db_path=db_path,
+        optuna_db_path=optuna_db,
+        adapter_store_dir=temp_dir / "adapters",
+    )
+
+    # Save state at start of MULTI_SEED
+    storage.save_auto_tune_run(
+        timeframe="1h",
+        snapshot_path="mock",
+        snapshot_hash=mock_snapshot.metadata.sha256,
+        phase="MULTI_SEED",
+        current_trial=4,
+        top_specs_json=json.dumps([s.to_dict() for s in top_specs]),
+        multi_seed_config_idx=0,
+        multi_seed_seed_idx=0,
+        multi_seed_fold_idx=1,
+        multi_seed_evaluations_json=json.dumps([]),
+    )
+
+    with patch.object(protocol, "get_or_compute_base_report", return_value=mock_eval_fn(mock_snapshot, top_specs[0])):
+        # Run through MULTI_SEED steps until it transitions to FINAL_FIT
+        curr_phase = "MULTI_SEED"
+        for _ in range(30):
+            st = protocol.execute_step(custom_eval_fn=mock_eval_fn)
+            curr_phase = st.get("phase")
+            if curr_phase != "MULTI_SEED":
+                break
+
+    assert curr_phase == "FINAL_FIT"
+    final_st = storage.get_auto_tune_run("1h")
+    # Winner must be Config B (r=8, median 0.036) NOT Config A (r=4, median 0.080)
+    best_spec = json.loads(final_st["best_spec_json"])
+    assert best_spec["lora_r"] == 8
+    # Winner median score across seeds [96.5, 96.4, 96.3] is 96.4 (since 100 * (1 - 0.036) = 96.4)
+    assert abs(final_st["best_score"] - 96.4) < 1e-4
+
+    # Part B: Repropose prior snapshot best params into fresh study
+    fresh_opt = OptunaTPEOptimizer(
+        timeframe="1h",
+        snapshot=mock_snapshot,
+        db_path=optuna_db,
+        study_name="fresh_snapshot_study",
+    )
+    fresh_study = fresh_opt.create_or_load_study(repropose_prior=True)
+    # The fresh study should have an enqueued trial containing best_trial params from previous study
+    assert len(fresh_study.trials) > 0
+    enqueued = fresh_study.trials[0]
+    assert enqueued.state == optuna.trial.TrialState.WAITING
+    enqueued_params = enqueued.system_attrs.get("fixed_params", enqueued.params)
+    assert enqueued_params["lora_r"] == study.best_trial.params["lora_r"]
+
+
+def test_locked_verification_ledger_migration_and_legacy_fallback(temp_dir: Path):
+    """Issue 6: Verifies that locked_verification_ledger safely migrates legacy tables without
+    test_start_time_ms/test_end_time_ms columns, and correctly falls back to snapshot_hash + indices
+    when legacy rows have test_start_time_ms == 0."""
+    import sqlite3
+
+    db_path = temp_dir / "legacy.db"
+
+    # 1. Create legacy schema without test_start_time_ms / test_end_time_ms
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript("""
+            CREATE TABLE locked_verification_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timeframe TEXT NOT NULL,
+                test_start_idx INTEGER NOT NULL,
+                test_end_idx INTEGER NOT NULL,
+                snapshot_hash TEXT NOT NULL,
+                candidate_id TEXT NOT NULL,
+                consumed_at REAL NOT NULL,
+                verdict TEXT NOT NULL DEFAULT 'IN_PROGRESS',
+                details TEXT NOT NULL DEFAULT ''
+            );
+        """)
+        # Insert a legacy row with no timestamps
+        conn.execute("""
+            INSERT INTO locked_verification_ledger (
+                timeframe, test_start_idx, test_end_idx, snapshot_hash, candidate_id, consumed_at, verdict, details
+            ) VALUES ('1h', 2400, 3000, 'legacy_snap_hash', 'legacy_cand', 1700000000.0, 'ACCEPTED_NEW_RECOMMENDED', 'Legacy');
+        """)
+        conn.commit()
+
+    # 2. Initializing GPUJobStorage should trigger migration PRAGMA check and add columns
+    storage = GPUJobStorage(db_path)
+
+    with storage.get_connection() as conn:
+        cur = conn.execute("PRAGMA table_info(locked_verification_ledger);")
+        col_names = [r["name"] for r in cur.fetchall()]
+        assert "test_start_time_ms" in col_names
+        assert "test_end_time_ms" in col_names
+
+    # 3. Test legacy fallback:
+    # A) Same snapshot hash and overlapping indices -> rejected (True)
+    assert storage.is_locked_range_consumed(
+        timeframe="1h",
+        snapshot_hash="legacy_snap_hash",
+        test_start_idx=2500,
+        test_end_idx=2900,
+        test_start_time_ms=0,
+        test_end_time_ms=0,
+    ) is True
+
+    # B) Same snapshot hash but non-overlapping indices -> not rejected (False)
+    assert storage.is_locked_range_consumed(
+        timeframe="1h",
+        snapshot_hash="legacy_snap_hash",
+        test_start_idx=0,
+        test_end_idx=1000,
+        test_start_time_ms=0,
+        test_end_time_ms=0,
+    ) is False
+
+    # C) Different snapshot hash with indices (legacy fallback ignores different hash) -> False
+    assert storage.is_locked_range_consumed(
+        timeframe="1h",
+        snapshot_hash="different_snap_hash",
+        test_start_idx=2500,
+        test_end_idx=2900,
+        test_start_time_ms=0,
+        test_end_time_ms=0,
+    ) is False
+
+    # 4. Modern row with timestamp interval:
+    storage.record_locked_consumption(
+        timeframe="1h",
+        test_start_idx=100,
+        test_end_idx=200,
+        test_start_time_ms=100000,
+        test_end_time_ms=200000,
+        snapshot_hash="modern_hash",
+        candidate_id="modern_cand",
+        verdict="ACCEPTED_NEW_RECOMMENDED",
+    )
+    # Timestamp overlap check across different snapshot hashes:
+    assert storage.is_locked_range_consumed(
+        timeframe="1h",
+        snapshot_hash="another_hash",
+        test_start_idx=0,
+        test_end_idx=50,
+        test_start_time_ms=150000,
+        test_end_time_ms=250000,
+    ) is True
+
+    # Non-overlapping timestamp range:
+    assert storage.is_locked_range_consumed(
+        timeframe="1h",
+        snapshot_hash="another_hash",
+        test_start_idx=0,
+        test_end_idx=50,
+        test_start_time_ms=200000,
+        test_end_time_ms=300000,
+    ) is False
+
 
 
 

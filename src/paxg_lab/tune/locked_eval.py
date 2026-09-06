@@ -86,6 +86,7 @@ def run_locked_verification(
     batch_size: int = 16,
     storage: Any | None = None,
     is_cancelled_func: Callable[[], bool] | None = None,
+    split_plan: SplitPlan | None = None,
 ) -> LockedVerificationReport:
     """Executes single-pass evaluation strictly on the locked test set [test_start, test_end).
 
@@ -99,10 +100,23 @@ def run_locked_verification(
     block_len = get_block_size_for_timeframe(timeframe)
     weights = get_horizon_weights(timeframe)
 
-    split_plan = calculate_split_plan(
-        total_candles=len(snapshot.features_a),
-        timeframe=timeframe,
-    )
+    if split_plan is None:
+        # Check if storage has persisted selected_test_range or prior consumed range
+        custom_test_start = None
+        if storage is not None and hasattr(storage, "get_auto_tune_run"):
+            run_st = storage.get_auto_tune_run(timeframe)
+            if run_st and run_st.get("selected_test_range_json"):
+                try:
+                    s_data = json.loads(run_st["selected_test_range_json"])
+                    custom_test_start = s_data.get("test_start_idx")
+                except Exception:
+                    pass
+
+        split_plan = calculate_split_plan(
+            total_candles=len(snapshot.features_a),
+            timeframe=timeframe,
+            custom_test_start=custom_test_start,
+        )
     test_start = split_plan.test_start
     test_end = split_plan.test_end
     snapshot_hash = ""
@@ -123,7 +137,14 @@ def run_locked_verification(
 
     # 1. Enforce statistical lock via SQLite audit ledger
     if storage is not None:
-        if storage.is_locked_range_consumed(timeframe, test_start_time_ms, test_end_time_ms):
+        if storage.is_locked_range_consumed(
+            timeframe=timeframe,
+            test_start_time_ms=test_start_time_ms,
+            test_end_time_ms=test_end_time_ms,
+            snapshot_hash=snapshot_hash,
+            test_start_idx=test_start,
+            test_end_idx=test_end,
+        ):
             raise RuntimeError(
                 f"Statistical lock violation: locked verification interval [{test_start_time_ms}, {test_end_time_ms}) "
                 f"for timeframe '{timeframe}' overlaps previously consumed test data in ledger. "
@@ -139,6 +160,7 @@ def run_locked_verification(
             snapshot_hash=snapshot_hash,
             candidate_id=candidate_manifest.adapter_id,
             verdict="IN_PROGRESS",
+            details="Locked verification initiated.",
         )
 
     logger.info(
