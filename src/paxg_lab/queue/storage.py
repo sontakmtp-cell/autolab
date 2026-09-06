@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Any
+import uuid
 
 from .types import AutoRunState, JobPriority, JobSpec, JobStatus
 
@@ -74,8 +75,15 @@ class GPUJobStorage:
                 );
             """)
 
-    def submit_job(self, job_spec: JobSpec) -> str:
+    def submit_job(self, job_spec: JobSpec, reject_if_stopped: bool = False) -> str:
         """Submits a job to the queue, enforcing atomic idempotency deduplication on active jobs."""
+        if reject_if_stopped and job_spec.priority == JobPriority.AUTO.value:
+            tf = job_spec.timeframe or "1h"
+            if self.get_auto_run_state(tf) == AutoRunState.STOPPED:
+                raise ValueError(
+                    f"Cannot submit AUTO job for timeframe '{tf}': auto-run is currently STOPPED."
+                )
+
         now = time.time()
         payload_json = json.dumps(job_spec.payload, default=str)
         result_json = json.dumps(job_spec.result, default=str) if job_spec.result is not None else None
@@ -246,40 +254,58 @@ class GPUJobStorage:
 
             # 4. Priority 3: Autonomous Tuning with 1h/4h Round-Robin Alternation
             if not candidate:
-                if last_auto_timeframe == "1h":
-                    # Prefer 4h next
-                    cur = conn.execute(
-                        """
-                        SELECT * FROM gpu_jobs
-                        WHERE status = ? AND priority = ? AND timeframe = '4h'
-                        ORDER BY created_at ASC LIMIT 1;
-                        """,
-                        (JobStatus.QUEUED.value, JobPriority.AUTO.value),
-                    )
-                    candidate = cur.fetchone()
-                elif last_auto_timeframe == "4h":
-                    # Prefer 1h next
-                    cur = conn.execute(
-                        """
-                        SELECT * FROM gpu_jobs
-                        WHERE status = ? AND priority = ? AND timeframe = '1h'
-                        ORDER BY created_at ASC LIMIT 1;
-                        """,
-                        (JobStatus.QUEUED.value, JobPriority.AUTO.value),
-                    )
-                    candidate = cur.fetchone()
+                cur_1h = conn.execute("SELECT value FROM scheduler_state WHERE key = 'auto_run_state_1h';").fetchone()
+                cur_4h = conn.execute("SELECT value FROM scheduler_state WHERE key = 'auto_run_state_4h';").fetchone()
+                state_1h = cur_1h["value"] if cur_1h else AutoRunState.SEARCHING.value
+                state_4h = cur_4h["value"] if cur_4h else AutoRunState.SEARCHING.value
 
-                # Fallback to any remaining auto job (FIFO)
-                if not candidate:
-                    cur = conn.execute(
-                        """
-                        SELECT * FROM gpu_jobs
-                        WHERE status = ? AND priority = ?
-                        ORDER BY created_at ASC LIMIT 1;
-                        """,
-                        (JobStatus.QUEUED.value, JobPriority.AUTO.value),
-                    )
-                    candidate = cur.fetchone()
+                ineligible_states = (AutoRunState.STOPPED.value, AutoRunState.PAUSED_ERROR.value)
+                eligible_1h = (state_1h not in ineligible_states)
+                eligible_4h = (state_4h not in ineligible_states)
+
+                eligible_tfs: list[str] = []
+                if eligible_1h:
+                    eligible_tfs.append("1h")
+                if eligible_4h:
+                    eligible_tfs.append("4h")
+
+                if eligible_tfs:
+                    if last_auto_timeframe == "1h" and eligible_4h:
+                        # Prefer 4h next
+                        cur = conn.execute(
+                            """
+                            SELECT * FROM gpu_jobs
+                            WHERE status = ? AND priority = ? AND timeframe = '4h'
+                            ORDER BY created_at ASC LIMIT 1;
+                            """,
+                            (JobStatus.QUEUED.value, JobPriority.AUTO.value),
+                        )
+                        candidate = cur.fetchone()
+                    elif last_auto_timeframe == "4h" and eligible_1h:
+                        # Prefer 1h next
+                        cur = conn.execute(
+                            """
+                            SELECT * FROM gpu_jobs
+                            WHERE status = ? AND priority = ? AND timeframe = '1h'
+                            ORDER BY created_at ASC LIMIT 1;
+                            """,
+                            (JobStatus.QUEUED.value, JobPriority.AUTO.value),
+                        )
+                        candidate = cur.fetchone()
+
+                    # Fallback to any remaining auto job within eligible timeframes
+                    if not candidate:
+                        placeholders = ",".join("?" for _ in eligible_tfs)
+                        cur = conn.execute(
+                            f"""
+                            SELECT * FROM gpu_jobs
+                            WHERE status = ? AND priority = ?
+                            AND (timeframe IN ({placeholders}) OR timeframe IS NULL)
+                            ORDER BY created_at ASC LIMIT 1;
+                            """,
+                            [JobStatus.QUEUED.value, JobPriority.AUTO.value, *eligible_tfs],
+                        )
+                        candidate = cur.fetchone()
 
             if not candidate:
                 conn.commit()
@@ -467,9 +493,9 @@ class GPUJobStorage:
             )
 
     def get_auto_run_state(self, timeframe: str) -> AutoRunState:
-        """Gets current AutoRunState for timeframe ('1h' or '4h')."""
+        """Gets current AutoRunState for timeframe ('1h' or '4h'). Default is SEARCHING."""
         key = f"auto_run_state_{timeframe}"
-        val = self.get_state(key, AutoRunState.STOPPED.value)
+        val = self.get_state(key, AutoRunState.SEARCHING.value)
         return AutoRunState(val)
 
     def set_auto_run_state(self, timeframe: str, state: AutoRunState) -> None:
@@ -482,10 +508,13 @@ class GPUJobStorage:
         my_pid: int,
         my_create_time: float,
         lease_timeout: float = 30.0,
+        owner_token: str | None = None,
     ) -> bool:
         """Atomically attempts to claim coordinator lease in SQLite with race prevention."""
         from .process_guard import is_process_alive
         now = time.time()
+        token = owner_token or f"{my_pid}_{my_create_time}_{uuid.uuid4().hex[:8]}"
+
         with self.get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE;")
             cur = conn.execute("SELECT value FROM scheduler_state WHERE key = 'coordinator_lease';")
@@ -504,7 +533,12 @@ class GPUJobStorage:
                 except Exception:
                     pass
 
-            new_lease = json.dumps({"pid": my_pid, "create_time": my_create_time, "heartbeat": now})
+            new_lease = json.dumps({
+                "pid": my_pid,
+                "create_time": my_create_time,
+                "owner_token": token,
+                "heartbeat": now,
+            })
             conn.execute(
                 """
                 INSERT INTO scheduler_state (key, value, updated_at) VALUES ('coordinator_lease', ?, ?)
@@ -515,29 +549,93 @@ class GPUJobStorage:
             conn.commit()
             return True
 
-    def renew_coordinator_lease(self, my_pid: int, my_create_time: float) -> None:
-        """Renews coordinator lease heartbeat."""
+    def renew_coordinator_lease(
+        self,
+        my_pid: int,
+        my_create_time: float,
+        owner_token: str | None = None,
+    ) -> bool:
+        """Renews coordinator lease heartbeat using compare-and-swap ownership verification.
+        
+        Returns:
+            True if lease was renewed successfully.
+            False if lease was taken over by another coordinator (split-brain prevention).
+        """
         now = time.time()
-        new_lease = json.dumps({"pid": my_pid, "create_time": my_create_time, "heartbeat": now})
         with self.get_connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO scheduler_state (key, value, updated_at) VALUES ('coordinator_lease', ?, ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;
-                """,
-                (new_lease, now),
-            )
+            conn.execute("BEGIN IMMEDIATE;")
+            cur = conn.execute("SELECT value FROM scheduler_state WHERE key = 'coordinator_lease';")
+            row = cur.fetchone()
+            if not row:
+                conn.commit()
+                return False
 
-    def release_coordinator_lease(self, my_pid: int) -> None:
-        """Releases coordinator lease if owned by my_pid."""
+            try:
+                lease = json.loads(row["value"])
+                l_pid = int(lease.get("pid", -1))
+                l_ctime = float(lease.get("create_time", 0.0))
+                l_token = lease.get("owner_token")
+
+                # Ownership verification CAS
+                if owner_token is not None:
+                    if l_token != owner_token:
+                        conn.commit()
+                        return False
+                else:
+                    if l_pid != my_pid or abs(l_ctime - my_create_time) > 0.1:
+                        conn.commit()
+                        return False
+
+                # Ownership confirmed - renew heartbeat
+                token_to_keep = l_token or owner_token or f"{my_pid}_{my_create_time}"
+                updated_lease = json.dumps({
+                    "pid": my_pid,
+                    "create_time": my_create_time,
+                    "owner_token": token_to_keep,
+                    "heartbeat": now,
+                })
+                conn.execute(
+                    "UPDATE scheduler_state SET value = ?, updated_at = ? WHERE key = 'coordinator_lease';",
+                    (updated_lease, now),
+                )
+                conn.commit()
+                return True
+            except Exception:
+                conn.commit()
+                return False
+
+    def release_coordinator_lease(self, my_pid: int, owner_token: str | None = None) -> bool:
+        """Releases coordinator lease if owned by my_pid and owner_token."""
         with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
             cur = conn.execute("SELECT value FROM scheduler_state WHERE key = 'coordinator_lease';")
             row = cur.fetchone()
             if row:
                 try:
                     lease = json.loads(row["value"])
-                    if int(lease.get("pid", -1)) == my_pid:
+                    l_pid = int(lease.get("pid", -1))
+                    l_token = lease.get("owner_token")
+                    if owner_token is not None and l_token != owner_token:
+                        conn.commit()
+                        return False
+                    if l_pid == my_pid:
                         conn.execute("DELETE FROM scheduler_state WHERE key = 'coordinator_lease';")
+                        conn.commit()
+                        return True
                 except Exception:
                     pass
+            conn.commit()
+            return False
+
+    def get_coordinator_lease(self) -> dict[str, Any] | None:
+        """Returns the current coordinator lease data, if present."""
+        with self.get_connection() as conn:
+            cur = conn.execute("SELECT value FROM scheduler_state WHERE key = 'coordinator_lease';")
+            row = cur.fetchone()
+            if row:
+                try:
+                    return json.loads(row["value"])
+                except Exception:
+                    return None
+            return None
 

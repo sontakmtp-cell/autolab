@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 from typing import Any
+import uuid
 
 import psutil
 
@@ -51,11 +52,14 @@ class GPUScheduler:
         self.active_worker_pid: int | None = None
         self.active_worker_create_time: float | None = None
         self.last_auto_timeframe: str | None = None
+        self.scheduler_error: str | None = None
+        self.owner_token: str | None = None
 
         self._stop_event = threading.Event()
         self._scheduler_thread: threading.Thread | None = None
         self._is_running = False
 
+        self.acquire_coordinator_lock = acquire_coordinator_lock
         self.my_pid = os.getpid()
         self.my_create_time = psutil.Process(self.my_pid).create_time()
 
@@ -67,10 +71,12 @@ class GPUScheduler:
 
     def _acquire_coordinator_lock(self) -> None:
         """Acquires the scheduler coordinator singleton lease in SQLite atomically."""
+        self.owner_token = f"{self.my_pid}_{self.my_create_time}_{uuid.uuid4().hex[:8]}"
         acquired = self.storage.try_acquire_coordinator_lease(
             my_pid=self.my_pid,
             my_create_time=self.my_create_time,
             lease_timeout=30.0,
+            owner_token=self.owner_token,
         )
         if not acquired:
             raise RuntimeError(
@@ -78,9 +84,27 @@ class GPUScheduler:
                 "Only one scheduler instance can run at a time."
             )
 
-    def _update_coordinator_heartbeat(self) -> None:
-        """Updates scheduler coordinator lease heartbeat."""
-        self.storage.renew_coordinator_lease(self.my_pid, self.my_create_time)
+    def _update_coordinator_heartbeat(self) -> bool:
+        """Updates scheduler coordinator lease heartbeat.
+        
+        Returns:
+            True if renewed, False if lease was lost to another coordinator.
+        """
+        if not self.acquire_coordinator_lock:
+            return True
+
+        renewed = self.storage.renew_coordinator_lease(
+            my_pid=self.my_pid,
+            my_create_time=self.my_create_time,
+            owner_token=self.owner_token,
+        )
+        if not renewed:
+            logger.critical(
+                "CRITICAL: Lost coordinator lease to another scheduler! Stopping scheduler immediately to avoid split-brain."
+            )
+            self.stop()
+            return False
+        return True
 
     def recover_on_startup(self) -> list[str]:
         """Recovers any orphan jobs left in RUNNING status from a previous crash or reboot."""
@@ -117,7 +141,27 @@ class GPUScheduler:
 
     def tick(self) -> None:
         """Executes a single monitoring and scheduling cycle."""
-        self._update_coordinator_heartbeat()
+        if not self._update_coordinator_heartbeat():
+            return
+
+        # Check if scheduler is in a blocked error state due to un-terminable stuck process
+        if self.scheduler_error is not None:
+            if self.active_worker_pid and not is_process_alive(self.active_worker_pid, self.active_worker_create_time):
+                logger.info(
+                    "Previously stuck worker PID %s has exited. Clearing scheduler error state.",
+                    self.active_worker_pid,
+                )
+                self.scheduler_error = None
+                self.active_worker = None
+                self.active_job_id = None
+                self.active_worker_pid = None
+                self.active_worker_create_time = None
+            else:
+                logger.error(
+                    "Scheduler in blocked error state: %s. Queue dispatch paused to protect GPU invariant.",
+                    self.scheduler_error,
+                )
+                return
 
         # 1. Monitor active worker process (spawned or adopted)
         has_active_worker = (self.active_worker is not None) or (self.active_worker_pid is not None)
@@ -169,7 +213,17 @@ class GPUScheduler:
                             now - job.heartbeat_at,
                             self.heartbeat_timeout,
                         )
-                        safe_terminate_process(pid, ctime, timeout=5.0)
+                        term_ok = safe_terminate_process(pid, ctime, timeout=5.0)
+                        if not term_ok or is_process_alive(pid, ctime):
+                            logger.critical(
+                                "CRITICAL: Failed to terminate stuck worker PID %s for job '%s'! Process remains alive! "
+                                "QUEUE IS BLOCKED to protect GPU single-process invariant. Manual intervention required.",
+                                pid,
+                                self.active_job_id,
+                            )
+                            self.scheduler_error = f"Worker PID {pid} could not be terminated and remains alive."
+                            return
+
                         self.storage.mark_failed(
                             self.active_job_id,
                             f"Heartbeat timed out after {self.heartbeat_timeout}s without response (process hung).",
@@ -187,7 +241,17 @@ class GPUScheduler:
                             self.active_job_id,
                             job.timeout_seconds,
                         )
-                        safe_terminate_process(pid, ctime, timeout=5.0)
+                        term_ok = safe_terminate_process(pid, ctime, timeout=5.0)
+                        if not term_ok or is_process_alive(pid, ctime):
+                            logger.critical(
+                                "CRITICAL: Failed to terminate timed-out worker PID %s for job '%s'! Process remains alive! "
+                                "QUEUE IS BLOCKED to protect GPU single-process invariant. Manual intervention required.",
+                                pid,
+                                self.active_job_id,
+                            )
+                            self.scheduler_error = f"Worker PID {pid} could not be terminated and remains alive."
+                            return
+
                         self.storage.mark_interrupted(
                             self.active_job_id,
                             f"Job exceeded max execution timeout of {job.timeout_seconds}s.",
@@ -198,8 +262,8 @@ class GPUScheduler:
                         self.active_worker_create_time = None
                         return
 
-        # 2. Dispatch next job if no worker is active
-        if self.active_worker is None and self.active_worker_pid is None:
+        # 2. Dispatch next job if no worker is active and scheduler is error-free
+        if self.scheduler_error is None and self.active_worker is None and self.active_worker_pid is None:
             next_job = self.storage.acquire_next_job(last_auto_timeframe=self.last_auto_timeframe)
             if next_job:
                 logger.info(
@@ -217,6 +281,9 @@ class GPUScheduler:
 
     def _spawn_worker(self, job: JobSpec) -> bool:
         """Spawns worker subprocess for the acquired job with dedicated log file and robust error handling."""
+        if self.scheduler_error is not None or self.active_worker is not None or self.active_worker_pid is not None:
+            logger.error("Refusing to spawn worker: active worker or scheduler error exists.")
+            return False
         log_dir = Path("var/paxg_lab/job_logs")
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"job_{job.job_id}.log"
@@ -340,6 +407,22 @@ class GPUScheduler:
                     logger.info("Requesting graceful cancellation of active auto job '%s'...", self.active_job_id)
                     self.storage.request_cancel(self.active_job_id)
 
+    def start_auto_run(self, timeframe: str | None = None) -> None:
+        """Starts or resumes autonomous tuning: sets state to SEARCHING.
+        
+        Queued and newly submitted AUTO jobs for the timeframe can now be dispatched.
+        """
+        logger.info("Starting auto run for timeframe: %s", timeframe or "all")
+        if timeframe in ("1h", "4h"):
+            self.storage.set_auto_run_state(timeframe, AutoRunState.SEARCHING)
+        else:
+            self.storage.set_auto_run_state("1h", AutoRunState.SEARCHING)
+            self.storage.set_auto_run_state("4h", AutoRunState.SEARCHING)
+
+    def resume_auto_run(self, timeframe: str | None = None) -> None:
+        """Alias for start_auto_run."""
+        self.start_auto_run(timeframe)
+
     def cancel_job(self, job_id: str) -> bool:
         """Requests cancellation of a specific job."""
         return self.storage.request_cancel(job_id)
@@ -387,4 +470,10 @@ class GPUScheduler:
             self.active_worker_create_time = None
 
         # Release coordinator lease
-        self.storage.release_coordinator_lease(self.my_pid)
+        if self.acquire_coordinator_lock:
+            if self.owner_token is not None:
+                self.storage.release_coordinator_lease(self.my_pid, owner_token=self.owner_token)
+                self.owner_token = None
+            else:
+                self.storage.release_coordinator_lease(self.my_pid)
+

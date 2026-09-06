@@ -209,19 +209,34 @@ class GPUWorker:
 
     def _handle_forecast_job(self, job: JobSpec) -> dict[str, Any]:
         """Handles single forecast request."""
+        from paxg_lab.constants import get_horizon_for_timeframe
         from paxg_lab.eval.predictor import TimesFM3Predictor
         from paxg_lab.eval.types import ForecastRequest
         import numpy as np
 
         payload = job.payload
         timeframe = payload.get("timeframe", job.timeframe or "1h")
+        horizon = int(payload.get("horizon") or get_horizon_for_timeframe(timeframe))
         context_len = int(payload.get("context_len", 256))
         adapter_path = payload.get("adapter_path")
-        feature_set = payload.get("feature_set", "A")
+        feature_set = payload.get("feature_set", "B" if adapter_path else "A")
+        columns = payload.get("columns")
 
         # Context features passed directly or loaded from snapshot - validate fail-fast before model loading
         if "contexts" in payload:
-            ctx_array = np.array(payload["contexts"], dtype=np.float32)
+            ctx_array = np.asarray(payload["contexts"], dtype=np.float32)
+            if ctx_array.ndim == 3 and ctx_array.shape[0] == 1:
+                ctx_array = ctx_array[0]
+            forecast_origin_time = payload.get("forecast_origin_time")
+            if forecast_origin_time is None:
+                if "timestamps" in payload and len(payload["timestamps"]) > 0:
+                    forecast_origin_time = int(payload["timestamps"][-1])
+                else:
+                    raise ValueError(
+                        "Forecast request with 'contexts' requires 'forecast_origin_time' or 'timestamps'"
+                    )
+            else:
+                forecast_origin_time = int(forecast_origin_time)
         elif "snapshot_path" in payload:
             from paxg_lab.data.snapshot import DatasetSnapshot
             snapshot_path = payload["snapshot_path"]
@@ -232,7 +247,8 @@ class GPUWorker:
             if len(feats) < context_len:
                 raise ValueError(f"Snapshot has only {len(feats)} candles, less than required context_len={context_len}")
             recent_ctx = feats[-context_len:]
-            ctx_array = np.transpose(recent_ctx, (1, 0))[np.newaxis, :, :]
+            ctx_array = np.asarray(recent_ctx, dtype=np.float32)
+            forecast_origin_time = int(payload.get("forecast_origin_time") or snapshot.timestamps[-1])
         else:
             raise ValueError(
                 "Forecast request missing required 'contexts' array or valid 'snapshot_path'. "
@@ -240,29 +256,30 @@ class GPUWorker:
             )
 
         self.progress_message = f"Loading model for {timeframe} forecast"
-        predictor = TimesFM3Predictor()
-        if adapter_path:
-            predictor.load_adapter(adapter_path)
+        predictor = TimesFM3Predictor(adapter_path=adapter_path)
 
         req = ForecastRequest(
             timeframe=timeframe,
+            horizon=horizon,
             context_len=context_len,
             feature_set=feature_set,
+            columns=columns,
             adapter_path=adapter_path,
         )
 
         self.progress_message = "Generating forecast"
-        res = predictor.forecast_request(req, ctx_array)
+        res = predictor.forecast_request(req, ctx_array, forecast_origin_time=forecast_origin_time)
         return res.to_dict()
 
     def _handle_train_job(self, job: JobSpec) -> dict[str, Any]:
         """Handles manual or auto LoRA training job."""
         import pandas as pd
+        from paxg_lab.constants import MODEL_REPO, MODEL_REVISION
         from paxg_lab.data.snapshot import DatasetSnapshot
         from paxg_lab.model.store import AdapterStore
         from paxg_lab.model.train_spec import TrainSpec
         from paxg_lab.model.trainer import LoRATrainer
-        from timesfm3.model import TimesFM3
+        from timesfm3 import TimesFM3Torch
 
         payload = job.payload
         spec_dict = payload.get("train_spec", {})
@@ -278,19 +295,21 @@ class GPUWorker:
             max_epochs=int(spec_dict.get("max_epochs", 2)),
             batch_size=int(spec_dict.get("batch_size", 2)),
             gradient_accumulation_steps=int(spec_dict.get("gradient_accumulation_steps", 8)),
+            history_days=int(spec_dict["history_days"]) if "history_days" in spec_dict else 365,
+            max_samples_per_epoch=int(spec_dict["max_samples_per_epoch"]) if "max_samples_per_epoch" in spec_dict else 1024,
             seed=int(spec_dict.get("seed", 42)),
         )
 
         snapshot_path = payload.get("snapshot_path")
         if snapshot_path and Path(snapshot_path).exists():
             snapshot = DatasetSnapshot.load(snapshot_path)
-            features_df = snapshot.to_dataframe()
-            snapshot_hash = snapshot.sha256
+            features_df = snapshot.to_dataframe(spec.feature_set)
+            snapshot_hash = snapshot.metadata.sha256
         else:
             raise FileNotFoundError(f"Snapshot path required for training, got '{snapshot_path}'")
 
         self.progress_message = "Initializing base model"
-        base_model = TimesFM3()
+        base_model = TimesFM3Torch.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
 
         def progress_cb(info: dict[str, Any]) -> bool:
             epoch = info.get("epoch", 0)
@@ -317,7 +336,13 @@ class GPUWorker:
         # Save to store
         store_dir = payload.get("adapter_store_dir", "var/paxg_lab/adapters")
         store = AdapterStore(store_dir)
-        saved_dir = store.save_trained_adapter(train_result, base_model=base_model)
+        smoke_test = bool(payload.get("smoke_test", True))
+        saved_dir = store.save_adapter(
+            peft_model=train_result.trained_model,
+            manifest=train_result.manifest,
+            base_model=base_model,
+            smoke_test=smoke_test,
+        )
 
         return {
             "adapter_id": train_result.manifest.adapter_id,

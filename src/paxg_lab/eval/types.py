@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +47,20 @@ class ForecastResult:
     uncertainty_lower: np.ndarray  # shape: (horizon,) - q10
     uncertainty_upper: np.ndarray  # shape: (horizon,) - q90
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Converts ForecastResult to JSON-serializable dictionary."""
+        return {
+            "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "forecast_origin_time": self.forecast_origin_time,
+            "target_timestamps": list(self.target_timestamps),
+            "point_forecast": self.point_forecast.tolist() if isinstance(self.point_forecast, np.ndarray) else list(self.point_forecast),
+            "quantiles": self.quantiles.tolist() if isinstance(self.quantiles, np.ndarray) else list(self.quantiles),
+            "uncertainty_lower": self.uncertainty_lower.tolist() if isinstance(self.uncertainty_lower, np.ndarray) else list(self.uncertainty_lower),
+            "uncertainty_upper": self.uncertainty_upper.tolist() if isinstance(self.uncertainty_upper, np.ndarray) else list(self.uncertainty_upper),
+            "metadata": dict(self.metadata),
+        }
 
 
 @dataclass(frozen=True)
@@ -110,4 +124,9 @@ class ScoreReport:
             if m.fold_id == fold_id:
                 return m
         return None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Converts ScoreReport to dictionary."""
+        return asdict(self)
+
 

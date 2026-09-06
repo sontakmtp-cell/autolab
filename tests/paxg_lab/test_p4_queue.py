@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -10,6 +11,7 @@ import tempfile
 import time
 from typing import Any
 
+import numpy as np
 import psutil
 import pytest
 import torch
@@ -1020,3 +1022,423 @@ def test_batch_level_graceful_stop_in_predict_windows():
             batch_size=4,
             progress_callback=stop_on_batch_2,
         )
+
+
+# ---------------------------------------------------------------------------
+# 24. Review Round 2: E2E Valid FORECAST from Snapshot (1h=24, 4h=6, Future Timestamps)
+# ---------------------------------------------------------------------------
+
+
+def test_forecast_job_e2e_success_with_snapshot(temp_db_path: Path, tmp_path: Path):
+    """Verifies valid FORECAST from snapshot executes via GPUWorker to SUCCEEDED with correct horizon & future timestamps."""
+    from paxg_lab.data.features import FEATURE_SPECS
+    from paxg_lab.data.snapshot import DatasetSnapshot
+    from paxg_lab.queue.worker import GPUWorker
+
+    storage = GPUJobStorage(temp_db_path)
+
+    # 1. Create a minimal valid 1h snapshot (300 candles)
+    n_candles = 300
+    base_ts = 1740000000000
+    step_1h_ms = 3600 * 1000
+    timestamps_1h = np.array([base_ts + i * step_1h_ms for i in range(n_candles)], dtype=np.int64)
+    feat_1h_a = np.ones((n_candles, len(FEATURE_SPECS["A"].columns)), dtype=np.float32) * 2000.0
+    feat_1h_b = np.ones((n_candles, len(FEATURE_SPECS["B"].columns)), dtype=np.float32) * 2000.0
+    snap_1h = DatasetSnapshot.create(
+        timeframe="1h",
+        timestamps=timestamps_1h,
+        features_a=feat_1h_a,
+        features_b=feat_1h_b,
+        symbol="PAXGUSDT",
+    )
+    snap_1h_dir = snap_1h.save(base_dir=tmp_path / "snap_1h")
+
+    # Submit 1h FORECAST job
+    job_id_1h = "job_forecast_1h_valid"
+    storage.submit_job(
+        JobSpec(
+            job_id=job_id_1h,
+            job_type=JobType.FORECAST.value,
+            timeframe="1h",
+            priority=JobPriority.FORECAST.value,
+            payload={
+                "snapshot_path": str(snap_1h_dir),
+                "timeframe": "1h",
+                "context_len": 256,
+                "feature_set": "A",
+            },
+        )
+    )
+
+    # Execute via GPUWorker
+    worker_1h = GPUWorker(job_id=job_id_1h, db_path=temp_db_path)
+    exit_code_1h = worker_1h.run()
+    assert exit_code_1h == 0
+
+    job_1h = storage.get_job(job_id_1h)
+    assert job_1h is not None
+    assert job_1h.status == JobStatus.SUCCEEDED.value
+    res_1h = job_1h.result
+    assert res_1h["timeframe"] == "1h"
+    assert len(res_1h["point_forecast"]) == 24
+    assert len(res_1h["quantiles"]) == 24
+    assert len(res_1h["target_timestamps"]) == 24
+    assert res_1h["forecast_origin_time"] == int(timestamps_1h[-1])
+    assert res_1h["target_timestamps"][0] == res_1h["forecast_origin_time"] + step_1h_ms
+    assert res_1h["target_timestamps"][-1] == res_1h["forecast_origin_time"] + 24 * step_1h_ms
+    assert all(t > res_1h["forecast_origin_time"] for t in res_1h["target_timestamps"])
+
+    # 2. Test 4h FORECAST job (horizon=6)
+    step_4h_ms = 4 * 3600 * 1000
+    timestamps_4h = np.array([base_ts + i * step_4h_ms for i in range(n_candles)], dtype=np.int64)
+    feat_4h_a = np.ones((n_candles, len(FEATURE_SPECS["A"].columns)), dtype=np.float32) * 2000.0
+    feat_4h_b = np.ones((n_candles, len(FEATURE_SPECS["B"].columns)), dtype=np.float32) * 2000.0
+    snap_4h = DatasetSnapshot.create(
+        timeframe="4h",
+        timestamps=timestamps_4h,
+        features_a=feat_4h_a,
+        features_b=feat_4h_b,
+        symbol="PAXGUSDT",
+    )
+    snap_4h_dir = snap_4h.save(base_dir=tmp_path / "snap_4h")
+
+    job_id_4h = "job_forecast_4h_valid"
+    storage.submit_job(
+        JobSpec(
+            job_id=job_id_4h,
+            job_type=JobType.FORECAST.value,
+            timeframe="4h",
+            priority=JobPriority.FORECAST.value,
+            payload={
+                "snapshot_path": str(snap_4h_dir),
+                "timeframe": "4h",
+                "context_len": 256,
+                "feature_set": "A",
+            },
+        )
+    )
+
+    worker_4h = GPUWorker(job_id=job_id_4h, db_path=temp_db_path)
+    exit_code_4h = worker_4h.run()
+    assert exit_code_4h == 0
+
+    job_4h = storage.get_job(job_id_4h)
+    assert job_4h is not None
+    assert job_4h.status == JobStatus.SUCCEEDED.value
+    res_4h = job_4h.result
+    assert res_4h["timeframe"] == "4h"
+    assert len(res_4h["point_forecast"]) == 6
+    assert len(res_4h["quantiles"]) == 6
+    assert len(res_4h["target_timestamps"]) == 6
+    assert res_4h["forecast_origin_time"] == int(timestamps_4h[-1])
+    assert res_4h["target_timestamps"][0] == res_4h["forecast_origin_time"] + step_4h_ms
+    assert res_4h["target_timestamps"][-1] == res_4h["forecast_origin_time"] + 6 * step_4h_ms
+
+
+# ---------------------------------------------------------------------------
+# 25. Review Round 2: E2E TRAIN & AUTO_TRIAL Job using Real P3 Adapter Pipeline
+# ---------------------------------------------------------------------------
+
+
+def test_train_and_auto_trial_job_e2e_success(temp_db_path: Path, tmp_path: Path):
+    """Verifies TRAIN and AUTO_TRIAL jobs execute via GPUWorker using real P3 APIs and save verified adapters."""
+    from paxg_lab.data.features import FEATURE_SPECS
+    from paxg_lab.data.snapshot import DatasetSnapshot
+    from paxg_lab.queue.worker import GPUWorker
+
+    storage = GPUJobStorage(temp_db_path)
+
+    real_snap_path = Path("var/paxg_lab/snapshots/paxgusdt_1h_1743073200000_1788613200000_837c9ee8")
+    if real_snap_path.exists():
+        snap_dir = real_snap_path
+    else:
+        n_candles = 6000
+        base_ts = 1700000000000
+        step_ms = 3600 * 1000
+        timestamps = np.array([base_ts + i * step_ms for i in range(n_candles)], dtype=np.int64)
+        feat_a = np.ones((n_candles, len(FEATURE_SPECS["A"].columns)), dtype=np.float32) * 2000.0
+        feat_b = np.ones((n_candles, len(FEATURE_SPECS["B"].columns)), dtype=np.float32) * 2000.0
+        snap = DatasetSnapshot.create(
+            timeframe="1h",
+            timestamps=timestamps,
+            features_a=feat_a,
+            features_b=feat_b,
+            symbol="PAXGUSDT",
+        )
+        snap_dir = snap.save(base_dir=tmp_path / "snap_train")
+
+    adapter_store_dir = tmp_path / "adapters"
+    adapter_store_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Execute TRAIN job
+    job_id_train = "job_train_p3_valid"
+    storage.submit_job(
+        JobSpec(
+            job_id=job_id_train,
+            job_type=JobType.TRAIN.value,
+            timeframe="1h",
+            priority=JobPriority.MANUAL.value,
+            payload={
+                "snapshot_path": str(snap_dir),
+                "adapter_store_dir": str(adapter_store_dir),
+                "smoke_test": False,
+                "train_spec": {
+                    "timeframe": "1h",
+                    "context_len": 256,
+                    "horizon": 24,
+                    "feature_set": "B",
+                    "max_epochs": 1,
+                    "batch_size": 2,
+                    "gradient_accumulation_steps": 1,
+                    "max_samples_per_epoch": 2,
+                    "history_days": 180,
+                },
+            },
+        )
+    )
+
+    worker_train = GPUWorker(job_id=job_id_train, db_path=temp_db_path)
+    exit_code_train = worker_train.run()
+    assert exit_code_train == 0
+
+    job_train = storage.get_job(job_id_train)
+    assert job_train is not None
+    assert job_train.status == JobStatus.SUCCEEDED.value
+    res_train = job_train.result
+    saved_adapter_path = Path(res_train["adapter_path"])
+    assert saved_adapter_path.is_dir()
+    assert (saved_adapter_path / "adapter_model.safetensors").exists()
+    assert (saved_adapter_path / "paxg_manifest.json").exists()
+    assert (saved_adapter_path / "checksums.sha256").exists()
+
+    # 2. Execute AUTO_TRIAL job (same pipeline)
+    job_id_auto = "job_auto_trial_p3_valid"
+    storage.submit_job(
+        JobSpec(
+            job_id=job_id_auto,
+            job_type=JobType.AUTO_TRIAL.value,
+            timeframe="1h",
+            priority=JobPriority.AUTO.value,
+            payload={
+                "snapshot_path": str(snap_dir),
+                "adapter_store_dir": str(adapter_store_dir),
+                "smoke_test": False,
+                "train_spec": {
+                    "timeframe": "1h",
+                    "context_len": 256,
+                    "horizon": 24,
+                    "feature_set": "B",
+                    "max_epochs": 1,
+                    "batch_size": 2,
+                    "gradient_accumulation_steps": 1,
+                    "max_samples_per_epoch": 2,
+                    "history_days": 180,
+                },
+            },
+        )
+    )
+
+    worker_auto = GPUWorker(job_id=job_id_auto, db_path=temp_db_path)
+    exit_code_auto = worker_auto.run()
+    assert exit_code_auto == 0
+
+    job_auto = storage.get_job(job_id_auto)
+    assert job_auto is not None
+    assert job_auto.status == JobStatus.SUCCEEDED.value
+    assert Path(job_auto.result["adapter_path"]).exists()
+
+
+# ---------------------------------------------------------------------------
+# 26. Review Round 2: Worker Terminate Failure Blocks Queue (Invariant Protection)
+# ---------------------------------------------------------------------------
+
+
+def test_worker_terminate_failure_blocks_queue(temp_db_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Verifies that if safe_terminate_process fails and the process remains alive,
+
+    the scheduler marks an error, keeps the queue blocked, and NEVER acquires or spawns the next GPU job.
+    """
+    scheduler = GPUScheduler(
+        db_path=temp_db_path,
+        heartbeat_timeout=1.0,
+        acquire_coordinator_lock=False,
+    )
+
+    # Job 1: Active hung worker
+    hung_job_id = "hung_unkillable_worker"
+    scheduler.storage.submit_job(
+        JobSpec(job_id=hung_job_id, job_type=JobType.DUMMY.value, priority=JobPriority.MANUAL.value)
+    )
+
+    # Job 2: Queued next job
+    next_job_id = "next_queued_gpu_job"
+    scheduler.storage.submit_job(
+        JobSpec(job_id=next_job_id, job_type=JobType.DUMMY.value, priority=JobPriority.FORECAST.value)
+    )
+
+    # Adopt fake PID 99999 in RUNNING state with expired heartbeat
+    fake_pid = 99999
+    fake_ctime = time.time()
+    stale_hb = time.time() - 10.0
+    with scheduler.storage.get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE gpu_jobs
+            SET status = 'RUNNING', worker_pid = ?, worker_create_time = ?,
+                started_at = ?, heartbeat_at = ?
+            WHERE job_id = ?;
+            """,
+            (fake_pid, fake_ctime, stale_hb, stale_hb, hung_job_id),
+        )
+
+    scheduler.active_job_id = hung_job_id
+    scheduler.active_worker_pid = fake_pid
+    scheduler.active_worker_create_time = fake_ctime
+
+    # Monkeypatch termination failure and alive process
+    monkeypatch.setattr("paxg_lab.queue.scheduler.safe_terminate_process", lambda pid, ctime=None, timeout=5.0: False)
+    monkeypatch.setattr("paxg_lab.queue.scheduler.is_process_alive", lambda pid, ctime=None: True)
+
+    # Tick scheduler: terminate fails!
+    scheduler.tick()
+
+    # Invariant Verification:
+    # 1. Scheduler error is recorded
+    assert scheduler.scheduler_error is not None
+    assert f"Worker PID {fake_pid} could not be terminated" in scheduler.scheduler_error
+
+    # 2. Active worker PID and active job ID are NOT cleared
+    assert scheduler.active_worker_pid == fake_pid
+    assert scheduler.active_job_id == hung_job_id
+
+    # 3. Subsequent ticks NEVER acquire or spawn the next job
+    for _ in range(5):
+        scheduler.tick()
+
+    next_job = scheduler.storage.get_job(next_job_id)
+    assert next_job is not None
+    assert next_job.status == JobStatus.QUEUED.value  # MUST stay QUEUED
+    assert next_job.started_at is None
+
+
+# ---------------------------------------------------------------------------
+# 27. Review Round 2: Stop Auto Run Enforces No New Auto Jobs Dispatched
+# ---------------------------------------------------------------------------
+
+
+def test_stop_auto_run_enforces_no_new_auto_jobs_dispatched(temp_db_path: Path):
+    """Verifies that calling stop_auto_run strictly blocks new AUTO jobs from being dispatched,
+
+    and only explicit start/resume allows queued AUTO jobs to proceed.
+    """
+    scheduler = GPUScheduler(
+        db_path=temp_db_path,
+        acquire_coordinator_lock=False,
+    )
+
+    # Stop 1h auto run
+    scheduler.stop_auto_run("1h")
+    assert scheduler.storage.get_auto_run_state("1h") == AutoRunState.STOPPED
+
+    # Attempt submitting with reject_if_stopped=True -> must raise ValueError
+    with pytest.raises(ValueError, match="auto-run is currently STOPPED"):
+        scheduler.storage.submit_job(
+            JobSpec(
+                job_id="auto_rejected",
+                job_type=JobType.DUMMY.value,
+                timeframe="1h",
+                priority=JobPriority.AUTO.value,
+            ),
+            reject_if_stopped=True,
+        )
+
+    # Submit new AUTO job without reject flag (enters queue as QUEUED)
+    auto_job_id = "auto_queued_while_stopped"
+    scheduler.storage.submit_job(
+        JobSpec(
+            job_id=auto_job_id,
+            job_type=JobType.DUMMY.value,
+            timeframe="1h",
+            priority=JobPriority.AUTO.value,
+            payload={"steps": 1, "step_sleep": 0.05},
+        )
+    )
+
+    # Run multiple scheduler ticks while STOPPED -> job must NEVER be dispatched to RUNNING
+    for _ in range(5):
+        scheduler.tick()
+        job = scheduler.storage.get_job(auto_job_id)
+        assert job.status == JobStatus.QUEUED.value
+        assert scheduler.active_job_id is None
+        assert scheduler.active_worker is None
+
+    # Now explicitly resume / start 1h auto run
+    scheduler.start_auto_run("1h")
+    assert scheduler.storage.get_auto_run_state("1h") == AutoRunState.SEARCHING
+
+    # Next tick acquires the previously blocked job
+    scheduler.tick()
+    assert scheduler.active_job_id == auto_job_id
+    job_resumed = scheduler.storage.get_job(auto_job_id)
+    assert job_resumed.status == JobStatus.RUNNING.value
+
+    # Stop worker to clean up
+    scheduler.stop()
+
+
+# ---------------------------------------------------------------------------
+# 28. Review Round 2: Coordinator Lease CAS Ownership & Split-Brain Prevention
+# ---------------------------------------------------------------------------
+
+
+def test_coordinator_lease_takeover_prevents_stale_renewal(temp_db_path: Path):
+    """Verifies that if coordinator lease is taken over by another scheduler,
+
+    the eclipsed coordinator's renewal fails and it immediately halts to prevent split-brain.
+    """
+    storage = GPUJobStorage(temp_db_path)
+
+    # Scheduler A claims lease
+    scheduler_a = GPUScheduler(
+        db_path=temp_db_path,
+        acquire_coordinator_lock=True,
+    )
+    assert scheduler_a.owner_token is not None
+
+    # Renewal succeeds while owner
+    assert scheduler_a._update_coordinator_heartbeat() is True
+
+    # Simulate takeover by Scheduler B with a new token and different PID
+    new_token_b = "token_coordinator_b_99999"
+    new_pid_b = 99999
+    now = time.time()
+    with storage.get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE scheduler_state
+            SET value = ?, updated_at = ?
+            WHERE key = 'coordinator_lease';
+            """,
+            (
+                json.dumps({
+                    "pid": new_pid_b,
+                    "create_time": now,
+                    "owner_token": new_token_b,
+                    "heartbeat": now,
+                }),
+                now,
+            ),
+        )
+
+    # Scheduler A attempts renewal on its next tick
+    scheduler_a.tick()
+
+    # Scheduler A must detect ownership loss and stop immediately
+    assert scheduler_a._is_running is False
+
+    # Lease in SQLite must NOT be overwritten by Scheduler A
+    current_lease = storage.get_coordinator_lease()
+    assert current_lease is not None
+    assert current_lease["owner_token"] == new_token_b
+    assert current_lease["pid"] == new_pid_b
+
