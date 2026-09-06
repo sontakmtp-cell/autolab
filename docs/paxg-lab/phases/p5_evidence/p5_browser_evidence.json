@@ -1,17 +1,20 @@
 {
-  "timestamp": 1788677212.3230944,
+  "timestamp": 1788678603.0506513,
   "url": "http://127.0.0.1:8501",
   "browser": "Google Chrome (Headless)",
   "checks": {
     "header_and_title": true,
     "all_five_tabs_present": true,
+    "forecast_1h_completed": true,
     "horizon_1h_24steps": true,
+    "forecast_4h_completed": true,
     "horizon_4h_6steps": true,
     "tab2_backtest": true,
     "tab3_training": true,
     "tab4_auto_tune": true,
     "tab5_adapter_manager": true,
-    "multi_tab_and_reload_safe": true
+    "multi_tab_and_reload_safe": true,
+    "idempotency_enforced": true
   },
   "screenshots": {
     "tab1_forecast_1h": "p5_tab1_forecast_1h_24steps.png",

@@ -22,6 +22,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import uuid
 
 # Ensure repository root and src directory are on sys.path
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -73,6 +74,7 @@ def run_browser_verification() -> dict:
     db_path = REPO_ROOT / "var" / "paxg_lab" / "paxg_lab.db"
     from paxg_lab.queue.scheduler import GPUScheduler
     from paxg_lab.queue.storage import GPUJobStorage
+    from paxg_lab.queue.types import JobPriority, JobSpec, JobStatus, JobType
 
     storage = GPUJobStorage(db_path)
     scheduler: GPUScheduler | None = None
@@ -152,14 +154,19 @@ def run_browser_verification() -> dict:
             # Trigger real forecast submission via UI button
             submit_btn = page.locator("button:has-text('Tạo Dự đoán')")
             logger.info("Found 1h submit button: %d", submit_btn.count())
-            if submit_btn.count() > 0:
-                logger.info("Submitting 1h forecast job via UI...")
-                submit_btn.first.click()
-                try:
-                    page.wait_for_selector("text=Bảng số chi tiết 24 bước", timeout=45000)
-                    logger.info("1h forecast completed: 24 steps table confirmed in DOM!")
-                except Exception as e:
-                    logger.warning("Waiting for 24 steps table timed out: %s", e)
+            if submit_btn.count() == 0:
+                raise RuntimeError("Could not locate 'Tạo Dự đoán' submit button on 1h tab")
+
+            logger.info("Submitting 1h forecast job via UI...")
+            submit_btn.first.click()
+            try:
+                page.wait_for_selector("text=Bảng số chi tiết 24 bước", timeout=60000)
+                forecast_1h_completed = True
+                logger.info("1h forecast completed: 24 steps table confirmed in DOM!")
+            except Exception as e:
+                logger.error("Waiting for 24 steps table timed out: %s", e)
+                forecast_1h_completed = False
+                raise RuntimeError("1h forecast failed to produce 24 steps table within timeout") from e
 
             # Screenshot Tab 1 (1h)
             tab1_1h_shot = EVIDENCE_DIR / "p5_tab1_forecast_1h_24steps.png"
@@ -167,12 +174,10 @@ def run_browser_verification() -> dict:
             evidence_report["screenshots"]["tab1_forecast_1h"] = str(tab1_1h_shot.name)
             logger.info("Captured screenshot: %s", tab1_1h_shot.name)
 
-            # Verify 24 steps horizon text and row count
+            # Verify 24 steps table and metric strictly in DOM
             content_1h = page.content()
-            horizon_1h_ok = (
-                ("Bảng số chi tiết 24 bước" in content_1h)
-                or ("24 nến" in content_1h and "24 giờ" in content_1h)
-            )
+            horizon_1h_ok = forecast_1h_completed and ("Bảng số chi tiết 24 bước" in content_1h) and ("24 bước (1h)" in content_1h)
+            evidence_report["checks"]["forecast_1h_completed"] = forecast_1h_completed
             evidence_report["checks"]["horizon_1h_24steps"] = horizon_1h_ok
 
             # ---------------------------------------------------------------
@@ -192,14 +197,19 @@ def run_browser_verification() -> dict:
 
             submit_btn_4h = page.locator("button:has-text('Tạo Dự đoán')")
             logger.info("Found 4h submit button: %d", submit_btn_4h.count())
-            if submit_btn_4h.count() > 0:
-                logger.info("Submitting 4h forecast job via UI...")
-                submit_btn_4h.first.click()
-                try:
-                    page.wait_for_selector("text=Bảng số chi tiết 6 bước", timeout=45000)
-                    logger.info("4h forecast completed: 6 steps table confirmed in DOM!")
-                except Exception as e:
-                    logger.warning("Waiting for 6 steps table timed out: %s", e)
+            if submit_btn_4h.count() == 0:
+                raise RuntimeError("Could not locate 'Tạo Dự đoán' submit button on 4h tab")
+
+            logger.info("Submitting 4h forecast job via UI...")
+            submit_btn_4h.first.click()
+            try:
+                page.wait_for_selector("text=Bảng số chi tiết 6 bước", timeout=60000)
+                forecast_4h_completed = True
+                logger.info("4h forecast completed: 6 steps table confirmed in DOM!")
+            except Exception as e:
+                logger.error("Waiting for 6 steps table timed out: %s", e)
+                forecast_4h_completed = False
+                raise RuntimeError("4h forecast failed to produce 6 steps table within timeout") from e
 
             # Screenshot Tab 1 (4h)
             tab1_4h_shot = EVIDENCE_DIR / "p5_tab1_forecast_4h_6steps.png"
@@ -208,10 +218,8 @@ def run_browser_verification() -> dict:
             logger.info("Captured screenshot: %s", tab1_4h_shot.name)
 
             content_4h = page.content()
-            horizon_4h_ok = (
-                ("Bảng số chi tiết 6 bước" in content_4h)
-                or ("6 nến" in content_4h and "24 giờ" in content_4h)
-            )
+            horizon_4h_ok = forecast_4h_completed and ("Bảng số chi tiết 6 bước" in content_4h) and ("6 bước (4h)" in content_4h)
+            evidence_report["checks"]["forecast_4h_completed"] = forecast_4h_completed
             evidence_report["checks"]["horizon_4h_6steps"] = horizon_4h_ok
 
             # ---------------------------------------------------------------
@@ -283,7 +291,7 @@ def run_browser_verification() -> dict:
             logger.info("Captured screenshot: %s", tab5_shot.name)
 
             # ---------------------------------------------------------------
-            # Check 6: Multi-tab & Reload Safety with Queue Verification
+            # Check 6: Multi-tab, Page Reload Safety, and Idempotency Verification
             # ---------------------------------------------------------------
             logger.info("Verifying multi-tab & page reload safety with SQLite queue verification...")
             count_before = len(storage.list_jobs())
@@ -314,9 +322,41 @@ def run_browser_verification() -> dict:
             )
             page2.close()
 
-            safety_ok = reload_jobs_unchanged and tab2_jobs_unchanged and page2_title_ok
+            # 3. Explicit Idempotency Test: Submit duplicate idempotency_key from concurrent sessions
+            test_idem_key = f"e2e_idem_{int(time.time())}_{uuid.uuid4().hex[:4]}"
+            test_spec_1 = JobSpec(
+                job_id=f"test_idem_1_{uuid.uuid4().hex[:6]}",
+                job_type=JobType.DUMMY.value,
+                timeframe="1h",
+                priority=JobPriority.MANUAL.value,
+                payload={"tab": "tab1"},
+                idempotency_key=test_idem_key,
+            )
+            test_spec_2 = JobSpec(
+                job_id=f"test_idem_2_{uuid.uuid4().hex[:6]}",
+                job_type=JobType.DUMMY.value,
+                timeframe="1h",
+                priority=JobPriority.MANUAL.value,
+                payload={"tab": "tab2_duplicate"},
+                idempotency_key=test_idem_key,
+            )
+            sub1 = storage.submit_job(test_spec_1)
+            sub2 = storage.submit_job(test_spec_2)
+            idempotency_enforced = (sub1 == sub2)
+            matching_idem_jobs = [j for j in storage.list_jobs() if j.idempotency_key == test_idem_key]
+            idempotency_enforced = idempotency_enforced and (len(matching_idem_jobs) == 1)
+            logger.info(
+                "Idempotency check: sub1=%s, sub2=%s, matching jobs in DB=%d (enforced=%s)",
+                sub1,
+                sub2,
+                len(matching_idem_jobs),
+                idempotency_enforced,
+            )
+
+            safety_ok = reload_jobs_unchanged and tab2_jobs_unchanged and page2_title_ok and idempotency_enforced
             evidence_report["checks"]["multi_tab_and_reload_safe"] = safety_ok
-            logger.info("Check 6 - Multi-tab & Reload safe: %s", safety_ok)
+            evidence_report["checks"]["idempotency_enforced"] = idempotency_enforced
+            logger.info("Check 6 - Multi-tab & Reload safe: %s (Idempotency: %s)", safety_ok, idempotency_enforced)
 
             context.close()
             browser.close()

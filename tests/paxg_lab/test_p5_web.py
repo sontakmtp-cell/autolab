@@ -419,3 +419,185 @@ def test_tab_adapter_manager_uuid_import():
     uid = tam.uuid.uuid4().hex
     assert len(uid) == 32
 
+
+# ---------------------------------------------------------------------------
+# 6. Review Round 2 Regression Tests (Comment ID: 5557593819)
+# ---------------------------------------------------------------------------
+
+
+def test_train_spec_instantiation_from_ui_values():
+    """Verifies TrainSpec builds cleanly from UI values without TypeError (patience vs early_stopping_patience),
+    and validates history_days mapping (180, 365, 'all') and PLAN 3.2 hyperparameter bounds.
+    """
+    from paxg_lab.model.train_spec import TrainSpec
+
+    # Simulate UI controls mapping
+    ui_history_options = {
+        "365 ngày (Khuyến nghị)": 365,
+        "180 ngày": 180,
+        "Toàn bộ lịch sử khả dụng": "all",
+    }
+
+    for opt_text, expected_val in ui_history_options.items():
+        if "180" in opt_text:
+            mapped_hd = 180
+        elif "365" in opt_text:
+            mapped_hd = 365
+        else:
+            mapped_hd = "all"
+
+        assert mapped_hd == expected_val
+
+        # Construct TrainSpec exactly as tab_training does
+        spec = TrainSpec(
+            timeframe="1h",
+            horizon=24,
+            context_len=256,
+            feature_set="B",
+            lora_r=4,
+            lora_alpha=8,
+            lora_dropout=0.10,
+            learning_rate=5e-5,
+            max_epochs=5,
+            batch_size=2,
+            gradient_accumulation_steps=8,
+            weight_decay=0.01,
+            early_stopping_patience=2,  # Must be early_stopping_patience, NOT patience
+            grad_clip_norm=1.0,
+            history_days=mapped_hd,
+            seed=42,
+        )
+
+        assert spec.history_days == expected_val
+        assert spec.early_stopping_patience == 2
+        assert spec.effective_batch_size == 16
+        assert spec.weight_decay == 0.01
+        assert spec.grad_clip_norm == 1.0
+
+
+def test_timeframe_state_isolation_prevents_cross_contamination():
+    """Verifies that switching 1h -> 4h -> 1h results do not cross-contaminate visualizations."""
+    from paxg_lab.ui.components.tab_backtest import _render_backtest_report_view
+
+    # 1h forecast result
+    fc_1h = {
+        "timeframe": "1h",
+        "q50": [2500.0] * 24,
+        "timestamps": [1788652800000 + i * 3600000 for i in range(24)],
+    }
+    # Parsing 1h result under 1h should produce 24 steps
+    steps_1h = _parse_forecast_result(fc_1h, "1h")
+    assert len(steps_1h) == 24
+
+    # Parsing 1h result under 4h must be rejected (returns empty list to prevent cross-contamination)
+    steps_cross = _parse_forecast_result(fc_1h, "4h")
+    assert len(steps_cross) == 0
+
+    # 4h forecast result
+    fc_4h = {
+        "timeframe": "4h",
+        "q50": [2500.0] * 6,
+        "timestamps": [1788652800000 + i * 14400000 for i in range(6)],
+    }
+    steps_4h = _parse_forecast_result(fc_4h, "4h")
+    assert len(steps_4h) == 6
+
+    steps_cross_4h_to_1h = _parse_forecast_result(fc_4h, "1h")
+    assert len(steps_cross_4h_to_1h) == 0
+
+    # Backtest report timeframe mismatch should be safely rejected
+    report_1h = {
+        "timeframe": "1h",
+        "model_name": "TestModel-1h",
+        "score": 1.5,
+    }
+    # Should not raise any error and safely warn
+    _render_backtest_report_view(report_1h, "4h")
+
+
+def test_safe_zip_import_rejects_checksum_traversal_and_uncovered_files(temp_store: AdapterStore, tmp_path: Path):
+    """Verifies that checksums.sha256 with traversal paths, absolute paths, or unverified files are strictly rejected."""
+    import hashlib
+
+    # 1. Traversal path in checksums.sha256 (../outside)
+    zip_traversal = tmp_path / "bad_checksum_traversal.zip"
+    manifest_str = json.dumps({"adapter_id": "test_traversal", "timeframe": "1h", "horizon": 24, "context_len": 256, "feature_set": "B", "feature_columns": ["close"], "best_val_loss": 0.01})
+    m_hash = hashlib.sha256(manifest_str.encode("utf-8")).hexdigest()
+
+    with zipfile.ZipFile(zip_traversal, "w") as zf:
+        zf.writestr("paxg_manifest.json", manifest_str)
+        zf.writestr("checksums.sha256", f"{m_hash}  paxg_manifest.json\n1234567890abcdef  ../outside_file.txt\n")
+
+    with pytest.raises(ValueError, match="Path traversal detected in checksums filename"):
+        temp_store.import_adapter_zip(zip_traversal)
+
+    # 2. Absolute / Drive path in checksums.sha256 (C:\Windows\...)
+    zip_drive = tmp_path / "bad_checksum_drive.zip"
+    with zipfile.ZipFile(zip_drive, "w") as zf:
+        zf.writestr("paxg_manifest.json", manifest_str)
+        zf.writestr("checksums.sha256", f"{m_hash}  paxg_manifest.json\n1234567890abcdef  C:\\Windows\\system.ini\n")
+
+    with pytest.raises(ValueError, match="Path traversal detected in checksums filename"):
+        temp_store.import_adapter_zip(zip_drive)
+
+    # 3. UNC path in checksums.sha256 (//server/share or \\\\server\\share)
+    zip_unc = tmp_path / "bad_checksum_unc.zip"
+    with zipfile.ZipFile(zip_unc, "w") as zf:
+        zf.writestr("paxg_manifest.json", manifest_str)
+        zf.writestr("checksums.sha256", f"{m_hash}  paxg_manifest.json\n1234567890abcdef  \\\\server\\share\\evil.txt\n")
+
+    with pytest.raises(ValueError, match="Path traversal detected in checksums filename"):
+        temp_store.import_adapter_zip(zip_unc)
+
+    # 4. Uncovered file in archive: archive contains extra file not in checksums.sha256
+    zip_uncovered = tmp_path / "uncovered_file.zip"
+    with zipfile.ZipFile(zip_uncovered, "w") as zf:
+        zf.writestr("paxg_manifest.json", manifest_str)
+        zf.writestr("secret_backdoor.bin", b"\x00\x01\x02")
+        # checksums only mentions paxg_manifest.json, secret_backdoor.bin is unverified!
+        zf.writestr("checksums.sha256", f"{m_hash}  paxg_manifest.json\n")
+
+    with pytest.raises(ValueError, match="archive contains unverified files not covered by checksums"):
+        temp_store.import_adapter_zip(zip_uncovered)
+
+
+def test_queue_idempotency_enforcement(tmp_path: Path):
+    """Verifies GPUJobStorage strictly enforces idempotency_key: two submissions yield 1 job ID."""
+    from paxg_lab.queue.storage import GPUJobStorage
+    from paxg_lab.queue.types import JobPriority, JobSpec, JobType
+
+    db_path = tmp_path / "test_queue.db"
+    storage = GPUJobStorage(db_path)
+
+    key = "idem_unique_key_123"
+    spec1 = JobSpec(
+        job_id="job_idempotency_first",
+        job_type=JobType.DUMMY.value,
+        timeframe="1h",
+        priority=JobPriority.MANUAL.value,
+        payload={"session": "tab1"},
+        idempotency_key=key,
+    )
+    spec2 = JobSpec(
+        job_id="job_idempotency_duplicate",
+        job_type=JobType.DUMMY.value,
+        timeframe="1h",
+        priority=JobPriority.MANUAL.value,
+        payload={"session": "tab2"},
+        idempotency_key=key,
+    )
+
+    id1 = storage.submit_job(spec1)
+    id2 = storage.submit_job(spec2)
+
+    assert id1 == "job_idempotency_first"
+    assert id2 == "job_idempotency_first"
+    assert id1 == id2
+
+    # Verify only 1 job was created in DB
+    jobs = storage.list_jobs()
+    matching = [j for j in jobs if j.idempotency_key == key]
+    assert len(matching) == 1
+    assert matching[0].job_id == "job_idempotency_first"
+
+

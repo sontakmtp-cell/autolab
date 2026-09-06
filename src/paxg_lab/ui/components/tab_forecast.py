@@ -126,13 +126,13 @@ def render_forecast_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
         )
 
         submitted_id = storage.submit_job(job_spec)
-        st.session_state["active_forecast_job_id"] = submitted_id
+        st.session_state[f"active_forecast_job_id_{timeframe}"] = submitted_id
 
     # Polling & displaying forecast result
-    active_job_id = st.session_state.get("active_forecast_job_id")
+    active_job_id = st.session_state.get(f"active_forecast_job_id_{timeframe}")
     if active_job_id:
         active_job = storage.get_job(active_job_id)
-        if active_job:
+        if active_job and active_job.timeframe == timeframe:
             if active_job.status in (JobStatus.QUEUED.value, JobStatus.RUNNING.value):
                 with st.spinner(f"Đang thực hiện dự đoán qua hàng đợi GPU ({active_job.status}). Vui lòng đợi..."):
                     # Quick polling loop
@@ -145,29 +145,31 @@ def render_forecast_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
                     st.rerun()
 
             elif active_job.status == JobStatus.SUCCEEDED.value and active_job.result:
-                st.session_state["last_forecast_data"] = active_job.result
-                st.session_state["last_forecast_model"] = (
+                st.session_state[f"last_forecast_data_{timeframe}"] = active_job.result
+                st.session_state[f"last_forecast_model_{timeframe}"] = (
                     f"LoRA: {adapter_store.get_alias(selected_adapter_id)}" if selected_adapter_id else "TimesFM 3.0 Base"
                 )
-                st.session_state.pop("active_forecast_job_id", None)
+                st.session_state.pop(f"active_forecast_job_id_{timeframe}", None)
                 st.success(f"Dự đoán thành công! Mã công việc: `{active_job_id}`")
 
             elif active_job.status == JobStatus.FAILED.value:
                 st.error(f"Dự đoán thất bại: {active_job.error_message}")
-                st.session_state.pop("active_forecast_job_id", None)
+                st.session_state.pop(f"active_forecast_job_id_{timeframe}", None)
 
             elif active_job.status in (JobStatus.CANCELLED.value, JobStatus.INTERRUPTED.value):
                 st.warning(f"Công việc dự đoán bị hủy hoặc gián đoạn ({active_job.status}).")
-                st.session_state.pop("active_forecast_job_id", None)
+                st.session_state.pop(f"active_forecast_job_id_{timeframe}", None)
+        else:
+            st.session_state.pop(f"active_forecast_job_id_{timeframe}", None)
 
     # Render Visualizations and Tables if forecast data is available
-    forecast_data = st.session_state.get("last_forecast_data")
+    forecast_data = st.session_state.get(f"last_forecast_data_{timeframe}")
     if not forecast_data:
         # Check if there was any previously succeeded forecast in DB
         prev_jobs = storage.list_jobs(job_type=JobType.FORECAST.value, timeframe=timeframe, limit=1)
-        if prev_jobs and prev_jobs[0].status == JobStatus.SUCCEEDED.value and prev_jobs[0].result:
+        if prev_jobs and prev_jobs[0].status == JobStatus.SUCCEEDED.value and prev_jobs[0].result and prev_jobs[0].timeframe == timeframe:
             forecast_data = prev_jobs[0].result
-            st.session_state["last_forecast_data"] = forecast_data
+            st.session_state[f"last_forecast_data_{timeframe}"] = forecast_data
 
     candles_df = get_recent_candles(timeframe, limit=candles_display_count, db_path=db_path)
 
@@ -257,6 +259,11 @@ def render_forecast_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
 def _parse_forecast_result(result_dict: dict[str, Any], timeframe: str) -> list[dict[str, Any]]:
     """Normalizes ForecastResult dictionary into a step list for charts and tables."""
     steps_list = []
+
+    # Safeguard against cross-timeframe pollution
+    res_tf = result_dict.get("timeframe")
+    if res_tf and str(res_tf).lower() != str(timeframe).lower():
+        return []
 
     # Read standard domain ForecastResult schema keys first, with backward-compatible fallbacks
     target_timestamps = result_dict.get("target_timestamps") or result_dict.get("timestamps", [])

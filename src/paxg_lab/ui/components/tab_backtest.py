@@ -121,13 +121,13 @@ def render_backtest_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
         )
 
         submitted_id = storage.submit_job(job_spec)
-        st.session_state["active_backtest_job_id"] = submitted_id
+        st.session_state[f"active_backtest_job_id_{timeframe}"] = submitted_id
 
     # Polling & displaying backtest results
-    active_job_id = st.session_state.get("active_backtest_job_id")
+    active_job_id = st.session_state.get(f"active_backtest_job_id_{timeframe}")
     if active_job_id:
         active_job = storage.get_job(active_job_id)
-        if active_job:
+        if active_job and active_job.timeframe == timeframe:
             if active_job.status in (JobStatus.QUEUED.value, JobStatus.RUNNING.value):
                 prog_msg = active_job.progress_message or "Đang chuẩn bị dữ liệu"
                 prog_pct = int(active_job.progress_pct)
@@ -136,22 +136,24 @@ def render_backtest_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
                     st.rerun()
 
             elif active_job.status == JobStatus.SUCCEEDED.value and active_job.result:
-                st.session_state["last_backtest_report"] = active_job.result
-                st.session_state.pop("active_backtest_job_id", None)
+                st.session_state[f"last_backtest_report_{timeframe}"] = active_job.result
+                st.session_state.pop(f"active_backtest_job_id_{timeframe}", None)
                 st.success(f"Backtest hoàn thành thành công! Mã công việc: `{active_job_id}`")
 
             elif active_job.status == JobStatus.FAILED.value:
                 st.error(f"Backtest thất bại: {active_job.error_message}")
-                st.session_state.pop("active_backtest_job_id", None)
+                st.session_state.pop(f"active_backtest_job_id_{timeframe}", None)
+        else:
+            st.session_state.pop(f"active_backtest_job_id_{timeframe}", None)
 
     # Display Backtest Report
-    report_data = st.session_state.get("last_backtest_report")
+    report_data = st.session_state.get(f"last_backtest_report_{timeframe}")
     if not report_data:
         # Load from recent DB history if available
         prev_bt = storage.list_jobs(job_type=JobType.BACKTEST.value, timeframe=timeframe, limit=1)
-        if prev_bt and prev_bt[0].status == JobStatus.SUCCEEDED.value and prev_bt[0].result:
+        if prev_bt and prev_bt[0].status == JobStatus.SUCCEEDED.value and prev_bt[0].result and prev_bt[0].timeframe == timeframe:
             report_data = prev_bt[0].result
-            st.session_state["last_backtest_report"] = report_data
+            st.session_state[f"last_backtest_report_{timeframe}"] = report_data
 
     if report_data:
         _render_backtest_report_view(report_data, timeframe)
@@ -180,6 +182,11 @@ def render_backtest_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
 
 def _render_backtest_report_view(report: dict[str, Any], timeframe: str) -> None:
     """Renders comprehensive backtest cards, charts, comparisons, and export buttons."""
+    rep_tf = report.get("timeframe")
+    if rep_tf and str(rep_tf).lower() != str(timeframe).lower():
+        st.warning(f"Báo cáo backtest thuộc khung {rep_tf}, không khớp với khung {timeframe} đang chọn.")
+        return
+
     model_name = report.get("model_name", "TimesFM3")
     score_v1 = float(report.get("score", report.get("score_v1", 0.0)))
     weighted_mae = float(report.get("overall_weighted_mae", report.get("weighted_mae", 0.0)))

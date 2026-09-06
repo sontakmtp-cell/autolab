@@ -624,6 +624,7 @@ class AdapterStore:
             if not checksums_file.exists():
                 raise ValueError(f"Import failed: required sidecar '{CHECKSUMS_FILENAME}' missing from zip archive.")
 
+            verified_files: set[Path] = set()
             with open(checksums_file, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
@@ -632,12 +633,37 @@ class AdapterStore:
                     parts = line.split(maxsplit=1)
                     if len(parts) == 2:
                         exp_hash, fname = parts[0].strip(), parts[1].strip()
-                        extracted_file = temp_dir / fname
-                        if not extracted_file.exists():
+                        # Strict filename validation: reject traversal, absolute paths, drive letters, UNC
+                        fname_clean = fname.replace("\\", "/")
+                        if (
+                            ".." in fname_clean
+                            or fname_clean.startswith("/")
+                            or fname.startswith("\\")
+                            or (len(fname) > 1 and fname[1] == ":")
+                            or fname.startswith("//")
+                            or fname.startswith("\\\\")
+                        ):
+                            raise ValueError(f"Path traversal detected in checksums filename: '{fname}'")
+
+                        extracted_file = (temp_dir / fname).resolve()
+                        try:
+                            extracted_file.relative_to(temp_dir.resolve())
+                        except ValueError:
+                            raise ValueError(f"Path traversal detected in checksums filename: '{fname}'")
+
+                        if not extracted_file.is_file():
                             raise FileNotFoundError(f"Missing file declared in checksums: '{fname}'")
                         act_hash = compute_file_sha256(extracted_file)
                         if act_hash != exp_hash:
                             raise ValueError(f"Checksum mismatch for '{fname}': expected {exp_hash}, got {act_hash}")
+                        verified_files.add(extracted_file)
+
+            # Archive completeness: ensure all files in temp_dir (except checksums.sha256) are covered by checksums
+            all_files_in_temp = {f.resolve() for f in temp_dir.rglob("*") if f.is_file() and f.name != CHECKSUMS_FILENAME}
+            uncovered_files = all_files_in_temp - verified_files
+            if uncovered_files:
+                uncovered_names = sorted([str(f.relative_to(temp_dir.resolve())) for f in uncovered_files])
+                raise ValueError(f"Import failed: archive contains unverified files not covered by checksums: {uncovered_names}")
 
             # 5. Move to canonical target
             if target_dir.exists() and overwrite:

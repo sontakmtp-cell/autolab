@@ -94,7 +94,14 @@ def render_training_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
                 "Phạm vi lịch sử học:",
                 options=["365 ngày (Khuyến nghị)", "180 ngày", "Toàn bộ lịch sử khả dụng"],
                 index=0,
+                help="Phạm vi lịch sử nến dùng để huấn luyện theo PLAN 3.2 (180, 365 ngày hoặc toàn bộ).",
             )
+            if "180" in history_days:
+                mapped_history_days: int | str = 180
+            elif "365" in history_days:
+                mapped_history_days = 365
+            else:
+                mapped_history_days = "all"
 
         row2_col1, row2_col2, row2_col3, row2_col4 = st.columns(4)
         with row2_col1:
@@ -123,17 +130,50 @@ def render_training_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
         with row2_col4:
             max_epochs = st.slider("Số vòng học tối đa (Epochs):", min_value=1, max_value=10, value=5)
 
-        # Advanced Settings
-        with st.expander("🛠️ Tham số Nâng cao (Batch GPU, Tích lũy Gradient, Dừng sớm)", expanded=False):
+        # Advanced Settings (PLAN 3.2)
+        with st.expander("🛠️ Tham số Nâng cao (Batch GPU, Tích lũy Gradient, Dừng sớm, Dropout, Clipping, Decay)", expanded=False):
             adv_c1, adv_c2, adv_c3, adv_c4 = st.columns(4)
             with adv_c1:
                 batch_size = st.selectbox("Batch size GPU:", options=[1, 2, 4], index=1)
+                lora_dropout = st.slider(
+                    "LoRA Dropout:",
+                    min_value=0.0,
+                    max_value=0.20,
+                    value=0.10,
+                    step=0.01,
+                    format="%.2f",
+                    help="Tỷ lệ dropout LoRA trong khoảng [0.0, 0.20] theo PLAN 3.2.",
+                )
             with adv_c2:
                 grad_accum = st.selectbox("Tích lũy gradient:", options=[1, 2, 4, 8, 16], index=3)
                 eff_batch = batch_size * grad_accum
                 st.caption(f"Batch hiệu dụng: **{eff_batch}**")
+                weight_decay = st.slider(
+                    "Weight Decay:",
+                    min_value=0.0,
+                    max_value=0.10,
+                    value=0.01,
+                    step=0.01,
+                    format="%.2f",
+                    help="Hệ số suy giảm trọng số AdamW trong [0.0, 0.10] theo PLAN 3.2.",
+                )
             with adv_c3:
-                early_stop_patience = st.slider("Số vòng dừng sớm:", min_value=1, max_value=4, value=2)
+                early_stop_patience = st.slider(
+                    "Số vòng dừng sớm:",
+                    min_value=1,
+                    max_value=4,
+                    value=2,
+                    help="Số epoch không cải thiện trước khi dừng sớm (PLAN 3.2: 1–4).",
+                )
+                grad_clip_norm = st.slider(
+                    "Gradient Clipping Norm:",
+                    min_value=0.5,
+                    max_value=2.0,
+                    value=1.0,
+                    step=0.1,
+                    format="%.1f",
+                    help="Ngưỡng cắt chuẩn gradient trong [0.5, 2.0] theo PLAN 3.2.",
+                )
             with adv_c4:
                 seed = st.number_input("Ngẫu nhiên (Seed):", min_value=1, max_value=999999, value=42)
 
@@ -144,7 +184,7 @@ def render_training_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
 
     # 3. Stop Button (Outside Form to allow immediate interrupt)
     running_job = storage.get_running_job()
-    active_train_job_id = st.session_state.get("active_train_job_id")
+    active_train_job_id = st.session_state.get(f"active_train_job_id_{timeframe}")
 
     if running_job and running_job.job_type in (JobType.TRAIN.value, JobType.AUTO_TRIAL.value):
         col_st1, col_st2 = st.columns([1.5, 3.5])
@@ -167,12 +207,15 @@ def render_training_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
             feature_set=feat_code,
             lora_r=lora_rank,
             lora_alpha=lora_alpha,
-            lora_dropout=0.10,
+            lora_dropout=lora_dropout,
             learning_rate=learning_rate,
             max_epochs=max_epochs,
             batch_size=batch_size,
             gradient_accumulation_steps=grad_accum,
-            patience=early_stop_patience,
+            weight_decay=weight_decay,
+            early_stopping_patience=early_stop_patience,
+            grad_clip_norm=grad_clip_norm,
+            history_days=mapped_history_days,
             seed=seed,
         )
 
@@ -193,14 +236,14 @@ def render_training_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
         )
 
         submitted_id = storage.submit_job(job_spec)
-        st.session_state["active_train_job_id"] = submitted_id
+        st.session_state[f"active_train_job_id_{timeframe}"] = submitted_id
         st.success(f"Đã gửi lệnh huấn luyện `{submitted_id}` vào hàng đợi GPU!")
         st.rerun()
 
     # 5. Monitor Live Progress
     if active_train_job_id:
         track_job = storage.get_job(active_train_job_id)
-        if track_job:
+        if track_job and track_job.timeframe == timeframe:
             if track_job.status in (JobStatus.QUEUED.value, JobStatus.RUNNING.value):
                 st.markdown("#### ⏳ Tiến trình Huấn luyện Thời gian Thực")
                 p_pct = float(track_job.progress_pct) / 100.0
@@ -217,23 +260,30 @@ def render_training_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
                     f"🎉 Huấn luyện thành công! Adapter ID: `{res.get('adapter_id', 'N/A')}` &bull; "
                     f"Best Epoch: {res.get('best_epoch', 1)} &bull; Best Val Loss: {res.get('best_val_loss', 0.0):.6f}"
                 )
-                st.session_state["last_trained_adapter_id"] = res.get("adapter_id")
-                st.session_state["last_training_result"] = res
-                st.session_state.pop("active_train_job_id", None)
+                st.session_state[f"last_trained_adapter_id_{timeframe}"] = res.get("adapter_id")
+                st.session_state[f"last_training_result_{timeframe}"] = res
+                st.session_state.pop(f"active_train_job_id_{timeframe}", None)
 
             elif track_job.status == JobStatus.CANCELLED.value:
                 st.warning("Huấn luyện đã được dừng an toàn theo yêu cầu. Checkpoint hợp lệ đã được bảo toàn.")
-                st.session_state.pop("active_train_job_id", None)
+                st.session_state.pop(f"active_train_job_id_{timeframe}", None)
 
             elif track_job.status == JobStatus.FAILED.value:
                 st.error(f"Huấn luyện thất bại: {track_job.error_message}")
-                st.session_state.pop("active_train_job_id", None)
+                st.session_state.pop(f"active_train_job_id_{timeframe}", None)
+        else:
+            st.session_state.pop(f"active_train_job_id_{timeframe}", None)
 
     # 6. Training Loss History Chart
     st.markdown("#### 📈 Biểu đồ Loss Huấn luyện Gần nhất")
     training_history: list[dict[str, Any]] = []
-    last_res = st.session_state.get("last_training_result")
-    if last_res and isinstance(last_res, dict) and last_res.get("history"):
+    last_res = st.session_state.get(f"last_training_result_{timeframe}")
+    if (
+        last_res
+        and isinstance(last_res, dict)
+        and last_res.get("history")
+        and last_res.get("timeframe", timeframe) == timeframe
+    ):
         training_history = last_res["history"]
     else:
         recent_succeeded = storage.list_jobs(
