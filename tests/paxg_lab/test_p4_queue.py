@@ -2630,5 +2630,173 @@ def test_startup_recovery_respects_stopped_and_cancel_requested_lightweight(
     assert len(resumed_jobs_b) == 0, f"Expected 0 resumed jobs, found: {resumed_jobs_b}"
 
 
+# ---------------------------------------------------------------------------
+# 36. Review Round 6 (Comment 5556675057): Scoped OOM Retry Policy by Job Type and Priority
+# ---------------------------------------------------------------------------
+
+
+def test_oom_retry_policy_scoped_by_job_type_and_priority_lightweight(temp_db_path: Path):
+    """Verifies that CUDA OOM handling enforces strict job-type and priority-scoped policies:
+
+    1. FORECAST OOM: Fails cleanly without retrying, and NEVER mutates AutoRunState to PAUSED_ERROR.
+    2. MANUAL TRAIN OOM: Retries once with halved batch_size and doubled accum, but upon second
+       failure (or when batch_size <= 1), fails cleanly and NEVER mutates AutoRunState to PAUSED_ERROR.
+    3. AUTO_TRIAL OOM: Retries once with halved batch_size and doubled accum, and upon second
+       failure (or when batch_size <= 1), transitions AutoRunState to PAUSED_ERROR per PLAN 4.1.
+    4. BACKTEST OOM: Retries once with halved batch_size without gradient accumulation, and
+       NEVER mutates AutoRunState to PAUSED_ERROR.
+    """
+    scheduler = GPUScheduler(db_path=temp_db_path, acquire_coordinator_lock=False)
+    storage = scheduler.storage
+
+    # -----------------------------------------------------------------------
+    # 1. FORECAST OOM: Fail cleanly, no retry job enqueued, AutoRunState intact
+    # -----------------------------------------------------------------------
+    storage.set_auto_run_state("1h", AutoRunState.SEARCHING)
+    fc_job_id = "forecast_oom_test_job"
+    storage.submit_job(
+        JobSpec(
+            job_id=fc_job_id,
+            job_type=JobType.FORECAST.value,
+            timeframe="1h",
+            priority=JobPriority.FORECAST.value,
+            payload={"snapshot_path": "dummy.snap"},
+        )
+    )
+    storage.mark_failed(fc_job_id, "[CUDA_OOM] CUDA out of memory in forecast_decode")
+    fc_job = storage.get_job(fc_job_id)
+    res_fc = scheduler._handle_oom_retry_if_needed(fc_job)
+    assert res_fc is None, "FORECAST OOM should not enqueue a retry job"
+    assert storage.get_auto_run_state("1h") == AutoRunState.SEARCHING, "FORECAST OOM must never pause auto-run!"
+    fc_job_after = storage.get_job(fc_job_id)
+    assert "[CUDA_OOM Guidance]" in fc_job_after.error_message
+
+    # -----------------------------------------------------------------------
+    # 2. MANUAL TRAIN OOM: Retries once, 2nd failure fails cleanly without pausing auto-run
+    # -----------------------------------------------------------------------
+    storage.set_auto_run_state("1h", AutoRunState.SEARCHING)
+    m_job_id = "manual_train_oom_test_job"
+    storage.submit_job(
+        JobSpec(
+            job_id=m_job_id,
+            job_type=JobType.TRAIN.value,
+            timeframe="1h",
+            priority=JobPriority.MANUAL.value,
+            payload={
+                "train_spec": {
+                    "batch_size": 4,
+                    "gradient_accumulation_steps": 2,
+                    "timeframe": "1h",
+                }
+            },
+        )
+    )
+    storage.mark_failed(m_job_id, "[CUDA_OOM] out of memory during backward")
+    m_job = storage.get_job(m_job_id)
+    res_m1 = scheduler._handle_oom_retry_if_needed(m_job)
+    assert res_m1 == f"{m_job_id}_oom_retry"
+    assert storage.get_auto_run_state("1h") == AutoRunState.SEARCHING
+
+    retry_m_job = storage.get_job(res_m1)
+    assert retry_m_job.payload["train_spec"]["batch_size"] == 2
+    assert retry_m_job.payload["train_spec"]["gradient_accumulation_steps"] == 4
+    assert retry_m_job.priority == JobPriority.MANUAL.value
+
+    # Second failure on manual retry
+    storage.mark_failed(res_m1, "[CUDA_OOM] out of memory again")
+    retry_m_job_failed = storage.get_job(res_m1)
+    res_m2 = scheduler._handle_oom_retry_if_needed(retry_m_job_failed)
+    assert res_m2 is None
+    assert storage.get_auto_run_state("1h") == AutoRunState.SEARCHING, "Manual TRAIN must never pause auto-run!"
+    assert "[CUDA_OOM Guidance]" in storage.get_job(res_m1).error_message
+
+    # Manual TRAIN batch_size <= 1 boundary: fails cleanly without pausing auto-run
+    m_b1_job_id = "manual_b1_test_job"
+    storage.submit_job(
+        JobSpec(
+            job_id=m_b1_job_id,
+            job_type=JobType.TRAIN.value,
+            timeframe="1h",
+            priority=JobPriority.MANUAL.value,
+            payload={"train_spec": {"batch_size": 1, "gradient_accumulation_steps": 8}},
+        )
+    )
+    storage.mark_failed(m_b1_job_id, "[CUDA_OOM] out of memory")
+    res_m_b1 = scheduler._handle_oom_retry_if_needed(storage.get_job(m_b1_job_id))
+    assert res_m_b1 is None
+    assert storage.get_auto_run_state("1h") == AutoRunState.SEARCHING
+
+    # -----------------------------------------------------------------------
+    # 3. AUTO_TRIAL OOM: Retries once, 2nd failure transitions to PAUSED_ERROR
+    # -----------------------------------------------------------------------
+    storage.set_auto_run_state("1h", AutoRunState.SEARCHING)
+    a_job_id = "auto_trial_oom_test_job"
+    storage.submit_job(
+        JobSpec(
+            job_id=a_job_id,
+            job_type=JobType.AUTO_TRIAL.value,
+            timeframe="1h",
+            priority=JobPriority.AUTO.value,
+            payload={
+                "train_spec": {
+                    "batch_size": 4,
+                    "gradient_accumulation_steps": 2,
+                    "timeframe": "1h",
+                }
+            },
+        )
+    )
+    storage.mark_failed(a_job_id, "[CUDA_OOM] out of memory in forward pass")
+    a_job = storage.get_job(a_job_id)
+    res_a1 = scheduler._handle_oom_retry_if_needed(a_job)
+    assert res_a1 == f"{a_job_id}_oom_retry"
+    assert storage.get_auto_run_state("1h") == AutoRunState.SEARCHING
+
+    retry_a_job = storage.get_job(res_a1)
+    assert retry_a_job.payload["train_spec"]["batch_size"] == 2
+    assert retry_a_job.payload["train_spec"]["gradient_accumulation_steps"] == 4
+
+    # Second failure on AUTO retry -> transitions to PAUSED_ERROR
+    storage.mark_failed(res_a1, "[CUDA_OOM] out of memory again")
+    retry_a_job_failed = storage.get_job(res_a1)
+    res_a2 = scheduler._handle_oom_retry_if_needed(retry_a_job_failed)
+    assert res_a2 is None
+    assert storage.get_auto_run_state("1h") == AutoRunState.PAUSED_ERROR
+
+    # -----------------------------------------------------------------------
+    # 4. BACKTEST OOM: Retries with halved batch (no grad accum), never pauses auto-run
+    # -----------------------------------------------------------------------
+    storage.set_auto_run_state("1h", AutoRunState.SEARCHING)
+    b_job_id = "backtest_oom_test_job"
+    storage.submit_job(
+        JobSpec(
+            job_id=b_job_id,
+            job_type=JobType.BACKTEST.value,
+            timeframe="1h",
+            priority=JobPriority.MANUAL.value,
+            payload={"batch_size": 16, "snapshot_path": "dummy.snap"},
+        )
+    )
+    storage.mark_failed(b_job_id, "[CUDA_OOM] out of memory evaluating fold 1")
+    b_job = storage.get_job(b_job_id)
+    res_b1 = scheduler._handle_oom_retry_if_needed(b_job)
+    assert res_b1 == f"{b_job_id}_oom_retry"
+    assert storage.get_auto_run_state("1h") == AutoRunState.SEARCHING
+
+    retry_b_job = storage.get_job(res_b1)
+    assert retry_b_job.payload["batch_size"] == 8
+    assert "gradient_accumulation_steps" not in retry_b_job.payload
+    assert retry_b_job.job_type == JobType.BACKTEST.value
+
+    # Second failure on backtest retry -> fails cleanly without pausing auto-run
+    storage.mark_failed(res_b1, "[CUDA_OOM] out of memory again")
+    retry_b_job_failed = storage.get_job(res_b1)
+    res_b2 = scheduler._handle_oom_retry_if_needed(retry_b_job_failed)
+    assert res_b2 is None
+    assert storage.get_auto_run_state("1h") == AutoRunState.SEARCHING, "BACKTEST must never pause auto-run!"
+    assert "[CUDA_OOM Guidance]" in storage.get_job(res_b1).error_message
+
+
+
 
 

@@ -459,26 +459,133 @@ class GPUScheduler:
             return False
 
     def _handle_oom_retry_if_needed(self, job: JobSpec) -> str | None:
-        """Implements PLAN 4.1 OOM protocol: retry once with halved batch size and adjusted accumulation.
+        """Handles CUDA OOM failures according to job-type and priority-specific policies.
 
-        If batch_size is already 1, no further reduction is possible; transitions directly to PAUSED_ERROR.
-        Gradient accumulation is clamped to max 16 per PLAN 3.2 constraints.
+        Policies:
+        1. FORECAST: Single-window inference; batch cannot be halved. Fails cleanly
+           without enqueuing an invalid retry, and NEVER transitions AutoRunState.
+        2. BACKTEST: Multi-window evaluation without gradients. If batch_size > 1 and
+           oom_retry_count == 0, retries once with halved batch_size (no gradient accumulation).
+           NEVER transitions AutoRunState to PAUSED_ERROR.
+        3. TRAIN / AUTO_TRIAL (and DUMMY for test harness): Training protocol.
+           If batch_size > 1 and oom_retry_count == 0, retries once with halved batch_size
+           and doubled gradient_accumulation_steps (clamped to 16).
+           Transitions AutoRunState to PAUSED_ERROR ONLY if priority == JobPriority.AUTO.
+           Manual training jobs fail cleanly without affecting AutoRunState.
         """
         err = (job.error_message or "").lower()
         if "[cuda_oom]" not in err and "out of memory" not in err:
             return None
 
-        retry_count = int(job.payload.get("oom_retry_count", 0))
+        is_auto = (job.priority == JobPriority.AUTO.value)
+        tf = job.timeframe or "1h"
+        payload = job.payload or {}
+        retry_count = int(payload.get("oom_retry_count", 0))
+
+        # -----------------------------------------------------------------------
+        # 1. FORECAST jobs: Fail cleanly, no retry, never mutate AutoRunState
+        # -----------------------------------------------------------------------
+        if job.job_type == JobType.FORECAST.value:
+            logger.error(
+                "CUDA OOM on FORECAST job '%s'. Single-window forecast cannot reduce batch size; "
+                "failing cleanly without retrying and preserving auto-run state.",
+                job.job_id,
+            )
+            actionable_err = (
+                f"{job.error_message or ''}\n[CUDA_OOM Guidance] Forecast inference encountered CUDA OOM. "
+                "Single-window inference cannot reduce batch size. Reduce context_len or run on a device with more VRAM."
+            ).strip()
+            self.storage.mark_failed(job.job_id, actionable_err)
+            return None
+
+        # -----------------------------------------------------------------------
+        # 2. BACKTEST jobs: Retry once by halving batch_size (no grad accum), never mutate AutoRunState
+        # -----------------------------------------------------------------------
+        if job.job_type == JobType.BACKTEST.value:
+            if retry_count > 0:
+                logger.error(
+                    "CUDA OOM retry already failed for BACKTEST job '%s'. Failing cleanly without pausing auto-run.",
+                    job.job_id,
+                )
+                actionable_err = (
+                    f"{job.error_message or ''}\n[CUDA_OOM Guidance] Backtest retry encountered CUDA OOM. "
+                    "Consider reducing context_len, lowering initial batch_size, or running on larger VRAM."
+                ).strip()
+                self.storage.mark_failed(job.job_id, actionable_err)
+                return None
+
+            old_b = int(payload.get("batch_size", 16))
+            if old_b <= 1:
+                logger.error(
+                    "CUDA OOM on BACKTEST job '%s' cannot be retried: batch_size=%d is already at minimum (1). "
+                    "Failing cleanly without pausing auto-run.",
+                    job.job_id,
+                    old_b,
+                )
+                actionable_err = (
+                    f"{job.error_message or ''}\n[CUDA_OOM Guidance] Backtest failed with CUDA OOM "
+                    f"at minimum batch_size={old_b}. Consider reducing context_len or running on larger VRAM."
+                ).strip()
+                self.storage.mark_failed(job.job_id, actionable_err)
+                return None
+
+            new_b = max(1, old_b // 2)
+            retry_payload = copy.deepcopy(payload)
+            retry_payload["oom_retry_count"] = 1
+            retry_payload["batch_size"] = new_b
+            retry_payload["original_batch_size"] = old_b
+            retry_payload["adjusted_batch_size"] = new_b
+
+            retry_job_id = f"{job.job_id}_oom_retry"
+            retry_spec = JobSpec(
+                job_id=retry_job_id,
+                job_type=job.job_type,
+                timeframe=job.timeframe,
+                priority=job.priority,
+                payload=retry_payload,
+                timeout_seconds=job.timeout_seconds,
+            )
+            self.storage.submit_job(retry_spec)
+            logger.info(
+                "CUDA OOM detected on BACKTEST job '%s' (batch=%d->%d). Dispatched OOM retry job '%s'.",
+                job.job_id,
+                old_b,
+                new_b,
+                retry_job_id,
+            )
+            return retry_job_id
+
+        # -----------------------------------------------------------------------
+        # 3. TRAIN, AUTO_TRIAL (and DUMMY for test harness) jobs
+        # -----------------------------------------------------------------------
+        if job.job_type not in (JobType.TRAIN.value, JobType.AUTO_TRIAL.value, JobType.DUMMY.value):
+            logger.error(
+                "CUDA OOM on unsupported job type '%s' for job '%s'. Failing cleanly.",
+                job.job_type,
+                job.job_id,
+            )
+            return None
+
+        # Training OOM protocol
         if retry_count > 0:
-            logger.error("CUDA OOM retry already failed for job '%s'. Setting PAUSED_ERROR.", job.job_id)
-            tf = job.timeframe or "1h"
-            self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
-            if not job.timeframe:
-                self.storage.set_auto_run_state("4h", AutoRunState.PAUSED_ERROR)
+            if is_auto:
+                logger.error("CUDA OOM retry already failed for AUTO job '%s'. Setting PAUSED_ERROR.", job.job_id)
+                self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
+                if not job.timeframe:
+                    self.storage.set_auto_run_state("4h", AutoRunState.PAUSED_ERROR)
+            else:
+                logger.error(
+                    "CUDA OOM retry failed for manual training job '%s'. Failing cleanly without mutating auto-run state.",
+                    job.job_id,
+                )
+                actionable_err = (
+                    f"{job.error_message or ''}\n[CUDA_OOM Guidance] Training retry with halved batch size "
+                    "still encountered CUDA OOM. Consider reducing context_len or training on larger VRAM."
+                ).strip()
+                self.storage.mark_failed(job.job_id, actionable_err)
             return None
 
         # Inspect current batch_size and gradient_accumulation_steps
-        payload = job.payload
         has_train_spec = "train_spec" in payload and isinstance(payload["train_spec"], dict)
         spec_d = payload["train_spec"] if has_train_spec else payload
 
@@ -487,23 +594,36 @@ class GPUScheduler:
 
         # Boundary check: If batch_size cannot be reduced further (batch_size <= 1)
         if old_b <= 1:
-            logger.error(
-                "CUDA OOM on job '%s' cannot be retried: batch_size=%d is already at minimum (1). "
-                "Setting PAUSED_ERROR directly per PLAN 4.1 protocol.",
-                job.job_id,
-                old_b,
-            )
-            tf = job.timeframe or "1h"
-            self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
-            if not job.timeframe:
-                self.storage.set_auto_run_state("4h", AutoRunState.PAUSED_ERROR)
+            if is_auto:
+                logger.error(
+                    "CUDA OOM on AUTO job '%s' cannot be retried: batch_size=%d is already at minimum (1). "
+                    "Setting PAUSED_ERROR directly per PLAN 4.1 protocol.",
+                    job.job_id,
+                    old_b,
+                )
+                self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
+                if not job.timeframe:
+                    self.storage.set_auto_run_state("4h", AutoRunState.PAUSED_ERROR)
+            else:
+                logger.error(
+                    "CUDA OOM on manual job '%s' cannot be retried: batch_size=%d is already at minimum (1). "
+                    "Failing cleanly without mutating auto-run state.",
+                    job.job_id,
+                    old_b,
+                )
+                actionable_err = (
+                    f"{job.error_message or ''}\n[CUDA_OOM Guidance] Training failed with CUDA OOM "
+                    f"at minimum batch_size={old_b}. Consider reducing context_len, using lower rank, "
+                    "or training on a GPU with larger VRAM."
+                ).strip()
+                self.storage.mark_failed(job.job_id, actionable_err)
             return None
 
         # Valid load reduction: halve batch_size, double grad_accum clamped to max 16 per PLAN 3.2
         new_b = max(1, old_b // 2)
         new_a = min(16, old_a * 2)
 
-        retry_payload = copy.deepcopy(job.payload)
+        retry_payload = copy.deepcopy(payload)
         retry_payload["oom_retry_count"] = 1
         if has_train_spec:
             retry_payload["train_spec"]["batch_size"] = new_b
