@@ -40,6 +40,12 @@ def storage(temp_db_path: Path) -> GPUJobStorage:
     return GPUJobStorage(temp_db_path)
 
 
+skip_lora_training_on_ci = pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("CI") == "true",
+    reason="LoRA training test skipped on GitHub Actions runner (hardware compute limit)",
+)
+
+
 # ---------------------------------------------------------------------------
 # 1. JobSpec and Status Lifecycle Validation
 # ---------------------------------------------------------------------------
@@ -1140,6 +1146,7 @@ def test_forecast_job_e2e_success_with_snapshot(temp_db_path: Path, tmp_path: Pa
 # ---------------------------------------------------------------------------
 
 
+@skip_lora_training_on_ci
 def test_train_and_auto_trial_job_e2e_success(temp_db_path: Path, tmp_path: Path):
     """Verifies TRAIN and AUTO_TRIAL jobs execute via GPUWorker using real P3 APIs and save verified adapters."""
     from paxg_lab.data.features import FEATURE_SPECS
@@ -1490,6 +1497,7 @@ def get_or_create_test_snapshot(tmp_path: Path, timeframe: str = "4h") -> Path:
     return snap.save(base_dir=snap_dir)
 
 
+@skip_lora_training_on_ci
 def test_backtest_job_e2e_base_and_lora(temp_db_path: Path, tmp_path: Path):
     """Verifies that BACKTEST jobs execute cleanly via GPUWorker for both Base and LoRA models."""
     from paxg_lab.queue.worker import GPUWorker
@@ -1601,6 +1609,7 @@ def test_backtest_job_e2e_base_and_lora(temp_db_path: Path, tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
+@skip_lora_training_on_ci
 def test_train_spec_full_hyperparameters_and_history_all(temp_db_path: Path, tmp_path: Path):
     """Verifies that custom TrainSpec hyperparameters and history_days='all' pass intact to the trainer and manifest."""
     from paxg_lab.model.store import AdapterStore
@@ -1825,6 +1834,7 @@ def test_oom_retry_boundaries_batch_1_and_accum_16(temp_db_path: Path):
 # ---------------------------------------------------------------------------
 
 
+@skip_lora_training_on_ci
 def test_train_stop_preserves_durable_checkpoint_and_loadable_adapter(temp_db_path: Path, tmp_path: Path):
     """Verifies that stopping a training job preserves a durable checkpoint and loadable adapter."""
     from paxg_lab.queue.checkpoint import TrainingCheckpointManager
@@ -1896,6 +1906,7 @@ def test_train_stop_preserves_durable_checkpoint_and_loadable_adapter(temp_db_pa
     assert saved_adapter_manifest.exists()
 
 
+@skip_lora_training_on_ci
 def test_scheduler_and_trainer_reconcile_durable_checkpoint_on_restart(temp_db_path: Path, tmp_path: Path):
     """Verifies that scheduler reconciles durable checkpoints on restart, requeues continuation job, and trainer resumes."""
     from paxg_lab.constants import MODEL_REPO, MODEL_REVISION
@@ -2282,6 +2293,7 @@ def test_checkpoint_compatibility_rejects_mismatch(tmp_path: Path):
         )
 
 
+@skip_lora_training_on_ci
 def test_mid_epoch_checkpoint_and_resumption_no_skipping(tmp_path: Path):
     """Verifies that mid-epoch checkpoint continuation does not skip remaining minibatches of the epoch nor rerun completed minibatches."""
     from paxg_lab.constants import MODEL_REPO, MODEL_REVISION
@@ -2371,6 +2383,7 @@ def test_mid_epoch_checkpoint_and_resumption_no_skipping(tmp_path: Path):
     assert res.manifest.best_epoch >= 1
 
 
+@skip_lora_training_on_ci
 def test_stopped_job_result_persisted_in_database(temp_db_path: Path, tmp_path: Path):
     """Verifies that when a job is stopped, its full result metadata is preserved in the database."""
     from paxg_lab.queue.worker import GPUWorker
