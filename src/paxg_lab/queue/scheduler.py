@@ -297,8 +297,17 @@ class GPUScheduler:
 
                 # Check if job failed with CUDA OOM for automatic single retry
                 refreshed_job = self.storage.get_job(self.active_job_id)
-                if refreshed_job and refreshed_job.status == JobStatus.FAILED.value:
-                    self._handle_oom_retry_if_needed(refreshed_job)
+                if refreshed_job and refreshed_job.status in (JobStatus.FAILED.value, JobStatus.INTERRUPTED.value):
+                    retry_id = self._handle_oom_retry_if_needed(refreshed_job)
+                    if retry_id is None and (refreshed_job.job_type == JobType.AUTO_TRIAL.value or refreshed_job.priority == JobPriority.AUTO.value):
+                        tf = refreshed_job.timeframe or "1h"
+                        logger.error(
+                            "AUTO job '%s' ended in status '%s': %s. Transitioning auto run state to PAUSED_ERROR.",
+                            refreshed_job.job_id,
+                            refreshed_job.status,
+                            refreshed_job.error_message,
+                        )
+                        self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
 
                 self.active_worker = None
                 self.active_job_id = None
@@ -335,6 +344,11 @@ class GPUScheduler:
                             self.active_job_id,
                             f"Heartbeat timed out after {self.heartbeat_timeout}s without response (process hung).",
                         )
+                        if job.job_type == JobType.AUTO_TRIAL.value or job.priority == JobPriority.AUTO.value:
+                            tf = job.timeframe or "1h"
+                            logger.error("Heartbeat timed out on AUTO job '%s'. Setting PAUSED_ERROR.", self.active_job_id)
+                            self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
+
                         self.active_worker = None
                         self.active_job_id = None
                         self.active_worker_pid = None
@@ -363,6 +377,11 @@ class GPUScheduler:
                             self.active_job_id,
                             f"Job exceeded max execution timeout of {job.timeout_seconds}s.",
                         )
+                        if job.job_type == JobType.AUTO_TRIAL.value or job.priority == JobPriority.AUTO.value:
+                            tf = job.timeframe or "1h"
+                            logger.error("Execution timeout exceeded on AUTO job '%s'. Setting PAUSED_ERROR.", self.active_job_id)
+                            self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
+
                         self.active_worker = None
                         self.active_job_id = None
                         self.active_worker_pid = None
@@ -485,6 +504,9 @@ class GPUScheduler:
             # Child was cleanly terminated or never spawned
             try:
                 self.storage.mark_failed(job.job_id, f"Failed to spawn worker subprocess: {exc}")
+                if job.job_type == JobType.AUTO_TRIAL.value or job.priority == JobPriority.AUTO.value:
+                    tf = job.timeframe or "1h"
+                    self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
             except Exception:
                 pass
             self.active_worker = None

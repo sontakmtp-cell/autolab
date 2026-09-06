@@ -139,6 +139,10 @@ class GPUWorker:
                 prefix = ""
 
             self.storage.mark_failed(self.job_id, f"{prefix}{str(exc)}")
+            if (job.job_type == JobType.AUTO_TRIAL.value or job.priority == JobPriority.AUTO.value) and not is_oom:
+                tf = job.timeframe or "1h"
+                logger.error("Error on AUTO job '%s'. Setting PAUSED_ERROR.", self.job_id)
+                self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
             exit_code = 1
 
         finally:

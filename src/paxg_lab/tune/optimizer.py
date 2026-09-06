@@ -83,6 +83,34 @@ class EarlyStoppingStagnationCallback:
                 # May be invoked outside of active optimize loop during testing
                 pass
 
+    def sync_from_study(self, study: optuna.Study) -> None:
+        """Reconstructs stagnation state deterministically from study trial history."""
+        self.best_score = float("-inf")
+        self.stagnant_trials = 0
+        self.stopped_early = False
+
+        completed_trials = [
+            t for t in study.trials
+            if t.state == TrialState.COMPLETE and t.value is not None
+        ]
+        completed_trials.sort(key=lambda t: t.number)
+
+        for i, t in enumerate(completed_trials, 1):
+            val = float(t.value)
+            if i <= self.startup_trials:
+                if val > self.best_score:
+                    self.best_score = val
+                continue
+
+            if val >= self.best_score + self.min_delta:
+                self.best_score = val
+                self.stagnant_trials = 0
+            else:
+                self.stagnant_trials += 1
+
+            if self.stagnant_trials >= self.patience:
+                self.stopped_early = True
+
 
 class OptunaTPEOptimizer:
     """Executes bounded Bayesian optimization for TimesFM 3.0 LoRA."""

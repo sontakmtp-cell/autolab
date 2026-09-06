@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -85,6 +85,7 @@ def run_locked_verification(
     store: AdapterStore | None = None,
     batch_size: int = 16,
     storage: Any | None = None,
+    is_cancelled_func: Callable[[], bool] | None = None,
 ) -> LockedVerificationReport:
     """Executes single-pass evaluation strictly on the locked test set [test_start, test_end).
 
@@ -108,12 +109,24 @@ def run_locked_verification(
     if hasattr(snapshot, "metadata") and hasattr(snapshot.metadata, "sha256"):
         snapshot_hash = str(snapshot.metadata.sha256)
 
+    if len(snapshot.timestamps) > 1:
+        candle_step_ms = int(snapshot.timestamps[1] - snapshot.timestamps[0])
+    else:
+        from ..constants import timeframe_to_seconds
+        candle_step_ms = int(timeframe_to_seconds(timeframe) * 1000)
+
+    test_start_time_ms = int(snapshot.timestamps[test_start])
+    if test_end < len(snapshot.timestamps):
+        test_end_time_ms = int(snapshot.timestamps[test_end])
+    else:
+        test_end_time_ms = int(snapshot.timestamps[test_end - 1]) + candle_step_ms
+
     # 1. Enforce statistical lock via SQLite audit ledger
     if storage is not None:
-        if storage.is_locked_range_consumed(timeframe, test_start, test_end, snapshot_hash):
+        if storage.is_locked_range_consumed(timeframe, test_start_time_ms, test_end_time_ms):
             raise RuntimeError(
-                f"Statistical lock violation: locked verification range [{test_start}, {test_end}) "
-                f"for timeframe '{timeframe}' and snapshot hash '{snapshot_hash[:8]}' has already been consumed. "
+                f"Statistical lock violation: locked verification interval [{test_start_time_ms}, {test_end_time_ms}) "
+                f"for timeframe '{timeframe}' overlaps previously consumed test data in ledger. "
                 "Refusing to reuse locked exam for another candidate."
             )
         # Atomically mark consumption before inference begins
@@ -121,6 +134,8 @@ def run_locked_verification(
             timeframe=timeframe,
             test_start_idx=test_start,
             test_end_idx=test_end,
+            test_start_time_ms=test_start_time_ms,
+            test_end_time_ms=test_end_time_ms,
             snapshot_hash=snapshot_hash,
             candidate_id=candidate_manifest.adapter_id,
             verdict="IN_PROGRESS",
@@ -195,10 +210,9 @@ def run_locked_verification(
                 timeframe=timeframe,
             )
         except Exception as exc:
-            logger.warning("Could not extract windows for current recommended adapter '%s': %s", current_rec_id, exc)
-            rec_ctx_raw = None
-            rec_origins = None
-            rec_path = None
+            raise RuntimeError(
+                f"Fail-closed: Failed preparing incumbent recommended adapter '{current_rec_id}' for contemporaneous evaluation: {exc}"
+            ) from exc
 
     # 5. Intersect common forecast origins across candidate, base, and current recommended
     common_set = set(cand_origins) & set(base_origins)
@@ -227,41 +241,54 @@ def run_locked_verification(
         rec_indices = [rec_orig_to_idx[orig] for orig in common_origins]
         rec_ctx = rec_ctx_raw[rec_indices]
 
+    pred_kwargs: dict[str, Any] = {"batch_size": batch_size}
+    if is_cancelled_func is not None:
+        pred_kwargs["is_cancelled_func"] = is_cancelled_func
+
     # 6. Candidate inference
+    if is_cancelled_func is not None and is_cancelled_func():
+        raise InterruptedError("Locked verification cancelled by user request.")
     cand_predictor = TimesFM3Predictor(adapter_path=candidate_adapter_path)
     cand_preds, cand_quantiles = cand_predictor.predict(
         contexts=cand_ctx,
         horizon=horizon,
-        batch_size=batch_size,
+        **pred_kwargs,
     )
 
     # 7. Base reference inference
+    if is_cancelled_func is not None and is_cancelled_func():
+        raise InterruptedError("Locked verification cancelled by user request.")
     base_predictor = TimesFM3Predictor()
     base_preds, base_quantiles = base_predictor.predict(
         contexts=base_ctx,
         horizon=horizon,
-        batch_size=batch_size,
+        **pred_kwargs,
     )
 
     # 8. Current recommended inference (if exists)
     rec_preds = None
     rec_quantiles = None
     baseline_name = "TimesFM3-Base"
-    if rec_ctx is not None and rec_path is not None:
+    if current_rec_id:
+        if is_cancelled_func is not None and is_cancelled_func():
+            raise InterruptedError("Locked verification cancelled by user request.")
+        if rec_ctx is None or rec_path is None:
+            raise RuntimeError(
+                f"Fail-closed: Incumbent recommended adapter '{current_rec_id}' is active but context or adapter path is missing."
+            )
         try:
             rec_predictor = TimesFM3Predictor(adapter_path=rec_path)
             rec_preds, rec_quantiles = rec_predictor.predict(
                 contexts=rec_ctx,
                 horizon=horizon,
-                batch_size=batch_size,
+                **pred_kwargs,
             )
             baseline_name = current_rec_id
             logger.info("Contemporaneous evaluation of recommended adapter '%s' on %d windows.", current_rec_id, len(rec_preds))
         except Exception as exc:
-            logger.warning("Inference failed for recommended adapter '%s': %s", current_rec_id, exc)
-            rec_preds = None
-            rec_quantiles = None
-            baseline_name = "TimesFM3-Base"
+            raise RuntimeError(
+                f"Fail-closed: Failed running inference on incumbent recommended adapter '{current_rec_id}': {exc}"
+            ) from exc
 
     # 9. Naive flat baseline on common origins
     origin_prices = np.asarray([targets[orig] for orig in common_origins], dtype=np.float64)
@@ -334,6 +361,8 @@ def run_locked_verification(
     step_maes = calculate_step_mae(cand_preds, cand_fut, timeframe=timeframe)
 
     # 13. Non-overlapping 24h independent blocks & Block Bootstrap CI
+    if is_cancelled_func is not None and is_cancelled_func():
+        raise InterruptedError("Locked verification cancelled by user request.")
     bootstrap_res = compute_block_bootstrap_ci(
         candidate_predictions=cand_preds,
         baseline_predictions=bootstrap_baseline_preds,

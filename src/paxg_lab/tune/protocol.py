@@ -272,12 +272,17 @@ class AutonomousTuningProtocol:
         best_epoch: int,
         custom_trainer_fn: Callable[[TrainSpec, int], Any] | None = None,
         fast_dev_mode: bool = False,
+        is_cancelled_func: Callable[[], bool] | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[str, AdapterManifest, Path]:
         """Trains final candidate model from base on all historical data prior to locked test set.
 
         Returns:
             Tuple of (candidate_id, manifest, saved_adapter_path).
         """
+        if is_cancelled_func is not None and is_cancelled_func():
+            raise InterruptedError("Final candidate training cancelled by user request.")
+
         logger.info(
             "Training final candidate from base weights on all data prior to test_start (%d) with epochs=%d...",
             self.split_plan.test_start,
@@ -307,7 +312,12 @@ class AutonomousTuningProtocol:
             fold_id="final_pre_test",
             explicit_train_range=(0, train_ceiling),
             fixed_epochs=True,
+            is_cancelled_func=is_cancelled_func,
+            progress_callback=progress_callback,
         )
+
+        if is_cancelled_func is not None and is_cancelled_func():
+            raise InterruptedError("Final candidate training cancelled by user request.")
 
         manifest = train_res.manifest
         manifest.adapter_id = cand_id
@@ -327,8 +337,12 @@ class AutonomousTuningProtocol:
         candidate_adapter_path: Path,
         base_reference_report: ScoreReport,
         custom_test_eval_fn: Any = None,
+        is_cancelled_func: Callable[[], bool] | None = None,
     ) -> tuple[Any, GatekeeperDecision]:
         """Executes strict single evaluation on 90-day locked test set and triggers gatekeeper winner check."""
+        if is_cancelled_func is not None and is_cancelled_func():
+            raise InterruptedError("Locked verification cancelled by user request.")
+
         logger.info(
             "Executing single locked verification on 90-day test set [%d, %d) for candidate '%s'...",
             self.split_plan.test_start,
@@ -340,26 +354,53 @@ class AutonomousTuningProtocol:
 
         base_model = TimesFM3Torch.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
 
-        if custom_test_eval_fn is not None:
-            locked_report = custom_test_eval_fn(self.snapshot, candidate_manifest)
-        else:
-            locked_report = run_locked_verification(
-                snapshot=self.snapshot,
+        try:
+            if custom_test_eval_fn is not None:
+                locked_report = custom_test_eval_fn(self.snapshot, candidate_manifest)
+            else:
+                locked_report = run_locked_verification(
+                    snapshot=self.snapshot,
+                    candidate_manifest=candidate_manifest,
+                    candidate_adapter_path=candidate_adapter_path,
+                    store=self.store,
+                    batch_size=16,
+                    storage=self.job_storage,
+                    is_cancelled_func=is_cancelled_func,
+                )
+
+            if is_cancelled_func is not None and is_cancelled_func():
+                raise InterruptedError("Locked verification cancelled by user request.")
+
+            decision = self.gatekeeper.evaluate_candidate(
                 candidate_manifest=candidate_manifest,
-                candidate_adapter_path=candidate_adapter_path,
-                store=self.store,
-                batch_size=16,
-                storage=self.job_storage,
+                locked_report=locked_report,
+                base_model=base_model,
+                perform_backup=True,
             )
 
-        decision = self.gatekeeper.evaluate_candidate(
-            candidate_manifest=candidate_manifest,
-            locked_report=locked_report,
-            base_model=base_model,
-            perform_backup=True,
-        )
+            # Update locked_verification_ledger audit verdict to terminal outcome
+            if self.job_storage is not None:
+                reasons_str = "; ".join(decision.reasons) if decision.reasons else "All criteria passed."
+                self.job_storage.update_locked_consumption_verdict(
+                    timeframe=self.timeframe,
+                    candidate_id=candidate_manifest.adapter_id,
+                    verdict=decision.verdict,
+                    details=f"Gatekeeper verdict: {decision.verdict}. Reasons: {reasons_str}",
+                )
 
-        return locked_report, decision
+            return locked_report, decision
+        except Exception as exc:
+            if self.job_storage is not None:
+                try:
+                    self.job_storage.update_locked_consumption_verdict(
+                        timeframe=self.timeframe,
+                        candidate_id=candidate_manifest.adapter_id,
+                        verdict="FAILED",
+                        details=f"Verification failed: {exc}",
+                    )
+                except Exception:
+                    pass
+            raise
 
     def get_or_compute_base_report(
         self,
@@ -472,6 +513,8 @@ class AutonomousTuningProtocol:
                 min_delta=optimizer.min_delta,
                 startup_trials=optimizer.startup_trials,
             )
+            early_stop_cb.sync_from_study(study)
+            completed_trials = len([t for t in study.trials if t.state == TrialState.COMPLETE])
 
             def eval_trial(spec: TrainSpec, trial: optuna.Trial) -> float:
                 if is_cancelled_func is not None and is_cancelled_func():
@@ -507,13 +550,17 @@ class AutonomousTuningProtocol:
                 trial.set_user_attr("score_v1", score)
                 return score
 
-            # Execute exactly 1 trial in this bounded step
-            study.optimize(objective, n_trials=1, callbacks=[early_stop_cb])
-            completed_trials = len([t for t in study.trials if t.state == TrialState.COMPLETE])
-            logger.info("Completed trial step for %s: %d completed trials so far.", self.timeframe, completed_trials)
+            # If stagnation reached or limit already met, advance immediately without executing extra trial
+            if early_stop_cb.stopped_early or completed_trials >= limit_trials:
+                is_finished = True
+            else:
+                # Execute exactly 1 trial in this bounded step
+                study.optimize(objective, n_trials=1, callbacks=[early_stop_cb])
+                completed_trials = len([t for t in study.trials if t.state == TrialState.COMPLETE])
+                logger.info("Completed trial step for %s: %d completed trials so far.", self.timeframe, completed_trials)
+                is_finished = (completed_trials >= limit_trials) or early_stop_cb.stopped_early
 
             # Check if search is complete
-            is_finished = (completed_trials >= limit_trials) or early_stop_cb.stopped_early
             if is_finished and len(study.trials) > 0:
                 best_t = study.best_trial
                 best_spec = suggest_trial_spec(best_t, timeframe=self.timeframe, seed=42)
@@ -577,6 +624,8 @@ class AutonomousTuningProtocol:
         elif phase == "FINAL_FIT":
             logger.info("Executing step: FINAL_FIT for %s", self.timeframe)
             self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.VALIDATING)
+            if is_cancelled_func is not None and is_cancelled_func():
+                raise InterruptedError(f"Step execution in phase '{phase}' cancelled by user request.")
             best_spec_dict = json.loads(state.get("best_spec_json") or "{}")
             best_spec = TrainSpec.from_dict(best_spec_dict)
             best_epoch = int(state.get("best_epoch") or 2)
@@ -588,7 +637,12 @@ class AutonomousTuningProtocol:
                 candidate_spec=best_spec,
                 best_epoch=best_epoch,
                 fast_dev_mode=fast_dev_mode,
+                is_cancelled_func=is_cancelled_func,
+                progress_callback=progress_callback,
             )
+
+            if is_cancelled_func is not None and is_cancelled_func():
+                raise InterruptedError(f"Step execution in phase '{phase}' cancelled by user request.")
 
             self.job_storage.save_auto_tune_run(
                 timeframe=self.timeframe,
@@ -605,6 +659,8 @@ class AutonomousTuningProtocol:
         elif phase == "LOCKED_VERIFICATION":
             logger.info("Executing step: LOCKED_VERIFICATION for %s", self.timeframe)
             self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.VALIDATING)
+            if is_cancelled_func is not None and is_cancelled_func():
+                raise InterruptedError(f"Step execution in phase '{phase}' cancelled by user request.")
             base_report = self.get_or_compute_base_report(is_cancelled_func=is_cancelled_func, progress_callback=progress_callback)
             cand_id = state.get("final_candidate_id")
             cand_path = Path(state.get("final_candidate_path") or "")
@@ -617,7 +673,11 @@ class AutonomousTuningProtocol:
                 candidate_manifest=cand_manifest,
                 candidate_adapter_path=cand_path,
                 base_reference_report=base_report,
+                is_cancelled_func=is_cancelled_func,
             )
+
+            if is_cancelled_func is not None and is_cancelled_func():
+                raise InterruptedError(f"Step execution in phase '{phase}' cancelled by user request.")
 
             # Complete cycle -> transition to WAITING_DATA
             self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.WAITING_DATA)

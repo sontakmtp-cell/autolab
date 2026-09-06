@@ -75,15 +75,21 @@ class GPUJobStorage:
                 );
 
                 CREATE TABLE IF NOT EXISTS locked_verification_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timeframe TEXT NOT NULL,
                     test_start_idx INTEGER NOT NULL,
                     test_end_idx INTEGER NOT NULL,
+                    test_start_time_ms INTEGER NOT NULL DEFAULT 0,
+                    test_end_time_ms INTEGER NOT NULL DEFAULT 0,
                     snapshot_hash TEXT NOT NULL,
                     candidate_id TEXT NOT NULL,
                     consumed_at REAL NOT NULL,
                     verdict TEXT NOT NULL,
-                    PRIMARY KEY (timeframe, test_start_idx, test_end_idx, snapshot_hash)
+                    details TEXT NOT NULL DEFAULT ''
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_locked_ledger_tf_time
+                ON locked_verification_ledger (timeframe, test_start_time_ms, test_end_time_ms);
 
                 CREATE TABLE IF NOT EXISTS auto_tune_runs (
                     timeframe TEXT PRIMARY KEY,
@@ -104,6 +110,22 @@ class GPUJobStorage:
                     updated_at REAL NOT NULL
                 );
             """)
+
+            # Safe migration for existing locked_verification_ledger tables
+            try:
+                cur = conn.execute("PRAGMA table_info(locked_verification_ledger);")
+                cols = [r["name"] for r in cur.fetchall()]
+                if "test_start_time_ms" not in cols:
+                    conn.execute("ALTER TABLE locked_verification_ledger ADD COLUMN test_start_time_ms INTEGER NOT NULL DEFAULT 0;")
+                if "test_end_time_ms" not in cols:
+                    conn.execute("ALTER TABLE locked_verification_ledger ADD COLUMN test_end_time_ms INTEGER NOT NULL DEFAULT 0;")
+                if "details" not in cols:
+                    conn.execute("ALTER TABLE locked_verification_ledger ADD COLUMN details TEXT NOT NULL DEFAULT '';")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_locked_ledger_tf_time ON locked_verification_ledger (timeframe, test_start_time_ms, test_end_time_ms);"
+                )
+            except Exception:
+                pass
 
     def submit_job(self, job_spec: JobSpec, reject_if_stopped: bool = False) -> str:
         """Submits a job to the queue, enforcing atomic idempotency deduplication on active jobs."""
@@ -688,20 +710,41 @@ class GPUJobStorage:
     def is_locked_range_consumed(
         self,
         timeframe: str,
-        test_start_idx: int,
-        test_end_idx: int,
-        snapshot_hash: str,
+        test_start_time_ms: int,
+        test_end_time_ms: int,
+        snapshot_hash: str | None = None,
+        test_start_idx: int | None = None,
+        test_end_idx: int | None = None,
     ) -> bool:
-        """Checks if a locked verification test range has already been consumed."""
+        """Checks if a candidate's locked verification interval [test_start_time_ms, test_end_time_ms)
+        overlaps with ANY previously consumed interval for the given timeframe.
+        """
         with self.get_connection() as conn:
-            cur = conn.execute(
-                """
-                SELECT 1 FROM locked_verification_ledger
-                WHERE timeframe = ? AND test_start_idx = ? AND test_end_idx = ? AND snapshot_hash = ?;
-                """,
-                (timeframe, test_start_idx, test_end_idx, snapshot_hash),
-            )
-            return cur.fetchone() is not None
+            if test_start_time_ms > 0 and test_end_time_ms > 0:
+                cur = conn.execute(
+                    """
+                    SELECT 1 FROM locked_verification_ledger
+                    WHERE timeframe = ?
+                      AND test_start_time_ms < ?
+                      AND test_end_time_ms > ?;
+                    """,
+                    (timeframe, test_end_time_ms, test_start_time_ms),
+                )
+                if cur.fetchone() is not None:
+                    return True
+
+            # Fallback check on snapshot_hash + indices if timestamps were 0 or not provided
+            if snapshot_hash and test_start_idx is not None and test_end_idx is not None:
+                cur = conn.execute(
+                    """
+                    SELECT 1 FROM locked_verification_ledger
+                    WHERE timeframe = ? AND test_start_idx = ? AND test_end_idx = ? AND snapshot_hash = ?;
+                    """,
+                    (timeframe, test_start_idx, test_end_idx, snapshot_hash),
+                )
+                return cur.fetchone() is not None
+
+            return False
 
     def record_locked_consumption(
         self,
@@ -710,7 +753,10 @@ class GPUJobStorage:
         test_end_idx: int,
         snapshot_hash: str,
         candidate_id: str,
-        verdict: str = "PENDING",
+        test_start_time_ms: int = 0,
+        test_end_time_ms: int = 0,
+        verdict: str = "IN_PROGRESS",
+        details: str = "",
     ) -> None:
         """Atomically records consumption of a locked verification test range into the audit ledger."""
         now = time.time()
@@ -719,12 +765,42 @@ class GPUJobStorage:
             conn.execute(
                 """
                 INSERT INTO locked_verification_ledger (
-                    timeframe, test_start_idx, test_end_idx, snapshot_hash, candidate_id, consumed_at, verdict
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(timeframe, test_start_idx, test_end_idx, snapshot_hash)
-                DO UPDATE SET candidate_id = excluded.candidate_id, consumed_at = excluded.consumed_at, verdict = excluded.verdict;
+                    timeframe, test_start_idx, test_end_idx, test_start_time_ms, test_end_time_ms,
+                    snapshot_hash, candidate_id, consumed_at, verdict, details
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
-                (timeframe, test_start_idx, test_end_idx, snapshot_hash, candidate_id, now, verdict),
+                (
+                    timeframe,
+                    test_start_idx,
+                    test_end_idx,
+                    test_start_time_ms,
+                    test_end_time_ms,
+                    snapshot_hash,
+                    candidate_id,
+                    now,
+                    verdict,
+                    details,
+                ),
+            )
+            conn.commit()
+
+    def update_locked_consumption_verdict(
+        self,
+        timeframe: str,
+        candidate_id: str,
+        verdict: str,
+        details: str = "",
+    ) -> None:
+        """Updates the audit verdict and details for an evaluated candidate in locked_verification_ledger."""
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(
+                """
+                UPDATE locked_verification_ledger
+                SET verdict = ?, details = ?
+                WHERE timeframe = ? AND candidate_id = ?;
+                """,
+                (verdict, details, timeframe, candidate_id),
             )
             conn.commit()
 

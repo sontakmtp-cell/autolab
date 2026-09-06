@@ -1613,5 +1613,360 @@ def test_fixed_epochs_final_retrain(temp_dir: Path, mock_snapshot: DatasetSnapsh
     assert t_range["train_end_idx"] == 1000
 
 
+# ---------------------------------------------------------------------------
+# Comment 5559161816 Regression & Audit Tests
+# ---------------------------------------------------------------------------
+
+
+def test_statistical_lock_timestamp_overlap_rejection_across_shifted_snapshots(temp_dir: Path):
+    """Comment 5559161816 Item 1: Verifies that candidates evaluated on shifted snapshots
+    are rejected if their real timestamp locked intervals overlap, even if snapshot hash and local indices differ."""
+    from unittest.mock import patch
+    from paxg_lab.tune.locked_eval import run_locked_verification
+
+    db_path = temp_dir / "timestamp_lock.db"
+    storage = GPUJobStorage(db_path)
+    store = AdapterStore(temp_dir / "adapters")
+
+    # Snapshot 1: 3000 candles starting at T0
+    n_candles = 3000
+    t0 = 1700000000000
+    step_ms = 3600000
+    ts1 = np.arange(t0, t0 + n_candles * step_ms, step_ms, dtype=np.int64)
+    features1 = 2000.0 + np.ones((n_candles, 1))
+
+    snap1 = DatasetSnapshot(
+        metadata=SnapshotMetadata(
+            snapshot_id="snap1", timeframe="1h", symbol="PAXGUSDT",
+            start_time=int(ts1[0]), end_time=int(ts1[-1]), total_candles=n_candles,
+            feature_sets=["A", "B"], created_at="2026-09-01T00:00:00Z", sha256="hash_snap_1",
+        ),
+        timestamps=ts1, features_a=features1, features_b=np.column_stack([features1, np.ones((n_candles, 8))]),
+    )
+
+    # Snapshot 2: Shifted by 168 candles (7 days forward)
+    shift = 168
+    ts2 = ts1 + shift * step_ms
+    features2 = 2000.0 + np.ones((n_candles, 1))
+    snap2 = DatasetSnapshot(
+        metadata=SnapshotMetadata(
+            snapshot_id="snap2", timeframe="1h", symbol="PAXGUSDT",
+            start_time=int(ts2[0]), end_time=int(ts2[-1]), total_candles=n_candles,
+            feature_sets=["A", "B"], created_at="2026-09-08T00:00:00Z", sha256="hash_snap_2_different",
+        ),
+        timestamps=ts2, features_a=features2, features_b=np.column_stack([features2, np.ones((n_candles, 8))]),
+    )
+
+    cand1_dir = temp_dir / "cand_snap1"
+    cand1_dir.mkdir(parents=True, exist_ok=True)
+    cand1 = AdapterManifest(adapter_id="cand_snap1", timeframe="1h", horizon=24, context_len=256, feature_set="B", feature_columns=["close"])
+    cand1.save_json(cand1_dir / "paxg_manifest.json")
+
+    cand2_dir = temp_dir / "cand_snap2"
+    cand2_dir.mkdir(parents=True, exist_ok=True)
+    cand2 = AdapterManifest(adapter_id="cand_snap2", timeframe="1h", horizon=24, context_len=256, feature_set="B", feature_columns=["close"])
+    cand2.save_json(cand2_dir / "paxg_manifest.json")
+
+    dummy_preds = np.ones((600, 24)) * 2000.0
+    dummy_quantiles = np.ones((600, 24, 9)) * 2000.0
+
+    with patch("paxg_lab.eval.predictor.TimesFM3Predictor.load_adapter"), \
+         patch("paxg_lab.tune.locked_eval.TimesFM3Predictor.predict", return_value=(dummy_preds, dummy_quantiles)), \
+         patch("paxg_lab.tune.locked_eval.extract_windows", return_value=(np.zeros((600, 256, 1)), np.zeros((600, 24)), list(range(600)))):
+
+        # Candidate 1 consumes snap1 locked range
+        report1 = run_locked_verification(
+            snapshot=snap1,
+            candidate_manifest=cand1,
+            candidate_adapter_path=cand1_dir,
+            store=store,
+            storage=storage,
+        )
+        assert report1.candidate_id == "cand_snap1"
+
+        # Candidate 2 on snap2 has an overlapping time range with snap1, despite differing snapshot hash and indices
+        with pytest.raises(RuntimeError, match="Statistical lock violation.*overlaps previously consumed"):
+            run_locked_verification(
+                snapshot=snap2,
+                candidate_manifest=cand2,
+                candidate_adapter_path=cand2_dir,
+                store=store,
+                storage=storage,
+            )
+
+
+def test_optuna_stagnation_early_stop_across_bounded_auto_steps(temp_dir: Path):
+    """Comment 5559161816 Item 2: Verifies that Optuna stagnation state is reconstructed
+    from study history so running 1 trial per step accumulates consecutive stagnant trials to 12."""
+    study = optuna.create_study(direction="maximize")
+    cb = EarlyStoppingStagnationCallback(patience=12, min_delta=0.5, startup_trials=10)
+
+    # Add 10 startup trials: best score reaches 49.0
+    for i in range(10):
+        t = study.ask()
+        study.tell(t, 40.0 + i)
+
+    cb.sync_from_study(study)
+    assert cb.best_score == 49.0
+    assert cb.stagnant_trials == 0
+    assert not cb.stopped_early
+
+    # Add 11 stagnant trials (score 49.2, < 49.0 + 0.5) across separate bounded steps
+    for i in range(11):
+        cb.sync_from_study(study)
+        assert cb.stagnant_trials == i
+        t = study.ask()
+        study.tell(t, 49.2)
+
+    # Trial 12 (overall trial 22, 12th post-exploration trial)
+    cb.sync_from_study(study)
+    assert cb.stagnant_trials == 11
+    t = study.ask()
+    study.tell(t, 49.1)
+    cb.sync_from_study(study)
+    assert cb.stagnant_trials == 12
+    assert cb.stopped_early is True
+
+
+def test_cancellation_during_final_fit_and_locked_verification(temp_dir: Path, mock_snapshot: DatasetSnapshot):
+    """Comment 5559161816 Item 3: Verifies that cancellation during FINAL_FIT and LOCKED_VERIFICATION
+    halts execution immediately without advancing persisted phase or promoting an adapter."""
+    from unittest.mock import patch
+
+    db_path = temp_dir / "cancel_test.db"
+    storage = GPUJobStorage(db_path)
+    store = AdapterStore(temp_dir / "adapters")
+
+    protocol = AutonomousTuningProtocol(
+        timeframe="1h",
+        snapshot=mock_snapshot,
+        db_path=db_path,
+        adapter_store_dir=temp_dir / "adapters",
+    )
+
+    best_spec = TrainSpec(timeframe="1h", horizon=24, context_len=128, feature_set="A", lora_r=8)
+    storage.save_auto_tune_run(
+        timeframe="1h",
+        snapshot_path=str(temp_dir),
+        snapshot_hash=mock_snapshot.metadata.sha256,
+        phase="FINAL_FIT",
+        best_spec_json=json.dumps(best_spec.to_dict()),
+        best_epoch=2,
+    )
+
+    # Cancel during FINAL_FIT
+    with pytest.raises(InterruptedError, match="cancelled by user request"):
+        protocol.execute_step(is_cancelled_func=lambda: True)
+
+    # State must NOT advance to LOCKED_VERIFICATION
+    st = storage.get_auto_tune_run("1h")
+    assert st["phase"] == "FINAL_FIT"
+    assert st.get("final_candidate_id") is None
+
+    # Advance state to LOCKED_VERIFICATION manually to test cancellation during verification
+    cand_dir = temp_dir / "cand_mock"
+    cand_dir.mkdir(parents=True, exist_ok=True)
+    cand_manifest = AdapterManifest(adapter_id="cand_mock", timeframe="1h", horizon=24, context_len=128, feature_set="A", feature_columns=["close"])
+    cand_manifest.save_json(cand_dir / "paxg_manifest.json")
+
+    storage.save_auto_tune_run(
+        timeframe="1h",
+        snapshot_path=str(temp_dir),
+        snapshot_hash=mock_snapshot.metadata.sha256,
+        phase="LOCKED_VERIFICATION",
+        final_candidate_id="cand_mock",
+        final_candidate_path=str(cand_dir),
+    )
+
+    # Cancel during LOCKED_VERIFICATION
+    with patch("paxg_lab.tune.protocol.run_locked_verification", side_effect=InterruptedError("Inference cancelled")), \
+         pytest.raises(InterruptedError):
+        protocol.execute_step(is_cancelled_func=lambda: True)
+
+    # State must NOT advance to WAITING_DATA and store recommended must remain None
+    st2 = storage.get_auto_tune_run("1h")
+    assert st2["phase"] == "LOCKED_VERIFICATION"
+    assert store.get_recommended("1h") is None
+
+
+def test_auto_job_failure_and_timeout_transitions_to_paused_error(temp_dir: Path):
+    """Comment 5559161816 Item 4: Verifies that timed out, hung, or failed AUTO_TRIAL jobs
+    transition AutoRunState to PAUSED_ERROR instead of silently stalling."""
+    from unittest.mock import MagicMock, patch
+    from paxg_lab.queue.scheduler import GPUScheduler
+    from paxg_lab.queue.types import AutoRunState, JobPriority, JobSpec, JobStatus, JobType
+
+    db_path = temp_dir / "scheduler_fail.db"
+    storage = GPUJobStorage(db_path)
+    storage.set_auto_run_state("1h", AutoRunState.SEARCHING)
+
+    scheduler = GPUScheduler(db_path=db_path, acquire_coordinator_lock=False)
+
+    # Case 1: Active worker exited with non-zero code or failed status
+    job1 = JobSpec(
+        job_id="auto_step_fail",
+        job_type=JobType.AUTO_TRIAL.value,
+        timeframe="1h",
+        priority=JobPriority.AUTO.value,
+        payload={"timeframe": "1h"},
+        status=JobStatus.FAILED.value,
+        error_message="Runtime training error",
+    )
+    storage.submit_job(job1)
+    storage.mark_failed("auto_step_fail", "Runtime training error")
+
+    scheduler.active_job_id = "auto_step_fail"
+    scheduler.active_worker = MagicMock()
+    scheduler.active_worker.poll.return_value = 1  # exited
+
+    scheduler.tick()
+    assert storage.get_auto_run_state("1h") == AutoRunState.PAUSED_ERROR
+
+    # Reset for Case 2: Heartbeat timeout
+    storage.set_auto_run_state("1h", AutoRunState.SEARCHING)
+    job2 = JobSpec(
+        job_id="auto_step_hung",
+        job_type=JobType.AUTO_TRIAL.value,
+        timeframe="1h",
+        priority=JobPriority.AUTO.value,
+        payload={"timeframe": "1h"},
+        status=JobStatus.RUNNING.value,
+        heartbeat_at=time.time() - 100.0,
+    )
+    storage.submit_job(job2)
+    scheduler.active_job_id = "auto_step_hung"
+    scheduler.active_worker = MagicMock()
+    scheduler.active_worker.poll.return_value = None  # running
+    scheduler.active_worker_pid = 999999
+
+    with patch("paxg_lab.queue.scheduler.safe_terminate_process", return_value=True), \
+         patch("paxg_lab.queue.scheduler.is_process_alive", return_value=False):
+        scheduler.tick()
+
+    assert storage.get_auto_run_state("1h") == AutoRunState.PAUSED_ERROR
+
+    # Reset for Case 3: Execution timeout (1200s)
+    storage.set_auto_run_state("1h", AutoRunState.SEARCHING)
+    job3 = JobSpec(
+        job_id="auto_step_timeout",
+        job_type=JobType.AUTO_TRIAL.value,
+        timeframe="1h",
+        priority=JobPriority.AUTO.value,
+        payload={"timeframe": "1h"},
+        status=JobStatus.RUNNING.value,
+        started_at=time.time() - 1500.0,
+        timeout_seconds=1200.0,
+    )
+    storage.submit_job(job3)
+    scheduler.active_job_id = "auto_step_timeout"
+    scheduler.active_worker = MagicMock()
+    scheduler.active_worker.poll.return_value = None
+    scheduler.active_worker_pid = 999999
+
+    with patch("paxg_lab.queue.scheduler.safe_terminate_process", return_value=True), \
+         patch("paxg_lab.queue.scheduler.is_process_alive", return_value=False):
+        scheduler.tick()
+
+    assert storage.get_auto_run_state("1h") == AutoRunState.PAUSED_ERROR
+
+
+def test_fail_closed_incumbent_recommended_adapter(temp_dir: Path, mock_snapshot: DatasetSnapshot):
+    """Comment 5559161816 Item 5: Verifies that if current_rec_id exists in store,
+    any extraction or inference failure fails closed (raises RuntimeError) without falling back to Base."""
+    from unittest.mock import patch
+    from paxg_lab.tune.locked_eval import run_locked_verification
+
+    store = AdapterStore(temp_dir / "adapters")
+    rec_id = "corrupt_rec_adapter"
+    rec_dir = store.get_adapter_path(rec_id)
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    # Write invalid / corrupt manifest
+    (rec_dir / "paxg_manifest.json").write_text("invalid json", encoding="utf-8")
+    store.set_recommended("1h", rec_id)
+
+    cand_dir = temp_dir / "cand"
+    cand_dir.mkdir(parents=True, exist_ok=True)
+    cand_manifest = AdapterManifest(
+        adapter_id="cand", timeframe="1h", horizon=24, context_len=256, feature_set="B", feature_columns=["close"]
+    )
+    cand_manifest.save_json(cand_dir / "paxg_manifest.json")
+
+    # Candidate adapter loads fine, but processing the corrupt incumbent must fail closed
+    with patch("paxg_lab.eval.predictor.TimesFM3Predictor.load_adapter"), \
+         pytest.raises(RuntimeError, match="Fail-closed.*corrupt_rec_adapter"):
+        run_locked_verification(
+            snapshot=mock_snapshot,
+            candidate_manifest=cand_manifest,
+            candidate_adapter_path=cand_dir,
+            store=store,
+        )
+
+
+def test_locked_verification_ledger_terminal_verdicts(temp_dir: Path):
+    """Comment 5559161816 Item 6: Verifies that locked_verification_ledger verdict is updated
+    from IN_PROGRESS to terminal verdicts (ACCEPTED_NEW_RECOMMENDED, REJECTED_PRESERVE_CURRENT, FAILED)."""
+    db_path = temp_dir / "ledger_audit.db"
+    storage = GPUJobStorage(db_path)
+
+    # 1. Initial consumption marked as IN_PROGRESS
+    storage.record_locked_consumption(
+        timeframe="1h",
+        test_start_idx=100,
+        test_end_idx=200,
+        test_start_time_ms=1000,
+        test_end_time_ms=2000,
+        snapshot_hash="h1",
+        candidate_id="cand_A",
+        verdict="IN_PROGRESS",
+    )
+
+    with storage.get_connection() as conn:
+        cur = conn.execute("SELECT verdict, details FROM locked_verification_ledger WHERE candidate_id = 'cand_A';")
+        row = cur.fetchone()
+        assert row["verdict"] == "IN_PROGRESS"
+
+    # 2. Update to ACCEPTED_NEW_RECOMMENDED
+    storage.update_locked_consumption_verdict("1h", "cand_A", "ACCEPTED_NEW_RECOMMENDED", details="Gatekeeper passed")
+    with storage.get_connection() as conn:
+        cur = conn.execute("SELECT verdict, details FROM locked_verification_ledger WHERE candidate_id = 'cand_A';")
+        row = cur.fetchone()
+        assert row["verdict"] == "ACCEPTED_NEW_RECOMMENDED"
+        assert "Gatekeeper passed" in row["details"]
+
+    # 3. Candidate B updated to REJECTED_PRESERVE_CURRENT
+    storage.record_locked_consumption(
+        timeframe="1h",
+        test_start_idx=300,
+        test_end_idx=400,
+        test_start_time_ms=3000,
+        test_end_time_ms=4000,
+        snapshot_hash="h2",
+        candidate_id="cand_B",
+        verdict="IN_PROGRESS",
+    )
+    storage.update_locked_consumption_verdict("1h", "cand_B", "REJECTED_PRESERVE_CURRENT", details="Bootstrap CI not positive")
+    with storage.get_connection() as conn:
+        cur = conn.execute("SELECT verdict, details FROM locked_verification_ledger WHERE candidate_id = 'cand_B';")
+        row = cur.fetchone()
+        assert row["verdict"] == "REJECTED_PRESERVE_CURRENT"
+
+    # 4. Candidate C failed
+    storage.record_locked_consumption(
+        timeframe="1h",
+        test_start_idx=500,
+        test_end_idx=600,
+        test_start_time_ms=5000,
+        test_end_time_ms=6000,
+        snapshot_hash="h3",
+        candidate_id="cand_C",
+        verdict="IN_PROGRESS",
+    )
+    storage.update_locked_consumption_verdict("1h", "cand_C", "FAILED", details="Out of memory")
+    with storage.get_connection() as conn:
+        cur = conn.execute("SELECT verdict, details FROM locked_verification_ledger WHERE candidate_id = 'cand_C';")
+        row = cur.fetchone()
+        assert row["verdict"] == "FAILED"
+
+
 
 

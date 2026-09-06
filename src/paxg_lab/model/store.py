@@ -593,6 +593,10 @@ class AdapterStore:
         """
         if self.db_path is None:
             return
+        # Auto-detect parameter order if passed as (timeframe, adapter_id)
+        if adapter_id.lower().strip() in ("1h", "4h") and timeframe.lower().strip() not in ("1h", "4h"):
+            adapter_id, timeframe = timeframe, adapter_id
+
         tf = timeframe.lower().strip()
         now = time.time()
         with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:

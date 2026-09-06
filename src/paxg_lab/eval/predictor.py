@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -179,6 +179,7 @@ class TimesFM3Predictor:
         contexts: np.ndarray,
         horizon: int,
         batch_size: int = 16,
+        is_cancelled_func: Callable[[], bool] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Runs batched inference over multiple contexts to avoid OOM."""
         if len(contexts) == 0:
@@ -187,6 +188,8 @@ class TimesFM3Predictor:
         point_preds = []
         quantiles = []
         for i in range(0, len(contexts), batch_size):
+            if is_cancelled_func is not None and is_cancelled_func():
+                raise InterruptedError("Inference batch loop cancelled by user request.")
             batch = contexts[i : i + batch_size]
             p, q = self.predict_batch(batch, horizon=horizon)
             point_preds.append(p)
