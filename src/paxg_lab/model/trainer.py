@@ -44,6 +44,7 @@ class TrainingResult:
     train_spec: TrainSpec
     training_range: dict[str, Any]
     total_training_time_sec: float
+    total_steps: int = 0
 
 
 class LoRATrainer:
@@ -226,6 +227,9 @@ class LoRATrainer:
         snapshot_hash: str = "",
         fold_id: int = 1,
         adapter_id: str | None = None,
+        progress_callback: Any | None = None,
+        checkpoint_manager: Any | None = None,
+        job_id: str | None = None,
     ) -> TrainingResult:
         """Runs the complete training loop, early stopping, and best checkpoint restoration."""
         start_wall_time = time.time()
@@ -289,12 +293,97 @@ class LoRATrainer:
         history: list[dict[str, Any]] = []
         global_step = 0
         final_train_loss = 0.0
-
+        start_epoch = 1
+        start_minibatch_idx = 0
+        saved_epoch_indices: np.ndarray | None = None
         rng = np.random.default_rng(self.spec.seed)
+
+        # Check for pre-existing durable checkpoint to reconcile / resume
+        if checkpoint_manager is not None and job_id is not None:
+            existing_ckpt = checkpoint_manager.load_checkpoint(job_id)
+            if existing_ckpt is not None:
+                from paxg_lab.queue.checkpoint import TrainingCheckpointManager
+
+                # 1. Fail closed: strictly validate provenance and compatibility
+                TrainingCheckpointManager.validate_compatibility(
+                    checkpoint=existing_ckpt,
+                    current_spec=self.spec,
+                    current_snapshot_hash=snapshot_hash,
+                    base_model_repo=MODEL_REPO,
+                    base_model_revision=MODEL_REVISION,
+                )
+
+                logger.info(
+                    "Reconciling compatible checkpoint for job '%s': epoch=%d, minibatch_idx=%d, step=%d, best_val_loss=%.6f",
+                    job_id,
+                    existing_ckpt.epoch,
+                    existing_ckpt.minibatch_idx,
+                    existing_ckpt.global_step,
+                    existing_ckpt.best_val_loss,
+                )
+                try:
+                    from safetensors.torch import load_file
+                    saved_weights = load_file(str(existing_ckpt.weights_path))
+                except Exception:
+                    try:
+                        saved_weights = torch.load(str(existing_ckpt.weights_path), map_location=self.device, weights_only=True)
+                    except TypeError:
+                        saved_weights = torch.load(str(existing_ckpt.weights_path), map_location=self.device)
+
+                peft_model.load_state_dict(saved_weights, strict=False)
+
+                # 2. Determine exact continuation boundary without skipping unfinished work
+                if existing_ckpt.minibatch_idx < 0 or existing_ckpt.minibatch_idx >= minibatches_per_epoch - 1:
+                    # Previous epoch was fully completed
+                    start_epoch = existing_ckpt.epoch + 1
+                    start_minibatch_idx = 0
+                else:
+                    # Stopped mid-epoch: resume right from next minibatch in the SAME epoch
+                    start_epoch = existing_ckpt.epoch
+                    start_minibatch_idx = existing_ckpt.minibatch_idx + 1
+
+                global_step = existing_ckpt.global_step
+                best_val_loss = existing_ckpt.best_val_loss
+                best_epoch = existing_ckpt.epoch
+                best_lora_state = {
+                    k: v.cpu().clone()
+                    for k, v in peft_model.state_dict().items()
+                    if "lora" in k.lower()
+                }
+
+                # 3. Restore optimizer, scheduler, and RNG state if trainer_state.pt is present
+                if existing_ckpt.trainer_state_path and existing_ckpt.trainer_state_path.exists():
+                    try:
+                        try:
+                            t_state = torch.load(
+                                str(existing_ckpt.trainer_state_path),
+                                map_location=self.device,
+                                weights_only=False,
+                            )
+                        except TypeError:
+                            t_state = torch.load(
+                                str(existing_ckpt.trainer_state_path),
+                                map_location=self.device,
+                            )
+                        if "optimizer" in t_state:
+                            optimizer.load_state_dict(t_state["optimizer"])
+                        if "scheduler" in t_state:
+                            scheduler.load_state_dict(t_state["scheduler"])
+                        if "torch_rng" in t_state:
+                            torch.set_rng_state(t_state["torch_rng"])
+                        if "torch_cuda_rng" in t_state and t_state["torch_cuda_rng"] is not None and torch.cuda.is_available():
+                            torch.cuda.set_rng_state_all(t_state["torch_cuda_rng"])
+                        if "np_rng" in t_state:
+                            rng.bit_generator.state = t_state["np_rng"]
+                        if "epoch_indices" in t_state and t_state["epoch_indices"] is not None:
+                            saved_epoch_indices = np.asarray(t_state["epoch_indices"])
+                        logger.info("Restored optimizer, scheduler, RNG, and epoch_indices from durable checkpoint.")
+                    except Exception as state_err:
+                        logger.warning("Failed to restore trainer_state.pt: %s", state_err)
 
         logger.info(
             "Starting LoRA training: max_epochs=%d, batch_size=%d, grad_accum=%d (effective=%d), "
-            "minibatches_per_epoch=%d, total_optimizer_steps=%d, warmup_optimizer_steps=%d",
+            "minibatches_per_epoch=%d, total_optimizer_steps=%d, warmup_optimizer_steps=%d, start_epoch=%d",
             self.spec.max_epochs,
             self.spec.batch_size,
             self.spec.gradient_accumulation_steps,
@@ -302,20 +391,32 @@ class LoRATrainer:
             minibatches_per_epoch,
             total_optimizer_steps,
             warmup_optimizer_steps,
+            start_epoch,
         )
 
-        for epoch in range(1, self.spec.max_epochs + 1):
+        stop_requested = False
+        for epoch in range(start_epoch, self.spec.max_epochs + 1):
             epoch_start = time.time()
             peft_model.train()
 
-            # Randomly shuffle and cap sliding windows for this epoch
-            epoch_indices = rng.permutation(num_train_samples)[:effective_samples]
+            # Randomly shuffle and cap sliding windows for this epoch (reuse preserved permutation if resuming mid-epoch)
+            if epoch == start_epoch and saved_epoch_indices is not None:
+                epoch_indices = saved_epoch_indices
+                saved_epoch_indices = None
+            else:
+                epoch_indices = rng.permutation(num_train_samples)[:effective_samples]
             epoch_loss_sum = 0.0
             epoch_loss_batches = 0
 
             optimizer.zero_grad()
 
-            for i in range(0, len(epoch_indices), self.spec.batch_size):
+            minibatch_start = start_minibatch_idx if epoch == start_epoch else 0
+            start_i = minibatch_start * self.spec.batch_size
+            last_processed_minibatch = minibatch_start - 1
+
+            for i in range(start_i, len(epoch_indices), self.spec.batch_size):
+                curr_minibatch = i // self.spec.batch_size
+                last_processed_minibatch = curr_minibatch
                 batch_idx = epoch_indices[i : i + self.spec.batch_size]
                 b_ctx_np = train_ctx[batch_idx]  # (B, context_len, num_features)
                 b_fut_np = train_fut[batch_idx]  # (B, horizon)
@@ -356,6 +457,79 @@ class LoRATrainer:
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
+
+                    # Fine-grained step-level stop check as mandated by PLAN 4.2
+                    if progress_callback is not None:
+                        step_record = {
+                            "epoch": epoch,
+                            "step": global_step,
+                            "type": "step_update",
+                            "loss": loss.item(),
+                        }
+                        try:
+                            should_cont = progress_callback(step_record)
+                            if should_cont is False:
+                                logger.info(
+                                    "Training stopped gracefully by progress_callback at step %d (epoch %d).",
+                                    global_step,
+                                    epoch,
+                                )
+                                stop_requested = True
+                                break
+                        except Exception as cb_err:
+                            logger.warning("progress_callback raised exception at step %d: %s", global_step, cb_err)
+                            stop_requested = True
+                            break
+
+            if stop_requested:
+                if best_lora_state is None:
+                    best_lora_state = {
+                        k: v.cpu().clone()
+                        for k, v in peft_model.state_dict().items()
+                        if "lora" in k.lower()
+                    }
+                if checkpoint_manager is not None and job_id is not None:
+                    try:
+                        f_spec = FEATURE_SPECS[self.spec.feature_set]
+                        ckpt_manifest = AdapterManifest(
+                            adapter_id=f"ckpt_{job_id}_{epoch}_{global_step}",
+                            timeframe=self.spec.timeframe,
+                            horizon=self.spec.horizon,
+                            context_len=self.spec.context_len,
+                            feature_set=self.spec.feature_set,
+                            feature_columns=list(f_spec.columns),
+                            base_model_repo=MODEL_REPO,
+                            base_model_revision=MODEL_REVISION,
+                            train_spec=self.spec.to_dict(),
+                            snapshot_hash=snapshot_hash,
+                            best_epoch=best_epoch,
+                            best_val_loss=best_val_loss,
+                        )
+                        trainer_state = {
+                            "optimizer": optimizer.state_dict(),
+                            "scheduler": scheduler.state_dict(),
+                            "torch_rng": torch.get_rng_state(),
+                            "torch_cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                            "np_rng": rng.bit_generator.state,
+                            "epoch": epoch,
+                            "minibatch_idx": last_processed_minibatch,
+                            "global_step": global_step,
+                            "epoch_indices": epoch_indices.tolist() if isinstance(epoch_indices, np.ndarray) else list(epoch_indices),
+                        }
+                        checkpoint_manager.save_checkpoint(
+                            job_id=job_id,
+                            peft_model=peft_model,
+                            manifest=ckpt_manifest,
+                            epoch=epoch,
+                            step=global_step,
+                            best_val_loss=best_val_loss,
+                            minibatch_idx=last_processed_minibatch,
+                            trainer_state=trainer_state,
+                            status="STOPPED",
+                        )
+                    except Exception as ckpt_err:
+                        logger.warning("Failed to save stopped checkpoint: %s", ckpt_err)
+                break
 
             avg_train_loss = epoch_loss_sum / max(1, epoch_loss_batches)
             final_train_loss = avg_train_loss
@@ -427,6 +601,70 @@ class LoRATrainer:
                 )
                 if patience_counter >= self.spec.early_stopping_patience:
                     logger.info("Early stopping triggered at epoch %d.", epoch)
+            if checkpoint_manager is not None and job_id is not None:
+                try:
+                    f_spec = FEATURE_SPECS[self.spec.feature_set]
+                    ckpt_manifest = AdapterManifest(
+                        adapter_id=f"ckpt_{job_id}_{epoch}_{global_step}",
+                        timeframe=self.spec.timeframe,
+                        horizon=self.spec.horizon,
+                        context_len=self.spec.context_len,
+                        feature_set=self.spec.feature_set,
+                        feature_columns=list(f_spec.columns),
+                        base_model_repo=MODEL_REPO,
+                        base_model_revision=MODEL_REVISION,
+                        train_spec=self.spec.to_dict(),
+                        snapshot_hash=snapshot_hash,
+                        best_epoch=best_epoch,
+                        best_val_loss=best_val_loss,
+                    )
+                    train_state_epoch = {
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                        "torch_rng": torch.get_rng_state(),
+                        "torch_cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                        "np_rng": rng.bit_generator.state,
+                        "epoch": epoch,
+                        "minibatch_idx": minibatches_per_epoch - 1,
+                        "global_step": global_step,
+                    }
+                    checkpoint_manager.save_checkpoint(
+                        job_id=job_id,
+                        peft_model=peft_model,
+                        manifest=ckpt_manifest,
+                        epoch=epoch,
+                        step=global_step,
+                        best_val_loss=best_val_loss,
+                        minibatch_idx=minibatches_per_epoch - 1,
+                        trainer_state=train_state_epoch,
+                        status="IN_PROGRESS",
+                    )
+                except Exception as ckpt_err:
+                    logger.warning("Failed to save epoch checkpoint: %s", ckpt_err)
+
+            if progress_callback is not None:
+                try:
+                    should_continue = progress_callback(epoch_record)
+                    if should_continue is False:
+                        logger.info("Training stopped gracefully by progress_callback after epoch %d.", epoch)
+                        if checkpoint_manager is not None and job_id is not None:
+                            try:
+                                checkpoint_manager.save_checkpoint(
+                                    job_id=job_id,
+                                    peft_model=peft_model,
+                                    manifest=ckpt_manifest,
+                                    epoch=epoch,
+                                    step=global_step,
+                                    best_val_loss=best_val_loss,
+                                    minibatch_idx=minibatches_per_epoch - 1,
+                                    trainer_state=train_state_epoch,
+                                    status="STOPPED",
+                                )
+                            except Exception as ckpt_err:
+                                logger.warning("Failed to save stopped checkpoint: %s", ckpt_err)
+                        break
+                except Exception as cb_exc:
+                    logger.warning("progress_callback raised exception: %s", cb_exc)
                     break
 
         # 6. Restore best checkpoint weights into model
@@ -499,4 +737,5 @@ class LoRATrainer:
             train_spec=self.spec,
             training_range=data_meta,
             total_training_time_sec=total_elapsed,
+            total_steps=global_step,
         )

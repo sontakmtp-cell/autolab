@@ -12,7 +12,7 @@ Tài liệu này theo dõi tiến độ thực hiện 8 giai đoạn (P0 đến 
 | **P1** | Kho dữ liệu Binance PAXGUSDT Futures, đặc trưng A/B/C và phân chia không rò rỉ | **HOÀN THÀNH** | [docs/paxg-lab/phases/P1.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P1.md) |
 | **P2** | Base TimesFM 3.0, dự đoán 24/6 bước, backtest và Score v1 | **HOÀN THÀNH** | [docs/paxg-lab/phases/P2.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P2.md) |
 | **P3** | Huấn luyện thủ công LoRA, checkpoint tốt nhất và kho adapter | **HOÀN THÀNH** | [docs/paxg-lab/phases/P3.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P3.md) |
-| **P4** | Hàng đợi GPU một tiến trình, dừng, heartbeat, phục hồi | Chưa bắt đầu | [docs/paxg-lab/phases/P4.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P4.md) |
+| **P4** | Hàng đợi GPU một tiến trình, dừng, heartbeat, phục hồi | **HOÀN THÀNH** | [docs/paxg-lab/phases/P4.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P4.md) |
 | **P5** | Giao diện Streamlit tiếng Việt đủ 5 thẻ, biểu đồ và điều khiển | Chưa bắt đầu | [docs/paxg-lab/phases/P5.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P5.md) |
 | **P6** | Tự động tối ưu Optuna TPE, kiểm chứng kín, công nhận LoRA thắng | Chưa bắt đầu | [docs/paxg-lab/phases/P6.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P6.md) |
 | **P7** | Chạy dài (>6h), kiểm tra rò rỉ, xử lý sự cố, bàn giao hoàn chỉnh | Chưa bắt đầu | [docs/paxg-lab/phases/P7.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P7.md) |
@@ -114,12 +114,41 @@ Tài liệu này theo dõi tiến độ thực hiện 8 giai đoạn (P0 đến 
 8. **Kiểm thử tự động:**
    - **98 tests collected: 98 passed trên workstation có GPU/cache dữ liệu (96 passed, 2 skipped trên runner CI sạch không có raw DB/snapshot cache)** (`pytest tests/paxg_lab/ src/timesfm3/ -v`), 100% pass rate.
 
+### Tại P4:
+1. **Mô hình Dữ liệu & Trạng thái Công việc (`JobSpec`, `JobStatus`, `JobPriority`):**
+   - Định nghĩa trạng thái công việc tại `src/paxg_lab/queue/types.py`: `QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, `INTERRUPTED`.
+   - Phân cấp ưu tiên bắt buộc: `FORECAST (P1)` > `MANUAL (P2)` > `AUTO (P3)`.
+   - Máy trạng thái tự động (`AutoRunState`): `SEARCHING`, `VALIDATING`, `WAITING_DATA`, `WAITING_AUDIT`, `PAUSED_ERROR`, `STOPPED`.
+2. **Kho lưu trữ Hàng đợi SQLite & Chống gửi trùng (`GPUJobStorage`):**
+   - Quản lý persistent trong `var/paxg_lab/paxg_lab.db` (WAL mode, busy timeout 30s).
+   - Chống gửi trùng lặp (Idempotency): kiểm tra `idempotency_key`, trả về `job_id` hiện có nếu công việc cùng khóa đang `QUEUED` hoặc `RUNNING`.
+   - Bảo đảm tính bất biến tối đa duy nhất 1 tiến trình GPU: transaction `BEGIN IMMEDIATE` từ chối cấp phát nếu đang có tác vụ `RUNNING`.
+3. **Bộ điều phối GPU & Khóa Luân phiên 1h/4h (`GPUScheduler`):**
+   - Singleton coordinator lock ngăn ngừa xung đột 2 bộ điều phối chạy đồng thời.
+   - Luân phiên Round-Robin cân bằng 1h và 4h cho các công việc tự động (1h $\rightarrow$ 4h $\rightarrow$ 1h $\rightarrow$ 4h), không để đói tài nguyên một khung.
+   - Dự đoán tức thời (FORECAST) chờ công việc hiện tại hoàn thành bước nhỏ rồi lập tức được ưu tiên thực thi trước toàn bộ hàng đợi.
+4. **Tiến trình con GPU Riêng biệt & Thu hồi VRAM (`GPUWorker`):**
+   - Mỗi công việc chạy trong tiến trình con độc lập (`sys.executable -m paxg_lab.queue.worker`).
+   - Luồng nền `heartbeat_thread` cập nhật `heartbeat_at` mỗi 2s và kiểm tra cờ hủy.
+   - Thu hồi hoàn toàn 100% bộ nhớ GPU khi tiến trình kết thúc (`vram_leaked = 0 bytes`).
+5. **Cơ chế Heartbeat phát hiện treo & Bảo vệ Tiến trình An toàn (`process_guard`):**
+   - Tự động phát hiện tiến trình bị treo khi quá hạn `heartbeat_timeout`, thu hồi tiến trình và đánh dấu `FAILED`.
+   - Hàm `safe_terminate_process` bắt buộc xác minh PID và `create_time` qua `psutil`, từ chối kết thúc nếu PID bị hệ điều hành cấp lại cho ứng dụng khác.
+6. **Dừng An toàn (Graceful Stop) & Phục hồi Sự cố (Crash Recovery):**
+   - Lệnh `stop_auto_run()` chuyển trạng thái sang `STOPPED`, hủy toàn bộ job pending và yêu cầu job đang chạy thoát sạch tại ranh giới bước/epoch, bảo toàn checkpoint hợp lệ đã lưu.
+   - Khởi động lại ứng dụng quét và phục hồi tự động các job mồ côi về `INTERRUPTED`, giải phóng khóa và không chạy đúp.
+7. **Bằng chứng Thực nghiệm trên RTX 5060 Ti:**
+   - Kịch bản `scripts/run_p4_queue_proof.py` đã thực thi thành công cả 6 kịch bản thực tế (ưu tiên dự đoán, luân phiên 1h/4h, treo heartbeat, dừng an toàn, ngắt đột ngột, thu hồi VRAM 0 byte).
+   - Lưu trữ tại `docs/paxg-lab/phases/p4_queue_evidence.json`.
+8. **Kiểm thử tự động:**
+   - **63 tests collected: 63 passed** (`pytest tests/paxg_lab/ -v`), 100% pass rate.
+
 ---
 
-## 3. Lệnh tiếp tục cho giai đoạn tiếp theo (P4)
+## 3. Lệnh tiếp tục cho giai đoạn tiếp theo (P5)
 
-Sau khi nghiệm thu P3, chuyển sang P4 bằng lệnh:
+Sau khi nghiệm thu P4, chuyển sang P5 bằng lệnh:
 
 ```text
-/goal Đọc bộ tài liệu docs/paxg-lab và thực hiện P4: xây dựng hàng đợi một tiến trình GPU, quản lý công việc (Queued, Running, Succeeded, Failed, Cancelled, Interrupted), cơ chế heartbeat phát hiện treo/tiến trình chết, dừng an toàn và phục hồi sau sự cố. Kiểm thử ngắt đột ngột, khóa luân phiên 1h/4h và tôn trọng quyền ưu tiên dự đoán; chỉ hoàn thành P4.
+/goal Đọc bộ tài liệu docs/paxg-lab và thực hiện P5: web Streamlit tiếng Việt đủ năm thẻ, hai chế độ 1h/24 nến và 4h/6 nến, biểu đồ và chọn base/LoRA. Kết nối hàng đợi có sẵn, kiểm tra toàn bộ luồng trên trình duyệt và tạo lệnh mở một bước. Chỉ hoàn thành P5.
 ```
