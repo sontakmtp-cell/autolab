@@ -295,6 +295,7 @@ class LoRATrainer:
         final_train_loss = 0.0
         start_epoch = 1
         start_minibatch_idx = 0
+        saved_epoch_indices: np.ndarray | None = None
         rng = np.random.default_rng(self.spec.seed)
 
         # Check for pre-existing durable checkpoint to reconcile / resume
@@ -324,7 +325,10 @@ class LoRATrainer:
                     from safetensors.torch import load_file
                     saved_weights = load_file(str(existing_ckpt.weights_path))
                 except Exception:
-                    saved_weights = torch.load(str(existing_ckpt.weights_path), map_location=self.device)
+                    try:
+                        saved_weights = torch.load(str(existing_ckpt.weights_path), map_location=self.device, weights_only=True)
+                    except TypeError:
+                        saved_weights = torch.load(str(existing_ckpt.weights_path), map_location=self.device)
 
                 peft_model.load_state_dict(saved_weights, strict=False)
 
@@ -350,7 +354,17 @@ class LoRATrainer:
                 # 3. Restore optimizer, scheduler, and RNG state if trainer_state.pt is present
                 if existing_ckpt.trainer_state_path and existing_ckpt.trainer_state_path.exists():
                     try:
-                        t_state = torch.load(str(existing_ckpt.trainer_state_path), map_location=self.device)
+                        try:
+                            t_state = torch.load(
+                                str(existing_ckpt.trainer_state_path),
+                                map_location=self.device,
+                                weights_only=False,
+                            )
+                        except TypeError:
+                            t_state = torch.load(
+                                str(existing_ckpt.trainer_state_path),
+                                map_location=self.device,
+                            )
                         if "optimizer" in t_state:
                             optimizer.load_state_dict(t_state["optimizer"])
                         if "scheduler" in t_state:
@@ -361,7 +375,9 @@ class LoRATrainer:
                             torch.cuda.set_rng_state_all(t_state["torch_cuda_rng"])
                         if "np_rng" in t_state:
                             rng.bit_generator.state = t_state["np_rng"]
-                        logger.info("Restored optimizer, scheduler, and RNG states from durable checkpoint.")
+                        if "epoch_indices" in t_state and t_state["epoch_indices"] is not None:
+                            saved_epoch_indices = np.asarray(t_state["epoch_indices"])
+                        logger.info("Restored optimizer, scheduler, RNG, and epoch_indices from durable checkpoint.")
                     except Exception as state_err:
                         logger.warning("Failed to restore trainer_state.pt: %s", state_err)
 
@@ -383,8 +399,12 @@ class LoRATrainer:
             epoch_start = time.time()
             peft_model.train()
 
-            # Randomly shuffle and cap sliding windows for this epoch
-            epoch_indices = rng.permutation(num_train_samples)[:effective_samples]
+            # Randomly shuffle and cap sliding windows for this epoch (reuse preserved permutation if resuming mid-epoch)
+            if epoch == start_epoch and saved_epoch_indices is not None:
+                epoch_indices = saved_epoch_indices
+                saved_epoch_indices = None
+            else:
+                epoch_indices = rng.permutation(num_train_samples)[:effective_samples]
             epoch_loss_sum = 0.0
             epoch_loss_batches = 0
 
@@ -494,6 +514,7 @@ class LoRATrainer:
                             "epoch": epoch,
                             "minibatch_idx": last_processed_minibatch,
                             "global_step": global_step,
+                            "epoch_indices": epoch_indices.tolist() if isinstance(epoch_indices, np.ndarray) else list(epoch_indices),
                         }
                         checkpoint_manager.save_checkpoint(
                             job_id=job_id,

@@ -151,7 +151,24 @@ class GPUScheduler:
                 # Automatic single requeue / resumption for TRAIN and AUTO_TRIAL jobs with durable checkpoints
                 is_trainable = running_job.job_type in (JobType.TRAIN.value, JobType.AUTO_TRIAL.value)
                 resume_attempt = int(running_job.payload.get("resume_attempt", 0)) if running_job.payload else 0
-                if is_trainable and ckpt is not None and resume_attempt < 1:
+
+                is_auto = running_job.priority == JobPriority.AUTO.value
+                auto_state = (
+                    self.storage.get_auto_run_state(running_job.timeframe)
+                    if (is_auto and running_job.timeframe)
+                    else None
+                )
+
+                # Do NOT resume if user requested cancellation or auto run is explicitly STOPPED
+                should_requeue = (
+                    is_trainable
+                    and ckpt is not None
+                    and resume_attempt < 1
+                    and not running_job.cancel_requested
+                    and (not is_auto or auto_state != AutoRunState.STOPPED)
+                )
+
+                if should_requeue:
                     resumed_job_id = f"{running_job.job_id}_resumed"
                     resumed_payload = copy.deepcopy(running_job.payload) if running_job.payload else {}
                     resumed_payload["resume_from_job_id"] = running_job.job_id
@@ -173,10 +190,18 @@ class GPUScheduler:
                         ckpt.epoch,
                         ckpt.global_step,
                     )
-                    if running_job.priority == JobPriority.AUTO.value and running_job.timeframe:
-                        curr_state = self.storage.get_auto_run_state(running_job.timeframe)
-                        if curr_state != AutoRunState.PAUSED_ERROR:
+                    if is_auto and running_job.timeframe:
+                        if auto_state not in (AutoRunState.STOPPED, AutoRunState.PAUSED_ERROR):
                             self.storage.set_auto_run_state(running_job.timeframe, AutoRunState.SEARCHING)
+                else:
+                    if running_job.cancel_requested or (is_auto and auto_state == AutoRunState.STOPPED):
+                        logger.info(
+                            "Crash Recovery: Job '%s' was stopped/cancelled (cancel_requested=%s, auto_state=%s). "
+                            "Preserving checkpoint without auto-requeuing resumption job.",
+                            running_job.job_id,
+                            running_job.cancel_requested,
+                            auto_state.value if auto_state else None,
+                        )
             else:
                 logger.info(
                     "Startup: Job '%s' is actively running under alive worker PID %d. Adopting job with supervision.",

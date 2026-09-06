@@ -2437,4 +2437,198 @@ def test_stopped_job_result_persisted_in_database(temp_db_path: Path, tmp_path: 
     assert "best_val_loss" in job_record.result
 
 
+# ---------------------------------------------------------------------------
+# 35. Review Round 5 (Comment 5556609187): Mid-Epoch Continuity & Stopped Recovery Invariants
+# ---------------------------------------------------------------------------
+
+
+def test_mid_epoch_resume_sample_sequence_continuity_lightweight(tmp_path: Path):
+    """Verifies that mid-epoch stop and resumption maintains 100% exact sample permutation continuity.
+
+    The sequence of training sample windows visited across part 1 and part 2 matches
+    the uninterrupted continuous run with zero duplicates and zero skipped samples.
+    Runs on CPU with MockTimesFM for ultra-fast CI execution (< 1s).
+    """
+    import torch.nn as nn
+    from paxg_lab.data.snapshot import DatasetSnapshot
+    from paxg_lab.model.train_spec import TrainSpec
+    from paxg_lab.model.trainer import LoRATrainer
+    from paxg_lab.queue.checkpoint import TrainingCheckpointManager
+
+    class MockTimesFM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.query_proj = nn.Linear(9, 9, bias=False)
+            self.value_proj = nn.Linear(9, 9, bias=False)
+
+        def forward_decode(self, target, horizon):
+            B, F, _ = target.shape
+            loss_val = (self.query_proj(target[:, :, 0]) + self.value_proj(target[:, :, 0])).sum() * 0.0
+            out = torch.zeros((B, F, horizon, 9), device=target.device, dtype=torch.float32)
+            return out + loss_val
+
+    snap_path = get_or_create_test_snapshot(tmp_path, timeframe="4h")
+    snapshot = DatasetSnapshot.load(snap_path)
+    features_df = snapshot.to_dataframe("B").copy()
+    features_df["close"] = np.arange(len(features_df), dtype=np.float32)
+
+    spec = TrainSpec(
+        timeframe="4h",
+        horizon=6,
+        context_len=128,
+        feature_set="B",
+        max_epochs=1,
+        batch_size=2,
+        gradient_accumulation_steps=1,
+        max_samples_per_epoch=8,
+        seed=123,
+    )
+
+    # 1. Uninterrupted continuous baseline run
+    trainer_cont = LoRATrainer(base_model=MockTimesFM(), spec=spec, device="cpu")
+    seq_cont = []
+    orig_fwd_cont = trainer_cont._forward_pass
+
+    def hook_cont(peft_model, b_ctx_tensor):
+        if peft_model.training:
+            seq_cont.extend(b_ctx_tensor[:, 0, -1].detach().cpu().long().tolist())
+        return orig_fwd_cont(peft_model, b_ctx_tensor)
+
+    trainer_cont._forward_pass = hook_cont
+
+    res_cont = trainer_cont.train(
+        features_df=features_df,
+        snapshot_hash=snapshot.metadata.sha256,
+        fold_id=1,
+        job_id="cont_baseline_job",
+        checkpoint_manager=TrainingCheckpointManager(tmp_path / "ckpt_cont"),
+    )
+    assert res_cont.best_epoch >= 1
+    assert len(seq_cont) == 8
+
+    # 2. Interrupted run: stops gracefully at step 2 (halfway through epoch 1)
+    ckpt_dir_split = tmp_path / "ckpt_split"
+    ckpt_mgr_split = TrainingCheckpointManager(ckpt_dir_split)
+    job_id = "split_resume_job"
+
+    trainer_part1 = LoRATrainer(base_model=MockTimesFM(), spec=spec, device="cpu")
+    seq_p1 = []
+    orig_fwd1 = trainer_part1._forward_pass
+
+    def hook_p1(peft_model, b_ctx_tensor):
+        if peft_model.training:
+            seq_p1.extend(b_ctx_tensor[:, 0, -1].detach().cpu().long().tolist())
+        return orig_fwd1(peft_model, b_ctx_tensor)
+
+    trainer_part1._forward_pass = hook_p1
+
+    def stop_callback(step_record):
+        if step_record.get("step", 0) >= 2:
+            return False
+        return True
+
+    res_p1 = trainer_part1.train(
+        features_df=features_df,
+        snapshot_hash=snapshot.metadata.sha256,
+        fold_id=1,
+        job_id=job_id,
+        progress_callback=stop_callback,
+        checkpoint_manager=ckpt_mgr_split,
+    )
+    assert len(seq_p1) == 4
+
+    # 3. Resumed run: continues exactly from durable checkpoint
+    trainer_part2 = LoRATrainer(base_model=MockTimesFM(), spec=spec, device="cpu")
+    seq_p2 = []
+    orig_fwd2 = trainer_part2._forward_pass
+
+    def hook_p2(peft_model, b_ctx_tensor):
+        if peft_model.training:
+            seq_p2.extend(b_ctx_tensor[:, 0, -1].detach().cpu().long().tolist())
+        return orig_fwd2(peft_model, b_ctx_tensor)
+
+    trainer_part2._forward_pass = hook_p2
+
+    res_p2 = trainer_part2.train(
+        features_df=features_df,
+        snapshot_hash=snapshot.metadata.sha256,
+        fold_id=1,
+        job_id=job_id,
+        checkpoint_manager=ckpt_mgr_split,
+    )
+
+    seq_resumed = seq_p1 + seq_p2
+    assert seq_resumed == seq_cont, f"Sample sequence mismatch! baseline={seq_cont}, resumed={seq_resumed}"
+    assert len(seq_resumed) == 8
+    assert len(set(seq_resumed)) == 8
+
+
+def test_startup_recovery_respects_stopped_and_cancel_requested_lightweight(
+    temp_db_path: Path, tmp_path: Path
+):
+    """Verifies that recover_on_startup():
+
+    1. Does NOT requeue a continuation job and does NOT flip auto_state to SEARCHING
+       if the auto run was STOPPED.
+    2. Does NOT requeue a continuation job if the job had cancel_requested = True.
+    """
+    storage = GPUJobStorage(temp_db_path)
+
+    # --- Subtest A: RUNNING job with auto_run_state = STOPPED ---
+    job_id_a = "auto_job_stopped_on_startup"
+    storage.submit_job(
+        JobSpec(
+            job_id=job_id_a,
+            job_type=JobType.AUTO_TRIAL.value,
+            timeframe="1h",
+            priority=JobPriority.AUTO.value,
+            payload={"checkpoint_dir": str(tmp_path / "ckpts_a")},
+        )
+    )
+    with storage.get_connection() as conn:
+        conn.execute(
+            "UPDATE gpu_jobs SET status = ?, worker_pid = ?, started_at = ? WHERE job_id = ?;",
+            (JobStatus.RUNNING.value, 12345, time.time(), job_id_a),
+        )
+    storage.set_auto_run_state("1h", AutoRunState.STOPPED)
+
+    sched_a = GPUScheduler(db_path=temp_db_path, acquire_coordinator_lock=True)
+    sched_a.recover_on_startup()
+
+    job_a = storage.get_job(job_id_a)
+    assert job_a.status == JobStatus.INTERRUPTED.value
+    assert storage.get_auto_run_state("1h") == AutoRunState.STOPPED
+    resumed_jobs_a = [j for j in storage.list_jobs() if j.job_id.endswith("_resumed")]
+    assert len(resumed_jobs_a) == 0, f"Expected 0 resumed jobs, found: {resumed_jobs_a}"
+
+    # --- Subtest B: RUNNING job with cancel_requested = True ---
+    job_id_b = "job_cancelled_pre_crash_on_startup"
+    storage.submit_job(
+        JobSpec(
+            job_id=job_id_b,
+            job_type=JobType.TRAIN.value,
+            timeframe="4h",
+            priority=JobPriority.MANUAL.value,
+            payload={"checkpoint_dir": str(tmp_path / "ckpts_b")},
+        )
+    )
+    with storage.get_connection() as conn:
+        conn.execute(
+            "UPDATE gpu_jobs SET status = ?, worker_pid = ?, started_at = ? WHERE job_id = ?;",
+            (JobStatus.RUNNING.value, 54321, time.time(), job_id_b),
+        )
+    storage.request_cancel(job_id_b)
+    job_b_pre = storage.get_job(job_id_b)
+    assert job_b_pre.cancel_requested is True
+
+    sched_b = GPUScheduler(db_path=temp_db_path, acquire_coordinator_lock=False)
+    sched_b.recover_on_startup()
+
+    job_b = storage.get_job(job_id_b)
+    assert job_b.status == JobStatus.INTERRUPTED.value
+    resumed_jobs_b = [j for j in storage.list_jobs() if j.job_id.startswith(f"{job_id_b}_resumed")]
+    assert len(resumed_jobs_b) == 0, f"Expected 0 resumed jobs, found: {resumed_jobs_b}"
+
+
+
 
