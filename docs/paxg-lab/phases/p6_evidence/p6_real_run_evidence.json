@@ -1,0 +1,198 @@
+{
+  "phase": "P6",
+  "timeframe": "1h",
+  "timestamp": 1788690451.3568065,
+  "device": "NVIDIA GeForce RTX 5060 Ti",
+  "steps": {
+    "step1_snapshot": {
+      "snapshot_id": "paxgusdt_1h_1743073200000_1788613200000_837c9ee8",
+      "total_candles": 12651,
+      "sha256": "837c9ee88b61494ff9512561051092ec53f22e07008b9bea4b6ac16af7dabff0"
+    },
+    "step2_split_plan": {
+      "timeframe": "1h",
+      "horizon": 24,
+      "total_candles": 12651,
+      "test_start": 10491,
+      "test_end": 12651,
+      "test_candles": 2160,
+      "eval_folds_count": 3
+    },
+    "step3_base_reference": {
+      "overall_weighted_mae": 25.017024278640747,
+      "overall_weighted_pinball": 10.333677859855074,
+      "coverage_80": 0.7593456081619641
+    },
+    "step4_optuna_search": {
+      "study_name": "study_1h_837c9ee8",
+      "total_trials": 4,
+      "best_trial_number": 3,
+      "best_trial_score": 0.43969474639857786,
+      "best_params": {
+        "context_len": 256,
+        "lora_r": 8,
+        "learning_rate": 6.373925021896197e-05,
+        "lora_dropout": 0.05,
+        "weight_decay": 0.02,
+        "feature_set": "B",
+        "history_days": 365,
+        "target_modules_group": "setB"
+      },
+      "trials_log": [
+        {
+          "trial_number": 0,
+          "score_v1": 0.4295138508416674,
+          "weighted_mae": 24.746854321161905,
+          "coverage_80": 0.7746293639406981,
+          "lora_r": 4,
+          "lr": 1.1900590783184243e-05,
+          "context_len": 256
+        },
+        {
+          "trial_number": 1,
+          "score_v1": 0.43162146736822615,
+          "weighted_mae": 24.746066856384275,
+          "coverage_80": 0.7746692172804082,
+          "lora_r": 8,
+          "lr": 2.3993242906812688e-05,
+          "context_len": 256
+        },
+        {
+          "trial_number": 2,
+          "score_v1": 0.4300627761822051,
+          "weighted_mae": 24.746637725830077,
+          "coverage_80": 0.7746293639406981,
+          "lora_r": 8,
+          "lr": 1.5817992118051935e-05,
+          "context_len": 256
+        },
+        {
+          "trial_number": 3,
+          "score_v1": 0.43969474639857786,
+          "weighted_mae": 24.74309962590535,
+          "coverage_80": 0.7747887772995377,
+          "lora_r": 8,
+          "lr": 6.373925021896197e-05,
+          "context_len": 256
+        },
+        {
+          "trial_number": 3,
+          "score_v1": 0.43969474639857786,
+          "weighted_mae": 24.74309962590535,
+          "coverage_80": 0.7747887772995377,
+          "lora_r": 8,
+          "lr": 6.373925021896197e-05,
+          "context_len": 256
+        },
+        {
+          "trial_number": 3,
+          "score_v1": 0.43566002934581904,
+          "weighted_mae": 24.744562800725298,
+          "coverage_80": 0.7746492906105532,
+          "lora_r": 8,
+          "lr": 6.373925021896197e-05,
+          "context_len": 256
+        },
+        {
+          "trial_number": 3,
+          "score_v1": 0.43525658340339834,
+          "weighted_mae": 24.745128313700356,
+          "coverage_80": 0.774669217280408,
+          "lora_r": 8,
+          "lr": 6.373925021896197e-05,
+          "context_len": 256
+        }
+      ]
+    },
+    "step5_multi_seed": {
+      "seeds": [
+        42,
+        123,
+        2026
+      ],
+      "scores": [
+        0.43969474639857786,
+        0.43566002934581904,
+        0.43525658340339834
+      ],
+      "median_score": 0.43566002934581904
+    },
+    "step6_final_candidate": {
+      "adapter_id": "paxg_1h_r8_optuna_1788690790",
+      "path": "D:\\AI\\timesfm_b\\var\\paxg_lab\\adapters\\paxg_1h_r8_optuna_1788690790",
+      "train_candles": 10467,
+      "is_verified_initial": false
+    },
+    "step8_bootstrap": {
+      "timeframe": "1h",
+      "block_size_candles": 24,
+      "num_blocks": 89,
+      "candidate_weighted_mae": 22.23520552242516,
+      "baseline_weighted_mae": 21.94685225599491,
+      "mean_improvement_usdt": -0.2883532664302577,
+      "relative_improvement_pct": -1.3138707230850948,
+      "ci_95_lower": -0.7896800969541067,
+      "ci_95_upper": 0.21461418760905587,
+      "is_significant_positive": false,
+      "num_resamples": 1000
+    },
+    "step9_gatekeeper": {
+      "candidate_id": "paxg_1h_r8_optuna_1788690790",
+      "timeframe": "1h",
+      "current_recommended_id": null,
+      "accepted": false,
+      "verdict": "REJECTED_PRESERVE_CURRENT",
+      "check_score_improvement": false,
+      "check_mae_vs_base_and_naive": false,
+      "check_no_segment_worse_5pct": true,
+      "check_coverage_80_range": true,
+      "check_min_independent_blocks": true,
+      "check_bootstrap_ci_positive": false,
+      "check_smoke_test_and_backup": false,
+      "criteria_details": {
+        "candidate_score": 0.4404003227303721,
+        "current_recommended_score": 0.0,
+        "score_diff": 0.4404003227303721,
+        "candidate_mae": 24.743115139007568,
+        "base_mae": 25.017024278640747,
+        "naive_test_mae": 19.71393638543007,
+        "mae_vs_base_ratio": 0.9890510903062504,
+        "mae_vs_naive_ratio": 1.2551077905118126,
+        "worst_segment_mae_ratio": 1.0086339954495023,
+        "fold_ratios": {
+          "1": 0.9746229219046336,
+          "2": 1.0086339954495023,
+          "3": 0.9961732463476397,
+          "test_locked": 1.0
+        },
+        "coverage_80": 0.7747688506296827,
+        "independent_24h_blocks": 89,
+        "bootstrap_ci_95": [
+          -0.7896800969541067,
+          0.21461418760905587
+        ]
+      },
+      "reasons": [
+        "Score v1 improvement insufficient: candidate score 0.44 vs current 0.00 (diff +0.44 < +2.0 required).",
+        "MAE improvement insufficient (< 1% better): vs base=0.989 (req <= 0.99), vs naive=1.255 (req <= 0.99).",
+        "95% block bootstrap CI lower bound not strictly positive: -0.7897 <= 0."
+      ],
+      "bootstrap_summary": {
+        "timeframe": "1h",
+        "block_size_candles": 24,
+        "num_blocks": 89,
+        "candidate_weighted_mae": 22.23520552242516,
+        "baseline_weighted_mae": 21.94685225599491,
+        "mean_improvement_usdt": -0.2883532664302577,
+        "relative_improvement_pct": -1.3138707230850948,
+        "ci_95_lower": -0.7896800969541067,
+        "ci_95_upper": 0.21461418760905587,
+        "is_significant_positive": false,
+        "num_resamples": 1000
+      },
+      "backup_zip_path": null,
+      "audit_report_path": "D:\\AI\\timesfm_b\\var\\paxg_lab\\audit_reports\\audit_1h_paxg_1h_r8_optuna_1788690790_1788690880.json",
+      "evaluated_at": 1788690880.592867
+    }
+  }
+}
