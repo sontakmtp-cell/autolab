@@ -226,6 +226,7 @@ class LoRATrainer:
         snapshot_hash: str = "",
         fold_id: int = 1,
         adapter_id: str | None = None,
+        progress_callback: Any | None = None,
     ) -> TrainingResult:
         """Runs the complete training loop, early stopping, and best checkpoint restoration."""
         start_wall_time = time.time()
@@ -427,6 +428,16 @@ class LoRATrainer:
                 )
                 if patience_counter >= self.spec.early_stopping_patience:
                     logger.info("Early stopping triggered at epoch %d.", epoch)
+                    break
+
+            if progress_callback is not None:
+                try:
+                    should_continue = progress_callback(epoch_record)
+                    if should_continue is False:
+                        logger.info("Training stopped gracefully by progress_callback after epoch %d.", epoch)
+                        break
+                except Exception as cb_exc:
+                    logger.warning("progress_callback raised exception: %s", cb_exc)
                     break
 
         # 6. Restore best checkpoint weights into model

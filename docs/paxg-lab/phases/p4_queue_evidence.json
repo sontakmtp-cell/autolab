@@ -1,0 +1,82 @@
+{
+  "phase": "P4",
+  "timestamp": 1788656200.6947827,
+  "device": "NVIDIA GeForce RTX 5060 Ti",
+  "python_version": "3.12.12 (main, Jan 14 2026, 19:30:21) [MSC v.1944 64 bit (AMD64)]",
+  "scenarios": {
+    "priority_hierarchy": {
+      "status": "PASSED",
+      "dispatch_sequence": [
+        {
+          "job_id": "s1_forecast",
+          "priority": 1,
+          "type": "DUMMY"
+        },
+        {
+          "job_id": "s1_manual",
+          "priority": 2,
+          "type": "DUMMY"
+        },
+        {
+          "job_id": "s1_auto",
+          "priority": 3,
+          "type": "DUMMY"
+        }
+      ],
+      "verified_rule": "Forecast (P1) > Manual (P2) > Auto (P3)"
+    },
+    "alternating_1h_4h": {
+      "status": "PASSED",
+      "sequence": [
+        {
+          "job_id": "auto_1h_1",
+          "timeframe": "1h"
+        },
+        {
+          "job_id": "auto_4h_1",
+          "timeframe": "4h"
+        },
+        {
+          "job_id": "auto_1h_2",
+          "timeframe": "1h"
+        },
+        {
+          "job_id": "auto_4h_2",
+          "timeframe": "4h"
+        }
+      ],
+      "verified_rule": "Round-Robin alternation 1h -> 4h -> 1h -> 4h"
+    },
+    "heartbeat_hang_detection": {
+      "status": "PASSED",
+      "worker_pid": 22332,
+      "final_status": "FAILED",
+      "error_message": "Heartbeat timed out after 1.5s without response (process hung).",
+      "verified_rule": "Hung worker terminated after heartbeat timeout; status marked FAILED"
+    },
+    "graceful_stop": {
+      "status": "PASSED",
+      "active_job_final_status": "CANCELLED",
+      "queued_job_final_status": "CANCELLED",
+      "auto_run_state_1h": "STOPPED",
+      "auto_run_state_4h": "STOPPED",
+      "verified_rule": "Stop cancels pending auto jobs and stops running job cleanly without corrupting checkpoints"
+    },
+    "crash_recovery": {
+      "status": "PASSED",
+      "abrupt_crash_detected_status": "INTERRUPTED",
+      "reboot_recovered_jobs": [
+        "proof_orphan_on_reboot"
+      ],
+      "verified_rule": "Abrupt kills and reboot orphans reliably recovered to INTERRUPTED; no duplicate runs"
+    },
+    "vram_reclamation": {
+      "status": "PASSED",
+      "cuda_available": true,
+      "vram_before_bytes": 0,
+      "vram_after_bytes": 0,
+      "vram_leaked_bytes": 0,
+      "verified_rule": "Complete GPU memory reclamation on subprocess termination"
+    }
+  }
+}

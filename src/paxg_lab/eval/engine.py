@@ -228,6 +228,7 @@ class BacktestEngine:
         include_locked_test: bool = False,
         custom_predictor_fn: Callable[[np.ndarray, int], tuple[np.ndarray, np.ndarray]] | None = None,
         adapter_manifest: AdapterManifest | None = None,
+        progress_callback: Callable[[dict[str, Any]], bool | None] | None = None,
     ) -> ScoreReport:
         """Runs backtest across evaluation folds (and optionally test lock set).
 
@@ -353,6 +354,20 @@ class BacktestEngine:
                 all_eval_targets.append(tgts)
                 all_eval_origins.append(orig_p)
                 all_eval_origins_ts.append(orig_ts)
+
+            if progress_callback is not None:
+                try:
+                    should_continue = progress_callback({
+                        "fold_id": fold.fold_id,
+                        "message": f"Completed fold {fold.fold_id}",
+                        "metric": f_metric,
+                    })
+                    if should_continue is False:
+                        logger.info("Backtest halted gracefully by progress_callback after fold %d.", fold.fold_id)
+                        break
+                except Exception as cb_exc:
+                    logger.warning("progress_callback raised exception: %s", cb_exc)
+                    break
 
         # 2. Evaluate locked test set ONLY if explicitly requested
         test_metric: FoldMetrics | None = None
