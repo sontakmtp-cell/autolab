@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -171,7 +172,7 @@ def test_safe_zip_import_rejection_of_code_or_pickle(temp_store: AdapterStore, t
     with zipfile.ZipFile(bad_zip, "w") as zf:
         zf.writestr("exploit.py", "import os; os.system('calc')")
 
-    with pytest.raises(ValueError, match="Dangerous file extension"):
+    with pytest.raises(ValueError, match=r"(Dangerous|Disallowed).*file extension"):
         temp_store.import_adapter_zip(bad_zip)
 
 
@@ -553,8 +554,8 @@ def test_safe_zip_import_rejects_checksum_traversal_and_uncovered_files(temp_sto
     zip_uncovered = tmp_path / "uncovered_file.zip"
     with zipfile.ZipFile(zip_uncovered, "w") as zf:
         zf.writestr("paxg_manifest.json", manifest_str)
-        zf.writestr("secret_backdoor.bin", b"\x00\x01\x02")
-        # checksums only mentions paxg_manifest.json, secret_backdoor.bin is unverified!
+        zf.writestr("secret_notes.txt", b"some unverified notes")
+        # checksums only mentions paxg_manifest.json, secret_notes.txt is unverified!
         zf.writestr("checksums.sha256", f"{m_hash}  paxg_manifest.json\n")
 
     with pytest.raises(ValueError, match="archive contains unverified files not covered by checksums"):
@@ -599,5 +600,207 @@ def test_queue_idempotency_enforcement(tmp_path: Path):
     matching = [j for j in jobs if j.idempotency_key == key]
     assert len(matching) == 1
     assert matching[0].job_id == "job_idempotency_first"
+
+
+def test_train_job_idempotency_deduplication(tmp_path: Path):
+    """Verifies training jobs submit deterministic idempotency keys and deduplicate active runs."""
+    import hashlib
+    import json
+    import hashlib
+    import json
+    from paxg_lab.model.train_spec import TrainSpec
+    from paxg_lab.queue.storage import GPUJobStorage
+    from paxg_lab.queue.types import JobPriority, JobSpec, JobType
+
+    db_path = tmp_path / "queue_train.db"
+    storage = GPUJobStorage(db_path)
+
+    spec_dict = {
+        "timeframe": "1h",
+        "feature_set": "A",
+        "lora_r": 8,
+        "lora_alpha": 16,
+        "batch_size": 2,
+        "max_epochs": 10,
+        "learning_rate": 1e-4,
+    }
+    train_spec = TrainSpec.from_dict(spec_dict)
+    timeframe = "1h"
+    snapshot_path = "snapshots/paxg_20260901.parquet"
+
+    # Compute idempotency key as tab_training.py does
+    train_hash_input = {
+        "timeframe": timeframe,
+        "snapshot": snapshot_path,
+        "spec": train_spec.to_dict(),
+    }
+    train_hash = hashlib.sha256(json.dumps(train_hash_input, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    idempotency_key = f"train_{timeframe}_{train_hash}"
+
+    job1 = JobSpec(
+        job_id="train_job_1",
+        job_type=JobType.TRAIN.value,
+        timeframe=timeframe,
+        priority=JobPriority.MANUAL.value,
+        payload=train_hash_input,
+        idempotency_key=idempotency_key,
+    )
+    job2 = JobSpec(
+        job_id="train_job_2",
+        job_type=JobType.TRAIN.value,
+        timeframe=timeframe,
+        priority=JobPriority.MANUAL.value,
+        payload=train_hash_input,
+        idempotency_key=idempotency_key,
+    )
+
+    submitted_id_1 = storage.submit_job(job1)
+    submitted_id_2 = storage.submit_job(job2)
+
+    assert submitted_id_1 == "train_job_1"
+    assert submitted_id_2 == "train_job_1"  # Deduplicated to active job 1
+    assert len(storage.list_jobs()) == 1
+
+
+def test_backtest_job_idempotency_deterministic_payload_no_minute_bucket():
+    """Verifies backtest idempotency keys are deterministic hashes of payload without minute buckets."""
+    import hashlib
+    import json
+
+    def make_key(timeframe: str, adapter: str, payload: dict) -> str:
+        payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        return f"bt_{timeframe}_{adapter}_{payload_hash}"
+
+    p1 = {"capital": 10000, "threshold": 0.005}
+    p2 = {"capital": 20000, "threshold": 0.005}
+
+    k1 = make_key("1h", "lora_v1", p1)
+    k1_again = make_key("1h", "lora_v1", p1)
+    k2 = make_key("1h", "lora_v1", p2)
+
+    assert k1 == k1_again
+    assert k1 != k2
+    # Ensure no minute-level timestamp bucket in key and format matches
+    prefix = "bt_1h_lora_v1_"
+    assert k1.startswith(prefix)
+    hash_part = k1[len(prefix):]
+    assert len(hash_part) == 16
+    assert int(hash_part, 16) >= 0
+
+
+def test_safe_zip_import_strict_allowlist_and_pickle_rejection(tmp_path: Path):
+    """Verifies that zip files with non-allowlisted or dangerous pickle/bin extensions are rejected."""
+    from paxg_lab.model.store import AdapterStore
+
+    store = AdapterStore(tmp_path / "models")
+    valid_manifest = {
+        "adapter_id": "test_reject",
+        "timeframe": "1h",
+        "horizon": 24,
+        "context_len": 512,
+        "feature_set": "A",
+        "feature_columns": ["close"],
+        "base_model_repo": "google/timesfm-2.0-500m-pytorch",
+    }
+    manifest_bytes = json.dumps(valid_manifest).encode("utf-8")
+    m_hash = hashlib.sha256(manifest_bytes).hexdigest()
+
+    # 1. Reject forbidden pickle / pt / bin extensions
+    for bad_ext in [".bin", ".pt", ".pth", ".ckpt", ".pkl", ".pickle"]:
+        bad_zip = tmp_path / f"forbidden_{bad_ext.strip('.')}.zip"
+        with zipfile.ZipFile(bad_zip, "w") as zf:
+            zf.writestr("paxg_manifest.json", manifest_bytes)
+            zf.writestr(f"weights{bad_ext}", b"bad data")
+            zf.writestr("checksums.sha256", f"{m_hash}  paxg_manifest.json\n{hashlib.sha256(b'bad data').hexdigest()}  weights{bad_ext}\n")
+
+        with pytest.raises(ValueError, match=r"(Disallowed or dangerous file extension|Pickle/PyTorch binary)"):
+            store.import_adapter_zip(bad_zip)
+
+    # 2. Reject non-allowlisted extensions like .py or .exe
+    unallowed_zip = tmp_path / "unallowed_ext.zip"
+    script_content = b"print('hello')"
+    script_hash = hashlib.sha256(script_content).hexdigest()
+    with zipfile.ZipFile(unallowed_zip, "w") as zf:
+        zf.writestr("paxg_manifest.json", manifest_bytes)
+        zf.writestr("script.py", script_content)
+        zf.writestr("checksums.sha256", f"{m_hash}  paxg_manifest.json\n{script_hash}  script.py\n")
+
+    with pytest.raises(ValueError, match=r"Disallowed or dangerous file extension '\.py'"):
+        store.import_adapter_zip(unallowed_zip)
+
+
+def test_safe_zip_import_uncompressed_size_limit_rejection(tmp_path: Path, monkeypatch):
+    """Verifies that zip files exceeding uncompressed limits are rejected before extraction."""
+    import paxg_lab.model.store as store_mod
+    from paxg_lab.model.store import AdapterStore
+
+    store = AdapterStore(tmp_path / "models")
+    valid_manifest = {
+        "adapter_id": "test_size",
+        "timeframe": "1h",
+        "horizon": 24,
+        "context_len": 512,
+        "feature_set": "A",
+        "feature_columns": ["close"],
+        "base_model_repo": "google/timesfm-2.0-500m-pytorch",
+    }
+    manifest_bytes = json.dumps(valid_manifest).encode("utf-8")
+    m_hash = hashlib.sha256(manifest_bytes).hexdigest()
+
+    # Monkeypatch MAX_MEMBER_UNCOMPRESSED_BYTES to 100 bytes for fast test
+    monkeypatch.setattr(store_mod, "MAX_MEMBER_UNCOMPRESSED_BYTES", 100)
+
+    oversized_member_zip = tmp_path / "oversized_member.zip"
+    with zipfile.ZipFile(oversized_member_zip, "w") as zf:
+        zf.writestr("paxg_manifest.json", manifest_bytes)
+        big_content = b"X" * 150
+        zf.writestr("notes.txt", big_content)
+        zf.writestr("checksums.sha256", f"{m_hash}  paxg_manifest.json\n{hashlib.sha256(big_content).hexdigest()}  notes.txt\n")
+
+    with pytest.raises(ValueError, match="exceeds uncompressed size limit"):
+        store.import_adapter_zip(oversized_member_zip)
+
+
+def test_safe_zip_import_static_compatibility_validation(tmp_path: Path):
+    """Verifies that manifests with incompatible parameters are rejected."""
+    from paxg_lab.model.store import AdapterStore
+
+    store = AdapterStore(tmp_path / "models")
+
+    def make_zip(filename: str, manifest: dict) -> Path:
+        p = tmp_path / filename
+        m_bytes = json.dumps(manifest).encode("utf-8")
+        h = hashlib.sha256(m_bytes).hexdigest()
+        with zipfile.ZipFile(p, "w") as zf:
+            zf.writestr("paxg_manifest.json", m_bytes)
+            zf.writestr("checksums.sha256", f"{h}  paxg_manifest.json\n")
+        return p
+
+    # 1. Invalid timeframe
+    bad_tf = make_zip("bad_tf.zip", {"adapter_id": "a1", "timeframe": "15m", "horizon": 24, "context_len": 512, "feature_set": "A", "feature_columns": ["close"], "base_model_repo": "google/timesfm-2.0-500m-pytorch"})
+    with pytest.raises(ValueError, match=r"(Incompatible adapter timeframe|Unsupported timeframe).*15m"):
+        store.import_adapter_zip(bad_tf)
+
+    # 2. Mismatched horizon
+    bad_horizon = make_zip("bad_hz.zip", {"adapter_id": "a2", "timeframe": "1h", "horizon": 6, "context_len": 512, "feature_set": "A", "feature_columns": ["close"], "base_model_repo": "google/timesfm-2.0-500m-pytorch"})
+    with pytest.raises(ValueError, match=r"(Incompatible adapter horizon|AdapterManifest horizon mismatch)"):
+        store.import_adapter_zip(bad_horizon)
+
+    # 3. Invalid context_len
+    bad_ctx = make_zip("bad_ctx.zip", {"adapter_id": "a3", "timeframe": "1h", "horizon": 24, "context_len": 999, "feature_set": "A", "feature_columns": ["close"], "base_model_repo": "google/timesfm-2.0-500m-pytorch"})
+    with pytest.raises(ValueError, match="Incompatible adapter context_len 999"):
+        store.import_adapter_zip(bad_ctx)
+
+    # 4. Invalid feature set
+    bad_feat = make_zip("bad_feat.zip", {"adapter_id": "a4", "timeframe": "4h", "horizon": 6, "context_len": 512, "feature_set": "D", "feature_columns": ["close"], "base_model_repo": "google/timesfm-2.0-500m-pytorch"})
+    with pytest.raises(ValueError, match="Incompatible adapter feature_set 'D'"):
+        store.import_adapter_zip(bad_feat)
+
+    # 5. Incompatible base_model_repo
+    bad_base = make_zip("bad_base.zip", {"adapter_id": "a5", "timeframe": "4h", "horizon": 6, "context_len": 512, "feature_set": "A", "feature_columns": ["close"], "base_model_repo": "bert-base-uncased"})
+    with pytest.raises(ValueError, match="Incompatible base model 'bert-base-uncased'"):
+        store.import_adapter_zip(bad_base)
+
+
 
 

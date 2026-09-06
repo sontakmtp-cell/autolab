@@ -151,7 +151,10 @@ def run_browser_verification() -> dict:
             logger.info("Verifying Tab 1: Forecast in 1h mode...")
             page.wait_for_timeout(2000)
 
-            # Trigger real forecast submission via UI button
+            # Record pre-click job state to track exact job submission
+            existing_1h_job_ids = {j.job_id for j in storage.list_jobs(job_type=JobType.FORECAST.value, timeframe="1h")}
+            click_time_1h = time.time() - 2.0
+
             submit_btn = page.locator("button:has-text('Tạo Dự đoán')")
             logger.info("Found 1h submit button: %d", submit_btn.count())
             if submit_btn.count() == 0:
@@ -159,10 +162,55 @@ def run_browser_verification() -> dict:
 
             logger.info("Submitting 1h forecast job via UI...")
             submit_btn.first.click()
+
+            # Identify newly submitted job
+            submitted_1h_job = None
+            for _ in range(25):
+                time.sleep(0.6)
+                cands = [
+                    j for j in storage.list_jobs(job_type=JobType.FORECAST.value, timeframe="1h")
+                    if j.job_id not in existing_1h_job_ids and j.created_at >= click_time_1h
+                ]
+                if cands:
+                    submitted_1h_job = cands[0]
+                    break
+
+            if not submitted_1h_job:
+                active_cands = [
+                    j for j in storage.list_jobs(job_type=JobType.FORECAST.value, timeframe="1h")
+                    if j.status in (JobStatus.QUEUED.value, JobStatus.RUNNING.value)
+                ]
+                if active_cands:
+                    submitted_1h_job = active_cands[0]
+                else:
+                    raise RuntimeError("No 1h forecast job was dispatched by UI submit click")
+
+            logger.info("Tracking submitted 1h forecast job '%s' until SUCCEEDED...", submitted_1h_job.job_id)
+            poll_start = time.time()
+            job_succeeded_1h = False
+            while time.time() - poll_start < 60.0:
+                cur = storage.get_job(submitted_1h_job.job_id)
+                if cur and cur.status == JobStatus.SUCCEEDED.value:
+                    submitted_1h_job = cur
+                    job_succeeded_1h = True
+                    break
+                elif cur and cur.status in (JobStatus.FAILED.value, JobStatus.CANCELLED.value):
+                    raise RuntimeError(f"1h job {submitted_1h_job.job_id} terminated with {cur.status}: {cur.error_message}")
+                time.sleep(0.8)
+
+            assert job_succeeded_1h, f"Job {submitted_1h_job.job_id} did not succeed within 60s"
+            assert submitted_1h_job.result is not None, f"Job {submitted_1h_job.job_id} result is empty"
+            assert submitted_1h_job.result.get("timeframe") == "1h", "Result timeframe mismatch"
+            res_pts_1h = submitted_1h_job.result.get("point_forecast") or []
+            res_ts_1h = submitted_1h_job.result.get("target_timestamps") or []
+            assert len(res_pts_1h) == 24, f"Expected 24 point_forecast entries, got {len(res_pts_1h)}"
+            assert len(res_ts_1h) == 24, f"Expected 24 target_timestamps entries, got {len(res_ts_1h)}"
+
+            # Wait for DOM table to render
             try:
-                page.wait_for_selector("text=Bảng số chi tiết 24 bước", timeout=60000)
+                page.wait_for_selector("text=Bảng số chi tiết 24 bước", timeout=25000)
                 forecast_1h_completed = True
-                logger.info("1h forecast completed: 24 steps table confirmed in DOM!")
+                logger.info("1h forecast completed: verified job %s and DOM table 24 steps!", submitted_1h_job.job_id)
             except Exception as e:
                 logger.error("Waiting for 24 steps table timed out: %s", e)
                 forecast_1h_completed = False
@@ -195,6 +243,10 @@ def run_browser_verification() -> dict:
             except Exception as e:
                 logger.warning("Could not click 4h radio: %s", e)
 
+            # Record pre-click 4h job state
+            existing_4h_job_ids = {j.job_id for j in storage.list_jobs(job_type=JobType.FORECAST.value, timeframe="4h")}
+            click_time_4h = time.time() - 2.0
+
             submit_btn_4h = page.locator("button:has-text('Tạo Dự đoán')")
             logger.info("Found 4h submit button: %d", submit_btn_4h.count())
             if submit_btn_4h.count() == 0:
@@ -202,10 +254,54 @@ def run_browser_verification() -> dict:
 
             logger.info("Submitting 4h forecast job via UI...")
             submit_btn_4h.first.click()
+
+            # Identify newly submitted 4h job
+            submitted_4h_job = None
+            for _ in range(25):
+                time.sleep(0.6)
+                cands = [
+                    j for j in storage.list_jobs(job_type=JobType.FORECAST.value, timeframe="4h")
+                    if j.job_id not in existing_4h_job_ids and j.created_at >= click_time_4h
+                ]
+                if cands:
+                    submitted_4h_job = cands[0]
+                    break
+
+            if not submitted_4h_job:
+                active_cands = [
+                    j for j in storage.list_jobs(job_type=JobType.FORECAST.value, timeframe="4h")
+                    if j.status in (JobStatus.QUEUED.value, JobStatus.RUNNING.value)
+                ]
+                if active_cands:
+                    submitted_4h_job = active_cands[0]
+                else:
+                    raise RuntimeError("No 4h forecast job was dispatched by UI submit click")
+
+            logger.info("Tracking submitted 4h forecast job '%s' until SUCCEEDED...", submitted_4h_job.job_id)
+            poll_start = time.time()
+            job_succeeded_4h = False
+            while time.time() - poll_start < 60.0:
+                cur = storage.get_job(submitted_4h_job.job_id)
+                if cur and cur.status == JobStatus.SUCCEEDED.value:
+                    submitted_4h_job = cur
+                    job_succeeded_4h = True
+                    break
+                elif cur and cur.status in (JobStatus.FAILED.value, JobStatus.CANCELLED.value):
+                    raise RuntimeError(f"4h job {submitted_4h_job.job_id} terminated with {cur.status}: {cur.error_message}")
+                time.sleep(0.8)
+
+            assert job_succeeded_4h, f"Job {submitted_4h_job.job_id} did not succeed within 60s"
+            assert submitted_4h_job.result is not None, f"Job {submitted_4h_job.job_id} result is empty"
+            assert submitted_4h_job.result.get("timeframe") == "4h", "Result timeframe mismatch"
+            res_pts_4h = submitted_4h_job.result.get("point_forecast") or []
+            res_ts_4h = submitted_4h_job.result.get("target_timestamps") or []
+            assert len(res_pts_4h) == 6, f"Expected 6 point_forecast entries, got {len(res_pts_4h)}"
+            assert len(res_ts_4h) == 6, f"Expected 6 target_timestamps entries, got {len(res_ts_4h)}"
+
             try:
-                page.wait_for_selector("text=Bảng số chi tiết 6 bước", timeout=60000)
+                page.wait_for_selector("text=Bảng số chi tiết 6 bước", timeout=25000)
                 forecast_4h_completed = True
-                logger.info("4h forecast completed: 6 steps table confirmed in DOM!")
+                logger.info("4h forecast completed: verified job %s and DOM table 6 steps!", submitted_4h_job.job_id)
             except Exception as e:
                 logger.error("Waiting for 6 steps table timed out: %s", e)
                 forecast_4h_completed = False

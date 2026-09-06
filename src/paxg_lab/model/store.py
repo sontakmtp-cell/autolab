@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 from peft import PeftModel
 
-from ..constants import MODEL_REVISION
+from ..constants import ALLOWED_CONTEXT_LENGTHS, MODEL_REVISION, get_horizon_for_timeframe
 from .lora import load_lora_adapter
 from .manifest import AdapterManifest
 
@@ -28,6 +28,14 @@ DEFAULT_ADAPTER_STORE_DIR = Path("var/paxg_lab/adapters")
 DEFAULT_DB_PATH = Path("var/paxg_lab/paxg_lab.db")
 CHECKSUMS_FILENAME = "checksums.sha256"
 ADAPTER_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-\.]{0,127}$")
+
+MAX_MEMBER_UNCOMPRESSED_BYTES = 500 * 1024 * 1024  # 500 MB
+MAX_TOTAL_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024   # 1 GB
+SAFE_EXTENSIONS_ALLOWLIST = {".safetensors", ".json", ".sha256", ".md", ".txt"}
+FORBIDDEN_EXTENSIONS = {
+    ".bin", ".pt", ".pth", ".ckpt", ".pkl", ".pickle",
+    ".py", ".pyc", ".exe", ".bat", ".ps1", ".sh", ".cmd", ".dll", ".so"
+}
 
 
 def validate_adapter_id(adapter_id: str, base_dir: Path | None = None) -> str:
@@ -559,26 +567,22 @@ class AdapterStore:
         out_path = Path(export_zip_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        ALLOWED_EXTENSIONS = {".safetensors", ".json", ".sha256", ".md", ".txt", ".bin"}
-        DISALLOWED_EXTENSIONS = {".py", ".pyc", ".pkl", ".pickle", ".exe", ".bat", ".ps1", ".sh", ".cmd", ".dll", ".so"}
-
         with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for item in sorted(target.iterdir()):
                 if item.is_file():
                     ext = item.suffix.lower()
-                    if ext in DISALLOWED_EXTENSIONS:
+                    if ext in FORBIDDEN_EXTENSIONS:
                         continue
-                    if ext in ALLOWED_EXTENSIONS or item.name in (CHECKSUMS_FILENAME, "paxg_manifest.json", "README.md"):
+                    if ext in SAFE_EXTENSIONS_ALLOWLIST or item.name in (CHECKSUMS_FILENAME, "paxg_manifest.json", "README.md"):
                         zf.write(item, arcname=item.name)
         return out_path
 
     def import_adapter_zip(self, zip_path: str | Path, overwrite: bool = False) -> str:
-        """Safely imports an adapter from a zip file with path traversal, extension, and SHA-256 verification."""
+        """Safely imports an adapter from a zip file with path traversal, extension allowlist,
+        decompression size limits, static compatibility checks, and SHA-256 verification."""
         zp = Path(zip_path)
         if not zp.is_file():
             raise FileNotFoundError(f"Zip file not found: {zp}")
-
-        DANGEROUS_EXTENSIONS = {".py", ".pyc", ".pkl", ".pickle", ".exe", ".bat", ".ps1", ".sh", ".cmd", ".dll", ".so"}
 
         temp_dir = self.base_dir / f".tmp_import_{int(time.time() * 1000)}"
         if temp_dir.exists():
@@ -587,14 +591,50 @@ class AdapterStore:
 
         try:
             with zipfile.ZipFile(zp, "r") as zf:
-                # 1. Path traversal and extension validation
+                # 1. Inspect members: traversal, strict allowlist, and size limits (Zip bomb protection)
+                total_uncompressed = 0
                 for member in zf.infolist():
                     name = member.filename
-                    if ".." in name or name.startswith("/") or name.startswith("\\") or (len(name) > 1 and name[1] == ":"):
+                    name_norm = name.replace("\\", "/")
+                    if (
+                        ".." in name_norm
+                        or name_norm.startswith("/")
+                        or name.startswith("\\")
+                        or (len(name) > 1 and name[1] == ":")
+                        or name_norm.startswith("//")
+                        or name.startswith("\\\\")
+                    ):
                         raise ValueError(f"Path traversal detected in zip member: '{name}'")
+
+                    if name.endswith("/") or name.endswith("\\"):
+                        continue
+
                     p_name = Path(name)
-                    if p_name.suffix.lower() in DANGEROUS_EXTENSIONS:
-                        raise ValueError(f"Dangerous file extension '{p_name.suffix}' in zip member: '{name}'")
+                    ext = p_name.suffix.lower()
+
+                    # Strict allowlist: reject forbidden and non-allowlisted extensions
+                    if ext in FORBIDDEN_EXTENSIONS or ext not in SAFE_EXTENSIONS_ALLOWLIST:
+                        raise ValueError(
+                            f"Disallowed or dangerous file extension '{ext}' in zip member: '{name}'. "
+                            "Only safetensors, json, sha256, and text files are allowed."
+                        )
+
+                    # Explicit reject for PyTorch/pickle weight files (.bin, .pt, .pth)
+                    if p_name.name.lower() in ("adapter_model.bin", "pytorch_model.bin", "model.pt", "model.pth"):
+                        raise ValueError(f"Pickle/PyTorch binary weights forbidden in adapter import: '{name}'")
+
+                    # Size check per member and total
+                    if member.file_size > MAX_MEMBER_UNCOMPRESSED_BYTES:
+                        raise ValueError(
+                            f"Zip member '{name}' exceeds uncompressed size limit "
+                            f"({member.file_size} > {MAX_MEMBER_UNCOMPRESSED_BYTES} bytes)"
+                        )
+                    total_uncompressed += member.file_size
+                    if total_uncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES:
+                        raise ValueError(
+                            f"Total uncompressed archive size exceeds limit "
+                            f"({total_uncompressed} > {MAX_TOTAL_UNCOMPRESSED_BYTES} bytes)"
+                        )
 
                 # 2. Extract into temp_dir
                 zf.extractall(temp_dir)
@@ -614,12 +654,36 @@ class AdapterStore:
                 raise ValueError("Import failed: 'paxg_manifest.json' missing from zip archive.")
 
             manifest = AdapterManifest.load_json(manifest_file)
-            adapter_id = manifest.adapter_id
+            adapter_id = validate_adapter_id(manifest.adapter_id, self.base_dir)
             target_dir = self.get_adapter_path(adapter_id)
             if target_dir.exists() and not overwrite:
                 raise FileExistsError(f"Adapter '{adapter_id}' already exists. Set overwrite=True to replace.")
 
-            # 4. Verify checksums.sha256 sidecar
+            # 4. Static compatibility validation
+            if manifest.timeframe not in ("1h", "4h"):
+                raise ValueError(f"Incompatible adapter timeframe '{manifest.timeframe}'. Must be '1h' or '4h'.")
+            expected_horizon = get_horizon_for_timeframe(manifest.timeframe)
+            if manifest.horizon != expected_horizon:
+                raise ValueError(
+                    f"Incompatible adapter horizon {manifest.horizon} for timeframe '{manifest.timeframe}'. "
+                    f"Expected {expected_horizon}."
+                )
+            if manifest.context_len not in ALLOWED_CONTEXT_LENGTHS:
+                raise ValueError(
+                    f"Incompatible adapter context_len {manifest.context_len}. "
+                    f"Must be one of {ALLOWED_CONTEXT_LENGTHS}."
+                )
+            if manifest.feature_set not in ("A", "B", "C"):
+                raise ValueError(f"Incompatible adapter feature_set '{manifest.feature_set}'. Must be 'A', 'B', or 'C'.")
+            if hasattr(manifest, "base_model_repo") and manifest.base_model_repo:
+                if "timesfm" not in str(manifest.base_model_repo).lower():
+                    raise ValueError(f"Incompatible base model '{manifest.base_model_repo}'. Expected TimesFM 3.0 compatible model.")
+
+            # 5. Check mandatory files
+            if (temp_dir / "adapter_model.bin").exists():
+                raise ValueError("Pickle/PyTorch binary weights ('adapter_model.bin') forbidden in adapter import.")
+
+            # 6. Verify checksums.sha256 sidecar
             checksums_file = temp_dir / CHECKSUMS_FILENAME
             if not checksums_file.exists():
                 raise ValueError(f"Import failed: required sidecar '{CHECKSUMS_FILENAME}' missing from zip archive.")
@@ -665,7 +729,7 @@ class AdapterStore:
                 uncovered_names = sorted([str(f.relative_to(temp_dir.resolve())) for f in uncovered_files])
                 raise ValueError(f"Import failed: archive contains unverified files not covered by checksums: {uncovered_names}")
 
-            # 5. Move to canonical target
+            # 7. Move to canonical target
             if target_dir.exists() and overwrite:
                 shutil.rmtree(target_dir, ignore_errors=True)
             os.replace(temp_dir, target_dir)

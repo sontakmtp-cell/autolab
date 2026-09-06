@@ -59,7 +59,7 @@ six==1.17.0
 starlette==1.6.0
 streamlit==1.63.0
 sympy==1.14.0
--e file:///D:/AI/timesfm_b
+-e .
 tokenizers==0.23.2
 toml==0.10.2
 torch==2.12.1+cu130

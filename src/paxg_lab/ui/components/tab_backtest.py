@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import time
@@ -92,7 +93,6 @@ def render_backtest_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
             return
 
         job_id = f"bt_{timeframe}_{uuid.uuid4().hex[:8]}"
-        idempotency_key = f"bt_{timeframe}_{selected_adapter_id or 'base'}_{int(time.time() // 60)}"
 
         adapter_dir = str(adapter_store.get_adapter_path(selected_adapter_id)) if selected_adapter_id else None
         feature_set = selected_manifest.feature_set if selected_manifest else "A"
@@ -110,6 +110,10 @@ def render_backtest_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
             "include_locked_test": include_test,
             "is_base_reference": (selected_adapter_id is None),
         }
+
+        # Deterministic idempotency key: based strictly on payload inputs, without fragile minute time-bucket
+        payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        idempotency_key = f"bt_{timeframe}_{selected_adapter_id or 'base'}_{payload_hash}"
 
         job_spec = JobSpec(
             job_id=job_id,

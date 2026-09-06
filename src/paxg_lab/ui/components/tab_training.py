@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 import time
 from typing import Any
@@ -226,6 +228,13 @@ def render_training_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
             "smoke_test": True,
         }
 
+        # Deterministic idempotency key to avoid duplicate training jobs on double-submit
+        spec_json = json.dumps(train_spec.to_dict(), sort_keys=True)
+        snap_id = snapshot_path.name if snapshot_path else "none"
+        hash_input = f"{timeframe}:{snap_id}:{spec_json}"
+        train_hash = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()[:16]
+        idempotency_key = f"train_{timeframe}_{train_hash}"
+
         job_spec = JobSpec(
             job_id=job_id,
             job_type=JobType.TRAIN.value,
@@ -233,6 +242,7 @@ def render_training_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
             priority=JobPriority.MANUAL.value,
             payload=payload,
             timeout_seconds=1800.0,
+            idempotency_key=idempotency_key,
         )
 
         submitted_id = storage.submit_job(job_spec)
