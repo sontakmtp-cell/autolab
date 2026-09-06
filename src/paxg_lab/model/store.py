@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import time
 from typing import Any
+import zipfile
 
 import torch
 import torch.nn as nn
@@ -21,6 +24,7 @@ from .manifest import AdapterManifest
 logger = logging.getLogger(__name__)
 
 DEFAULT_ADAPTER_STORE_DIR = Path("var/paxg_lab/adapters")
+DEFAULT_DB_PATH = Path("var/paxg_lab/paxg_lab.db")
 CHECKSUMS_FILENAME = "checksums.sha256"
 
 
@@ -39,9 +43,16 @@ def compute_file_sha256(path: str | Path) -> str:
 class AdapterStore:
     """Manages atomic saving, loading, integrity verification, and cleanup of adapters."""
 
-    def __init__(self, base_dir: str | Path = DEFAULT_ADAPTER_STORE_DIR):
+    def __init__(
+        self,
+        base_dir: str | Path = DEFAULT_ADAPTER_STORE_DIR,
+        db_path: str | Path | None = DEFAULT_DB_PATH,
+    ):
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.db_path = Path(db_path) if db_path is not None else None
+        if self.db_path is not None:
+            self._init_registry()
 
     def get_adapter_path(self, adapter_id: str) -> Path:
         """Returns the canonical directory path for an adapter."""
@@ -324,11 +335,145 @@ class AdapterStore:
                         logger.warning("Failed to parse manifest in %s: %s", item, e)
         return manifests
 
+    def _init_registry(self) -> None:
+        """Initializes adapter_registry table in the database."""
+        if self.db_path is None:
+            return
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS adapter_registry (
+                    adapter_id TEXT PRIMARY KEY,
+                    alias TEXT,
+                    is_pinned INTEGER NOT NULL DEFAULT 0,
+                    is_recommended INTEGER NOT NULL DEFAULT 0,
+                    timeframe TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    notes TEXT NOT NULL DEFAULT ''
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_adapter_reg_tf ON adapter_registry(timeframe);")
+            conn.commit()
+
+    def get_registry_metadata(self, adapter_id: str) -> dict[str, Any]:
+        """Gets registry metadata for an adapter (alias, is_pinned, is_recommended, etc.)."""
+        if self.db_path is None:
+            return {"adapter_id": adapter_id, "alias": adapter_id, "is_pinned": False, "is_recommended": False}
+        with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM adapter_registry WHERE adapter_id = ?;", (adapter_id,))
+            row = cur.fetchone()
+            if row:
+                return {
+                    "adapter_id": row["adapter_id"],
+                    "alias": row["alias"] or row["adapter_id"],
+                    "is_pinned": bool(row["is_pinned"]),
+                    "is_recommended": bool(row["is_recommended"]),
+                    "timeframe": row["timeframe"],
+                    "created_at": row["created_at"],
+                    "notes": row["notes"],
+                }
+        return {"adapter_id": adapter_id, "alias": adapter_id, "is_pinned": False, "is_recommended": False}
+
+    def set_pinned(self, adapter_id: str, pinned: bool = True) -> None:
+        """Pins or unpins an adapter to protect from deletion."""
+        if self.db_path is None:
+            return
+        now = time.time()
+        with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            conn.execute(
+                """
+                INSERT INTO adapter_registry (adapter_id, alias, is_pinned, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(adapter_id) DO UPDATE SET is_pinned = excluded.is_pinned;
+                """,
+                (adapter_id, adapter_id, 1 if pinned else 0, now),
+            )
+            conn.commit()
+
+    def is_pinned(self, adapter_id: str) -> bool:
+        """Returns True if the adapter is pinned."""
+        meta = self.get_registry_metadata(adapter_id)
+        return bool(meta.get("is_pinned", False))
+
+    def set_alias(self, adapter_id: str, alias: str) -> None:
+        """Sets a human-readable display alias for the adapter."""
+        if self.db_path is None:
+            return
+        now = time.time()
+        with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            conn.execute(
+                """
+                INSERT INTO adapter_registry (adapter_id, alias, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(adapter_id) DO UPDATE SET alias = excluded.alias;
+                """,
+                (adapter_id, alias.strip(), now),
+            )
+            conn.commit()
+
+    def get_alias(self, adapter_id: str) -> str:
+        """Gets display alias or defaults to adapter_id."""
+        meta = self.get_registry_metadata(adapter_id)
+        return meta.get("alias") or adapter_id
+
+    def set_recommended(self, adapter_id: str, timeframe: str) -> None:
+        """Designates this adapter as the recommended winner for the timeframe.
+        
+        Automatically clears previous recommended flag for this timeframe and auto-pins it.
+        """
+        if self.db_path is None:
+            return
+        tf = timeframe.lower().strip()
+        now = time.time()
+        with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            # Clear previous recommended for this timeframe
+            conn.execute("UPDATE adapter_registry SET is_recommended = 0 WHERE timeframe = ?;", (tf,))
+            # Set this adapter as recommended and pinned
+            conn.execute(
+                """
+                INSERT INTO adapter_registry (adapter_id, alias, is_pinned, is_recommended, timeframe, created_at)
+                VALUES (?, ?, 1, 1, ?, ?)
+                ON CONFLICT(adapter_id) DO UPDATE SET
+                    is_recommended = 1,
+                    is_pinned = 1,
+                    timeframe = excluded.timeframe;
+                """,
+                (adapter_id, adapter_id, tf, now),
+            )
+            conn.commit()
+
+    def get_recommended(self, timeframe: str) -> str | None:
+        """Gets the recommended adapter ID for the given timeframe, if any."""
+        if self.db_path is None:
+            return None
+        tf = timeframe.lower().strip()
+        with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                "SELECT adapter_id FROM adapter_registry WHERE timeframe = ? AND is_recommended = 1 LIMIT 1;",
+                (tf,),
+            )
+            row = cur.fetchone()
+            if row:
+                target = self.get_adapter_path(row["adapter_id"])
+                if target.is_dir():
+                    return str(row["adapter_id"])
+        return None
+
     def delete_adapter(self, adapter_id: str, use_trash: bool = True) -> bool:
-        """Deletes or moves an adapter to trash."""
+        """Deletes or moves an adapter to trash, strictly protecting pinned or recommended adapters."""
         target = self.get_adapter_path(adapter_id)
         if not target.exists():
             return False
+
+        meta = self.get_registry_metadata(adapter_id)
+        if meta.get("is_recommended"):
+            raise ValueError(f"Không thể xóa adapter '{adapter_id}' vì đang là adapter khuyến nghị.")
+
+        if self.is_pinned(adapter_id):
+            raise ValueError(f"Không thể xóa adapter '{adapter_id}' vì đã được ghim chống xóa.")
 
         if use_trash:
             trash_dir = self.base_dir / ".trash"
@@ -340,3 +485,144 @@ class AdapterStore:
             shutil.rmtree(target, ignore_errors=True)
             logger.info("Permanently deleted adapter '%s'", adapter_id)
         return True
+
+    def restore_adapter(self, adapter_id: str) -> bool:
+        """Restores an adapter from .trash back to active adapters."""
+        target = self.get_adapter_path(adapter_id)
+        if target.exists():
+            return False
+        trash_dir = self.base_dir / ".trash"
+        if not trash_dir.exists():
+            return False
+
+        candidates = sorted(
+            [d for d in trash_dir.iterdir() if d.is_dir() and (d.name == adapter_id or d.name.startswith(f"{adapter_id}_"))],
+            key=lambda x: x.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidates:
+            return False
+
+        chosen = candidates[0]
+        os.replace(chosen, target)
+        logger.info("Restored adapter '%s' from trash (%s)", adapter_id, chosen.name)
+        return True
+
+    def list_trash_adapters(self) -> list[str]:
+        """Lists IDs of adapters currently in trash."""
+        trash_dir = self.base_dir / ".trash"
+        if not trash_dir.exists():
+            return []
+        items = []
+        for d in sorted(trash_dir.iterdir()):
+            if d.is_dir():
+                items.append(d.name)
+        return items
+
+    def export_adapter_zip(self, adapter_id: str, export_zip_path: str | Path) -> Path:
+        """Safely exports adapter files to a zip archive, strictly excluding any executable code."""
+        target = self.get_adapter_path(adapter_id)
+        if not target.is_dir():
+            raise FileNotFoundError(f"Adapter '{adapter_id}' not found at {target}")
+
+        manifest_file = target / "paxg_manifest.json"
+        if not manifest_file.exists():
+            raise FileNotFoundError(f"Manifest missing in adapter '{adapter_id}'")
+
+        out_path = Path(export_zip_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        ALLOWED_EXTENSIONS = {".safetensors", ".json", ".sha256", ".md", ".txt", ".bin"}
+        DISALLOWED_EXTENSIONS = {".py", ".pyc", ".pkl", ".pickle", ".exe", ".bat", ".ps1", ".sh", ".cmd", ".dll", ".so"}
+
+        with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for item in sorted(target.iterdir()):
+                if item.is_file():
+                    ext = item.suffix.lower()
+                    if ext in DISALLOWED_EXTENSIONS:
+                        continue
+                    if ext in ALLOWED_EXTENSIONS or item.name in (CHECKSUMS_FILENAME, "paxg_manifest.json", "README.md"):
+                        zf.write(item, arcname=item.name)
+        return out_path
+
+    def import_adapter_zip(self, zip_path: str | Path, overwrite: bool = False) -> str:
+        """Safely imports an adapter from a zip file with path traversal, extension, and SHA-256 verification."""
+        zp = Path(zip_path)
+        if not zp.is_file():
+            raise FileNotFoundError(f"Zip file not found: {zp}")
+
+        DANGEROUS_EXTENSIONS = {".py", ".pyc", ".pkl", ".pickle", ".exe", ".bat", ".ps1", ".sh", ".cmd", ".dll", ".so"}
+
+        temp_dir = self.base_dir / f".tmp_import_{int(time.time() * 1000)}"
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            with zipfile.ZipFile(zp, "r") as zf:
+                # 1. Path traversal and extension validation
+                for member in zf.infolist():
+                    name = member.filename
+                    if ".." in name or name.startswith("/") or name.startswith("\\") or (len(name) > 1 and name[1] == ":"):
+                        raise ValueError(f"Path traversal detected in zip member: '{name}'")
+                    p_name = Path(name)
+                    if p_name.suffix.lower() in DANGEROUS_EXTENSIONS:
+                        raise ValueError(f"Dangerous file extension '{p_name.suffix}' in zip member: '{name}'")
+
+                # 2. Extract into temp_dir
+                zf.extractall(temp_dir)
+
+            # Flatten if zip has a single root folder containing paxg_manifest.json
+            inner_dirs = [d for d in temp_dir.iterdir() if d.is_dir()]
+            if not (temp_dir / "paxg_manifest.json").exists() and len(inner_dirs) == 1:
+                single_sub = inner_dirs[0]
+                if (single_sub / "paxg_manifest.json").exists():
+                    for item in single_sub.iterdir():
+                        shutil.move(str(item), str(temp_dir))
+                    shutil.rmtree(single_sub, ignore_errors=True)
+
+            # 3. Check paxg_manifest.json
+            manifest_file = temp_dir / "paxg_manifest.json"
+            if not manifest_file.exists():
+                raise ValueError("Import failed: 'paxg_manifest.json' missing from zip archive.")
+
+            manifest = AdapterManifest.load_json(manifest_file)
+            adapter_id = manifest.adapter_id
+            target_dir = self.get_adapter_path(adapter_id)
+            if target_dir.exists() and not overwrite:
+                raise FileExistsError(f"Adapter '{adapter_id}' already exists. Set overwrite=True to replace.")
+
+            # 4. Verify checksums.sha256 sidecar
+            checksums_file = temp_dir / CHECKSUMS_FILENAME
+            if not checksums_file.exists():
+                raise ValueError(f"Import failed: required sidecar '{CHECKSUMS_FILENAME}' missing from zip archive.")
+
+            with open(checksums_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split(maxsplit=1)
+                    if len(parts) == 2:
+                        exp_hash, fname = parts[0].strip(), parts[1].strip()
+                        extracted_file = temp_dir / fname
+                        if not extracted_file.exists():
+                            raise FileNotFoundError(f"Missing file declared in checksums: '{fname}'")
+                        act_hash = compute_file_sha256(extracted_file)
+                        if act_hash != exp_hash:
+                            raise ValueError(f"Checksum mismatch for '{fname}': expected {exp_hash}, got {act_hash}")
+
+            # 5. Move to canonical target
+            if target_dir.exists() and overwrite:
+                shutil.rmtree(target_dir, ignore_errors=True)
+            os.replace(temp_dir, target_dir)
+
+            # Register in DB
+            self.set_alias(adapter_id, adapter_id)
+            return adapter_id
+
+        except Exception:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+

@@ -13,7 +13,7 @@ Tài liệu này theo dõi tiến độ thực hiện 8 giai đoạn (P0 đến 
 | **P2** | Base TimesFM 3.0, dự đoán 24/6 bước, backtest và Score v1 | **HOÀN THÀNH** | [docs/paxg-lab/phases/P2.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P2.md) |
 | **P3** | Huấn luyện thủ công LoRA, checkpoint tốt nhất và kho adapter | **HOÀN THÀNH** | [docs/paxg-lab/phases/P3.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P3.md) |
 | **P4** | Hàng đợi GPU một tiến trình, dừng, heartbeat, phục hồi | **HOÀN THÀNH** | [docs/paxg-lab/phases/P4.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P4.md) |
-| **P5** | Giao diện Streamlit tiếng Việt đủ 5 thẻ, biểu đồ và điều khiển | Chưa bắt đầu | [docs/paxg-lab/phases/P5.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P5.md) |
+| **P5** | Giao diện Streamlit tiếng Việt đủ 5 thẻ, biểu đồ và điều khiển | **HOÀN THÀNH** | [docs/paxg-lab/phases/P5.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P5.md) |
 | **P6** | Tự động tối ưu Optuna TPE, kiểm chứng kín, công nhận LoRA thắng | Chưa bắt đầu | [docs/paxg-lab/phases/P6.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P6.md) |
 | **P7** | Chạy dài (>6h), kiểm tra rò rỉ, xử lý sự cố, bàn giao hoàn chỉnh | Chưa bắt đầu | [docs/paxg-lab/phases/P7.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P7.md) |
 
@@ -143,12 +143,45 @@ Tài liệu này theo dõi tiến độ thực hiện 8 giai đoạn (P0 đến 
 8. **Kiểm thử tự động:**
    - **63 tests collected: 63 passed** (`pytest tests/paxg_lab/ -v`), 100% pass rate.
 
+### Tại P5:
+1. **Giao diện Streamlit Tiếng Việt Đủ 5 Thẻ Chuẩn PLAN 5.1-5.6:**
+   - **Thẻ 1 (Dự đoán tương lai - `tab_forecast`):** Chuyển đổi linh hoạt Base TimesFM 3.0 và các LoRA adapter tương thích; thanh trượt số nến lịch sử (96-512); form điều khiển chống F5 gửi đúp; biểu đồ Plotly candlestick kết hợp đường trung vị $q_{50}$ và dải bất định danh nghĩa 80% $[q_{10}, q_{90}]$; bảng kết quả chi tiết đúng 24 nến (1h) hoặc 6 nến (4h) kèm chênh lệch giá và %; lưu và xem lịch sử dự đoán.
+   - **Thẻ 2 (Backtest & Đánh giá - `tab_backtest`):** Chọn mô hình đánh giá (Base vs LoRA), chọn fold kiểm định (Fold 1, Fold 2, Fold 3); phát hiện cảnh báo rò rỉ in-sample; thẻ tóm tắt Score v1, MAE, Pinball, Direction Accuracy; bảng so sánh trực diện 3 bên (Candidate vs Base vs Naive); xuất báo cáo JSON và CSV.
+   - **Thẻ 3 (Huấn luyện thủ công LoRA - `tab_training`):** Bảng điều khiển siêu tham số khóa chặt theo quy tắc PLAN 3.2 (context length 256/512, feature set A/B/C, rank 4/8/16, alpha 8/16/32, lr, epochs 1-10, batch 1/2/4, gradient accumulation); thẻ preflight kiểm tra VRAM & RAM an toàn trước khi khởi tạo; nút Dừng an toàn (Graceful stop); thanh tiến trình và biểu đồ loss (train loss vs validation loss) cập nhật trực quan.
+   - **Thẻ 4 (Tự động tìm kiếm & Tối ưu - `tab_auto_tune`):** Hiển thị máy trạng thái `AutoRunState` (SEARCHING, VALIDATING, WAITING_DATA...); nút Bắt đầu / Tạm dừng tự động; bảng xếp hạng Leaderboard các adapter tốt nhất; nhật ký kiểm toán (Audit Trail) chi tiết từng quyết định; chức năng gửi job kiểm thử khô (dry-run test).
+   - **Thẻ 5 (Quản lý Adapter - `tab_adapter_manager`):** Lọc theo khung thời gian (1h/4h); ghim bảo vệ (pin/unpin); đổi tên gợi nhớ (alias); gắn nhãn khuyến nghị (recommended); xuất gói `.zip` an toàn (loại trừ code/python); tải lên & nhập zip an toàn (chặn path traversal `..`, cấm `.py`/`.pkl`, kiểm tra SHA-256 sidecar checksums); đưa vào thùng rác (`.trash/`) và khôi phục khi cần; cơ chế Deletion Protection chống xóa adapter đang được ghim hoặc khuyến nghị.
+2. **Quy ước Horizon Bắt buộc 24 Giờ & Múi giờ Việt Nam (UTC+7):**
+   - Header hiển thị banner bắt buộc: 1h dự đoán 24 nến (24 giờ), 4h dự đoán 6 nến (24 giờ).
+   - Mọi mốc thời gian hiển thị trên giao diện người dùng chuyển đổi chuẩn xác sang múi giờ Việt Nam (`Asia/Ho_Chi_Minh` UTC+7).
+3. **Phân tách Tuyệt đối Streamlit và Tính toán GPU:**
+   - Streamlit không bao giờ nạp trọng số mô hình hoặc chạy autograd trực tiếp.
+   - Toàn bộ tác vụ suy luận, huấn luyện, backtest được gửi dưới dạng `JobSpec` vào SQLite job queue (`var/paxg_lab/paxg_lab.db`) và được điều phối bởi `GPUScheduler` độc lập.
+   - Tránh hoàn toàn xung đột VRAM, crash tiến trình web hay rò rỉ bộ nhớ.
+4. **Cơ chế Chống Gửi Trùng lặp & Bảo vệ Trạng thái qua `st.form`:**
+   - Mọi hành động gửi tác vụ được bọc trong `st.form` với khóa phân biệt theo session/timestamp.
+   - Khi người dùng F5 hoặc mở nhiều tab trình duyệt, `idempotency_key` và trạng thái session ngăn chặn tuyệt đối việc tạo job lặp hoặc phá vỡ hàng đợi.
+5. **Khởi động Một Bước & Khóa Cổng Cục bộ (`127.0.0.1:8501`):**
+   - Bộ khởi động `scripts/launch_app.py`, `run_web.bat`, `run_web.ps1` chạy đồng thời `GPUScheduler` nền và giao diện Streamlit.
+   - Cấu hình bắt buộc `--server.address=127.0.0.1 --server.port=8501 --server.fileWatcherType=none --browser.gatherUsageStats=false`.
+6. **Kiểm thử Trình duyệt Tự động & Bằng chứng Nghiệm thu Hoàn chỉnh:**
+   - Kiểm thử Playwright trên Chrome thật không đầu (`scripts/verify_p5_browser.py`) đã xác thực toàn bộ 5 thẻ, chụp ảnh minh chứng đầy đủ trong `docs/paxg-lab/phases/p5_evidence/`:
+     - `p5_tab1_forecast_1h_24steps.png`
+     - `p5_tab1_forecast_4h_6steps.png`
+     - `p5_tab2_backtest.png`
+     - `p5_tab3_training.png`
+     - `p5_tab4_auto_tune.png`
+     - `p5_tab5_adapter_manager.png`
+     - Báo cáo JSON: `docs/paxg-lab/phases/p5_evidence/p5_browser_evidence.json`.
+7. **Kiểm thử Đơn vị & Hồi quy:**
+   - Bộ 9 bài kiểm thử `tests/paxg_lab/test_p5_web.py` đạt **9/9 passed (100%)**.
+   - Toàn bộ 102 bài kiểm thử hệ thống `tests/paxg_lab/` đạt **102/102 passed (100%)**.
+
 ---
 
-## 3. Lệnh tiếp tục cho giai đoạn tiếp theo (P5)
+## 3. Lệnh tiếp tục cho giai đoạn tiếp theo (P6)
 
-Sau khi nghiệm thu P4, chuyển sang P5 bằng lệnh:
+Sau khi nghiệm thu P5, chuyển sang P6 bằng lệnh:
 
 ```text
-/goal Đọc bộ tài liệu docs/paxg-lab và thực hiện P5: web Streamlit tiếng Việt đủ năm thẻ, hai chế độ 1h/24 nến và 4h/6 nến, biểu đồ và chọn base/LoRA. Kết nối hàng đợi có sẵn, kiểm tra toàn bộ luồng trên trình duyệt và tạo lệnh mở một bước. Chỉ hoàn thành P5.
+/goal Đọc bộ tài liệu docs/paxg-lab và thực hiện P6: tự tối ưu bằng Optuna TPE, backtest nhiều đoạn, kiểm chứng kín, công nhận LoRA thắng và chờ dữ liệu mới. Dùng horizon theo khung và tối thiểu 20 khối độc lập dài 24 giờ. Kiểm thử rò rỉ, phục hồi và chạy một đợt thật có giới hạn; chỉ hoàn thành P6.
 ```

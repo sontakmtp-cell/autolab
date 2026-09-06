@@ -7,10 +7,14 @@ SYMBOL: Final[str] = "PAXGUSDT"
 MODEL_REPO: Final[str] = "google/timesfm-3.0-pytorch"
 MODEL_REVISION: Final[str] = "43046b85ec22d584a13f8098c2ed39c889e129c2"
 
+# Timeframes
+TIMEFRAME_1H: Final[str] = "1h"
+TIMEFRAME_4H: Final[str] = "4h"
+
 # Mandatory horizon convention
 TIMEFRAME_HORIZONS: Final[dict[str, int]] = {
-    "1h": 24,  # 24 candles = 24 hours
-    "4h": 6,   # 6 candles = 24 hours
+    TIMEFRAME_1H: 24,  # 24 candles = 24 hours
+    TIMEFRAME_4H: 6,   # 6 candles = 24 hours
 }
 
 DEFAULT_CONTEXT_LENGTH: Final[int] = 256

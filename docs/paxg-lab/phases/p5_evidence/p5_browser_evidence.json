@@ -1,0 +1,24 @@
+{
+  "timestamp": 1788675010.8159525,
+  "url": "http://127.0.0.1:8501",
+  "browser": "Google Chrome (Headless)",
+  "checks": {
+    "header_and_title": true,
+    "all_five_tabs_present": true,
+    "horizon_1h_24steps": true,
+    "horizon_4h_6steps": true,
+    "tab2_backtest": true,
+    "tab3_training": true,
+    "tab4_auto_tune": true,
+    "tab5_adapter_manager": true,
+    "multi_tab_and_reload_safe": true
+  },
+  "screenshots": {
+    "tab1_forecast_1h": "p5_tab1_forecast_1h_24steps.png",
+    "tab1_forecast_4h": "p5_tab1_forecast_4h_6steps.png",
+    "tab2_backtest": "p5_tab2_backtest.png",
+    "tab3_training": "p5_tab3_training.png",
+    "tab4_auto_tune": "p5_tab4_auto_tune.png",
+    "tab5_adapter_manager": "p5_tab5_adapter_manager.png"
+  }
+}
