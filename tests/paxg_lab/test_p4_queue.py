@@ -1451,7 +1451,7 @@ def test_coordinator_lease_takeover_prevents_stale_renewal(temp_db_path: Path):
 def get_or_create_test_snapshot(tmp_path: Path, timeframe: str = "4h") -> Path:
     """Returns an existing snapshot or synthesizes a cryptographically valid snapshot for CI."""
     candidates = list(Path("var/paxg_lab/snapshots").glob(f"paxgusdt_{timeframe}_*"))
-    if candidates:
+    if candidates and not os.environ.get("FORCE_SYNTHETIC_SNAPSHOT"):
         return candidates[0]
 
     import numpy as np
@@ -1459,10 +1459,10 @@ def get_or_create_test_snapshot(tmp_path: Path, timeframe: str = "4h") -> Path:
     from paxg_lab.data.features import build_features
     from paxg_lab.data.snapshot import DatasetSnapshot
 
-    n_rows = 600
-    base_ts = 1700000000
-    step_sec = 14400 if timeframe == "4h" else 3600
-    timestamps = [base_ts + i * step_sec for i in range(n_rows)]
+    n_rows = 2000 if timeframe == "4h" else 5000
+    base_ts_ms = 1700000000000
+    step_ms = (14400 if timeframe == "4h" else 3600) * 1000
+    timestamps = [base_ts_ms + i * step_ms for i in range(n_rows)]
     rng = np.random.default_rng(42)
     prices = 2000.0 + np.cumsum(rng.normal(0, 2, n_rows))
     df = pd.DataFrame({
@@ -1472,7 +1472,7 @@ def get_or_create_test_snapshot(tmp_path: Path, timeframe: str = "4h") -> Path:
         "low": prices - 2.0,
         "close": prices,
         "volume": rng.uniform(10, 100, n_rows),
-        "close_time": [t + step_sec - 1 for t in timestamps],
+        "close_time": [t + step_ms - 1 for t in timestamps],
         "quote_volume": rng.uniform(20000, 200000, n_rows),
         "count": rng.integers(50, 500, n_rows),
         "taker_buy_volume": rng.uniform(5, 50, n_rows),
@@ -1542,6 +1542,7 @@ def test_backtest_job_e2e_base_and_lora(temp_db_path: Path, tmp_path: Path):
             payload={
                 "snapshot_path": str(snap_4h),
                 "adapter_store_dir": str(adapter_store_dir),
+                "checkpoint_dir": str(tmp_path / "checkpoints_backtest_train"),
                 "smoke_test": False,
                 "train_spec": {
                     "timeframe": "4h",
@@ -1619,6 +1620,7 @@ def test_train_spec_full_hyperparameters_and_history_all(temp_db_path: Path, tmp
             payload={
                 "snapshot_path": str(snap_4h),
                 "adapter_store_dir": str(adapter_store_dir),
+                "checkpoint_dir": str(tmp_path / "checkpoints_spec_all"),
                 "smoke_test": False,
                 "train_spec": {
                     "timeframe": "4h",
