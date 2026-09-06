@@ -18,6 +18,9 @@ from safetensors import safe_open
 import torch
 import torch.nn as nn
 from peft import PeftModel
+import warnings
+
+from timesfm import TimesFM3Torch
 
 from ..constants import (
     ALLOWED_CONTEXT_LENGTHS,
@@ -35,6 +38,18 @@ DEFAULT_ADAPTER_STORE_DIR = Path("var/paxg_lab/adapters")
 DEFAULT_DB_PATH = Path("var/paxg_lab/paxg_lab.db")
 CHECKSUMS_FILENAME = "checksums.sha256"
 ADAPTER_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-\.]{0,127}$")
+
+CANONICAL_TIMESFM3_PROJECTION_DIM = 1280
+CANONICAL_TIMESFM3_NUM_LAYERS = 20
+CANONICAL_TIMESFM3_ATTN_TYPES = ("seq_attn", "var_attn")
+CANONICAL_TIMESFM3_TARGET_MODULE_DIMS: dict[str, tuple[int, int]] = {
+    "query_proj": (CANONICAL_TIMESFM3_PROJECTION_DIM, CANONICAL_TIMESFM3_PROJECTION_DIM),
+    "value_proj": (CANONICAL_TIMESFM3_PROJECTION_DIM, CANONICAL_TIMESFM3_PROJECTION_DIM),
+    "key_proj": (CANONICAL_TIMESFM3_PROJECTION_DIM, CANONICAL_TIMESFM3_PROJECTION_DIM),
+    "out_proj": (CANONICAL_TIMESFM3_PROJECTION_DIM, CANONICAL_TIMESFM3_PROJECTION_DIM),
+    "dense_h_to_4h": (CANONICAL_TIMESFM3_PROJECTION_DIM, 5120),
+    "dense_4h_to_h": (5120, CANONICAL_TIMESFM3_PROJECTION_DIM),
+}
 
 MAX_MEMBER_UNCOMPRESSED_BYTES = 500 * 1024 * 1024  # 500 MB
 MAX_TOTAL_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024   # 1 GB
@@ -83,12 +98,24 @@ def compute_file_sha256(path: str | Path) -> str:
 
 def validate_lora_weights_semantics(safetensors_path: Path, peft_cfg: dict) -> None:
     """Validates that a safetensors file contains a valid, well-formed LoRA state dict
-    matching the configured rank r and target_modules."""
+    matching the configured rank r, canonical TimesFM 3.0 dimensions, and target_modules."""
     expected_r = peft_cfg.get("r")
+    if not isinstance(expected_r, int) or expected_r <= 0:
+        raise ValueError(f"Invalid rank r in LoRA config: must be a positive integer, got '{expected_r}'.")
+
     target_modules = peft_cfg.get("target_modules", [])
     if isinstance(target_modules, str):
         target_modules = [target_modules]
     target_modules_set = set(target_modules) if target_modules else set()
+    if not target_modules_set:
+        raise ValueError("LoRA config must define non-empty 'target_modules'.")
+
+    for tm in target_modules_set:
+        if tm not in CANONICAL_TIMESFM3_TARGET_MODULE_DIMS:
+            raise ValueError(
+                f"Target module '{tm}' is not a valid canonical module in TimesFM 3.0. "
+                f"Expected one of: {sorted(CANONICAL_TIMESFM3_TARGET_MODULE_DIMS.keys())}."
+            )
 
     with safe_open(str(safetensors_path), framework="pt") as f:
         keys = list(f.keys())
@@ -125,7 +152,7 @@ def validate_lora_weights_semantics(safetensors_path: Path, peft_cfg: dict) -> N
                 f"Adapter weights in '{safetensors_path.name}' do not contain both lora_A and lora_B tensors."
             )
 
-        # Verify A and B pairs match and verify rank r
+        # Verify A and B pairs match and verify rank r & dimensions against canonical architecture
         all_prefixes = set(lora_a_modules.keys()) | set(lora_b_modules.keys())
         for prefix in all_prefixes:
             if prefix not in lora_a_modules:
@@ -133,41 +160,52 @@ def validate_lora_weights_semantics(safetensors_path: Path, peft_cfg: dict) -> N
             if prefix not in lora_b_modules:
                 raise ValueError(f"Missing matching lora_B tensor for LoRA module: '{prefix}'")
 
+            arch_match = re.match(
+                r"^base_model\.model\.transformer_stack\.layers\.(\d+)\.(seq_attn|var_attn)\.([a-zA-Z0-9_]+)$",
+                prefix,
+            )
+            if not arch_match:
+                raise ValueError(
+                    f"LoRA module prefix '{prefix}' does not conform to canonical TimesFM 3.0 hierarchy."
+                )
+
+            layer_idx = int(arch_match.group(1))
+            attn_type = arch_match.group(2)
+            mod_name = arch_match.group(3)
+
+            if not (0 <= layer_idx < CANONICAL_TIMESFM3_NUM_LAYERS):
+                raise ValueError(
+                    f"Layer index {layer_idx} in '{prefix}' exceeds canonical TimesFM 3.0 layers (0..{CANONICAL_TIMESFM3_NUM_LAYERS - 1})."
+                )
+
+            if mod_name not in target_modules_set:
+                raise ValueError(
+                    f"LoRA module '{prefix}' targets '{mod_name}', which does not match any configured target_modules: {sorted(target_modules_set)}."
+                )
+
+            exp_in, exp_out = CANONICAL_TIMESFM3_TARGET_MODULE_DIMS[mod_name]
             k_a, shape_a = lora_a_modules[prefix]
             k_b, shape_b = lora_b_modules[prefix]
 
-            if shape_a[0] != expected_r:
+            if shape_a != (expected_r, exp_in):
                 raise ValueError(
-                    f"Rank mismatch in '{k_a}': expected rank {expected_r}, got shape {shape_a}."
+                    f"Dimension mismatch in '{k_a}': expected shape ({expected_r}, {exp_in}) for TimesFM 3.0 '{mod_name}', got {shape_a}."
                 )
-            if shape_b[1] != expected_r:
+            if shape_b != (exp_out, expected_r):
                 raise ValueError(
-                    f"Rank mismatch in '{k_b}': expected rank {expected_r}, got shape {shape_b}."
+                    f"Dimension mismatch in '{k_b}': expected shape ({exp_out}, {expected_r}) for TimesFM 3.0 '{mod_name}', got {shape_b}."
                 )
 
-            # Check that module prefix targets one of the configured target_modules
-            if target_modules_set:
-                matched_target = any(
-                    prefix.endswith(f".{tm}") or prefix == tm or f".{tm}." in prefix
-                    for tm in target_modules_set
-                )
-                if not matched_target:
-                    raise ValueError(
-                        f"LoRA module '{prefix}' does not match any configured target_modules: {sorted(target_modules_set)}."
-                    )
-
-        # Verify all configured target_modules are covered in weights
-        if target_modules_set:
-            covered_targets = set()
-            for tm in target_modules_set:
-                for prefix in lora_a_modules.keys():
-                    if prefix.endswith(f".{tm}") or prefix == tm or f".{tm}." in prefix:
-                        covered_targets.add(tm)
-            missing_targets = target_modules_set - covered_targets
-            if missing_targets:
-                raise ValueError(
-                    f"Missing LoRA weights for configured target_modules: {sorted(missing_targets)}."
-                )
+        # Verify all configured target_modules are fully covered across all 20 layers and both attention mechanisms
+        for tm in target_modules_set:
+            if tm in ("query_proj", "value_proj", "key_proj", "out_proj"):
+                for l_idx in range(CANONICAL_TIMESFM3_NUM_LAYERS):
+                    for attn in CANONICAL_TIMESFM3_ATTN_TYPES:
+                        expected_prefix = f"base_model.model.transformer_stack.layers.{l_idx}.{attn}.{tm}"
+                        if expected_prefix not in lora_a_modules:
+                            raise ValueError(
+                                f"Missing canonical LoRA weights: module '{expected_prefix}' was not found in '{safetensors_path.name}'."
+                            )
 
 
 class AdapterStore:
@@ -809,12 +847,26 @@ class AdapterStore:
             # 4.6. Validate semantic structure of LoRA PEFT weights (A/B pairs, rank r, target_modules)
             validate_lora_weights_semantics(temp_dir / "adapter_model.safetensors", peft_cfg)
 
-            # 4.7. If base_model provided, test real load compatibility
-            if base_model is not None:
-                try:
-                    load_lora_adapter(base_model, temp_dir)
-                except Exception as err:
-                    raise ValueError(f"Failed to load adapter weights into base model: {err}") from err
+            # 4.7. Live PEFT Compatibility Verification (GPU-free, 0 VRAM, instant)
+            # Even when base_model is None (the default Web UI / service path),
+            # verify loading into TimesFM3Torch on meta device.
+            # This rigorously proves that PeftModel.from_pretrained executes cleanly
+            # with zero shape mismatches and zero missing adapter keys.
+            test_model = base_model
+            if test_model is None:
+                with torch.device("meta"):
+                    test_model = TimesFM3Torch()
+
+            try:
+                with warnings.catch_warnings(record=True) as recorded_warnings:
+                    warnings.simplefilter("always")
+                    PeftModel.from_pretrained(test_model, str(temp_dir))
+                    for w in recorded_warnings:
+                        w_str = str(w.message)
+                        if "missing adapter keys" in w_str.lower() or "not present in the checkpoint" in w_str.lower():
+                            raise ValueError(f"Incompatible LoRA adapter: checkpoint is missing declared adapter keys: {w_str}")
+            except Exception as err:
+                raise ValueError(f"Adapter failed TimesFM 3.0 PEFT compatibility verification: {err}") from err
 
             # 5. Check paxg_manifest.json and enforce strict base model provenance
             manifest_file = temp_dir / "paxg_manifest.json"

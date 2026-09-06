@@ -40,11 +40,14 @@ def make_valid_lora_safetensors_bytes(
     in_dim: int = 1280,
     out_dim: int = 1280,
     target_modules: tuple[str, ...] = ("query_proj", "value_proj"),
+    num_layers: int = 20,
 ) -> bytes:
     tensors = {}
-    for tm in target_modules:
-        tensors[f"base_model.model.transformer_stack.layers.0.seq_attn.{tm}.lora_A.weight"] = torch.zeros(r, in_dim)
-        tensors[f"base_model.model.transformer_stack.layers.0.seq_attn.{tm}.lora_B.weight"] = torch.zeros(out_dim, r)
+    for l_idx in range(num_layers):
+        for attn in ("seq_attn", "var_attn"):
+            for tm in target_modules:
+                tensors[f"base_model.model.transformer_stack.layers.{l_idx}.{attn}.{tm}.lora_A.weight"] = torch.zeros(r, in_dim)
+                tensors[f"base_model.model.transformer_stack.layers.{l_idx}.{attn}.{tm}.lora_B.weight"] = torch.zeros(out_dim, r)
     return safetensors.torch.save(tensors)
 
 
@@ -1296,59 +1299,83 @@ def test_safe_zip_import_rejects_semantic_lora_weights_mismatches(tmp_path: Path
             zf.writestr("checksums.sha256", chk)
         return zpath
 
-    # 1. Rank mismatch: tensor has rank 2 but config expects rank 4
-    bad_rank_tensors = {
-        "base_model.model.transformer_stack.layers.0.seq_attn.query_proj.lora_A.weight": torch.zeros(2, 1280),
-        "base_model.model.transformer_stack.layers.0.seq_attn.query_proj.lora_B.weight": torch.zeros(1280, 4),
-        "base_model.model.transformer_stack.layers.0.seq_attn.value_proj.lora_A.weight": torch.zeros(4, 1280),
-        "base_model.model.transformer_stack.layers.0.seq_attn.value_proj.lora_B.weight": torch.zeros(1280, 4),
-    }
-    zip_bad_rank = make_custom_zip("bad_rank_tensors.zip", bad_rank_tensors)
-    with pytest.raises(ValueError, match="Rank mismatch"):
-        store.import_adapter_zip(zip_bad_rank)
-    assert not store.get_adapter_path(base_manifest["adapter_id"]).exists()
+    def assert_not_registered(adapter_id: str):
+        assert not store.get_adapter_path(adapter_id).exists()
+        with sqlite3.connect(str(db_path)) as conn:
+            cur = conn.execute("SELECT 1 FROM adapter_registry WHERE adapter_id = ?;", (adapter_id,))
+            assert cur.fetchone() is None
 
-    # 2. Missing lora_B for value_proj
-    missing_b_tensors = {
-        "base_model.model.transformer_stack.layers.0.seq_attn.query_proj.lora_A.weight": torch.zeros(4, 1280),
-        "base_model.model.transformer_stack.layers.0.seq_attn.query_proj.lora_B.weight": torch.zeros(1280, 4),
-        "base_model.model.transformer_stack.layers.0.seq_attn.value_proj.lora_A.weight": torch.zeros(4, 1280),
-    }
+    # 1. Incompatible in_dim/out_dim: shapes (4, 1) and (1, 4) instead of (4, 1280) and (1280, 4)
+    bad_dims_tensors = {}
+    for l_idx in range(20):
+        for attn in ("seq_attn", "var_attn"):
+            for tm in ("query_proj", "value_proj"):
+                bad_dims_tensors[f"base_model.model.transformer_stack.layers.{l_idx}.{attn}.{tm}.lora_A.weight"] = torch.zeros(4, 1)
+                bad_dims_tensors[f"base_model.model.transformer_stack.layers.{l_idx}.{attn}.{tm}.lora_B.weight"] = torch.zeros(1, 4)
+    zip_bad_dims = make_custom_zip("bad_dims_tensors.zip", bad_dims_tensors)
+    with pytest.raises(ValueError, match="Dimension mismatch|compatibility"):
+        store.import_adapter_zip(zip_bad_dims)
+    assert_not_registered(base_manifest["adapter_id"])
+
+    # 2. Rank mismatch: tensor has rank 2 but config expects rank 4
+    bad_rank_tensors = {}
+    for l_idx in range(20):
+        for attn in ("seq_attn", "var_attn"):
+            for tm in ("query_proj", "value_proj"):
+                bad_rank_tensors[f"base_model.model.transformer_stack.layers.{l_idx}.{attn}.{tm}.lora_A.weight"] = torch.zeros(2, 1280)
+                bad_rank_tensors[f"base_model.model.transformer_stack.layers.{l_idx}.{attn}.{tm}.lora_B.weight"] = torch.zeros(1280, 4)
+    zip_bad_rank = make_custom_zip("bad_rank_tensors.zip", bad_rank_tensors)
+    with pytest.raises(ValueError, match="Dimension mismatch|Rank mismatch|compatibility"):
+        store.import_adapter_zip(zip_bad_rank)
+    assert_not_registered(base_manifest["adapter_id"])
+
+    # 3. Missing lora_B for value_proj
+    missing_b_tensors = {}
+    for l_idx in range(20):
+        for attn in ("seq_attn", "var_attn"):
+            missing_b_tensors[f"base_model.model.transformer_stack.layers.{l_idx}.{attn}.query_proj.lora_A.weight"] = torch.zeros(4, 1280)
+            missing_b_tensors[f"base_model.model.transformer_stack.layers.{l_idx}.{attn}.query_proj.lora_B.weight"] = torch.zeros(1280, 4)
+            missing_b_tensors[f"base_model.model.transformer_stack.layers.{l_idx}.{attn}.value_proj.lora_A.weight"] = torch.zeros(4, 1280)
     zip_missing_b = make_custom_zip("missing_b_tensors.zip", missing_b_tensors)
     with pytest.raises(ValueError, match="Missing matching lora_B tensor"):
         store.import_adapter_zip(zip_missing_b)
-    assert not store.get_adapter_path(base_manifest["adapter_id"]).exists()
+    assert_not_registered(base_manifest["adapter_id"])
 
-    # 3. Wrong target module (unconfigured module dense_h_to_4h)
-    wrong_mod_tensors = {
-        "base_model.model.transformer_stack.layers.0.dense_h_to_4h.lora_A.weight": torch.zeros(4, 1280),
-        "base_model.model.transformer_stack.layers.0.dense_h_to_4h.lora_B.weight": torch.zeros(1280, 4),
-        "base_model.model.transformer_stack.layers.0.seq_attn.value_proj.lora_A.weight": torch.zeros(4, 1280),
-        "base_model.model.transformer_stack.layers.0.seq_attn.value_proj.lora_B.weight": torch.zeros(1280, 4),
-    }
-    zip_wrong_mod = make_custom_zip("wrong_mod_tensors.zip", wrong_mod_tensors)
-    with pytest.raises(ValueError, match="does not match any configured target_modules"):
-        store.import_adapter_zip(zip_wrong_mod)
-    assert not store.get_adapter_path(base_manifest["adapter_id"]).exists()
-
-    # 4. Missing one of configured target modules (missing value_proj entirely)
-    missing_mod_tensors = {
+    # 4. Missing canonical layers (only layer 0 provided out of 20)
+    missing_layers_tensors = {
         "base_model.model.transformer_stack.layers.0.seq_attn.query_proj.lora_A.weight": torch.zeros(4, 1280),
         "base_model.model.transformer_stack.layers.0.seq_attn.query_proj.lora_B.weight": torch.zeros(1280, 4),
+        "base_model.model.transformer_stack.layers.0.seq_attn.value_proj.lora_A.weight": torch.zeros(4, 1280),
+        "base_model.model.transformer_stack.layers.0.seq_attn.value_proj.lora_B.weight": torch.zeros(1280, 4),
+        "base_model.model.transformer_stack.layers.0.var_attn.query_proj.lora_A.weight": torch.zeros(4, 1280),
+        "base_model.model.transformer_stack.layers.0.var_attn.query_proj.lora_B.weight": torch.zeros(1280, 4),
+        "base_model.model.transformer_stack.layers.0.var_attn.value_proj.lora_A.weight": torch.zeros(4, 1280),
+        "base_model.model.transformer_stack.layers.0.var_attn.value_proj.lora_B.weight": torch.zeros(1280, 4),
     }
-    zip_missing_mod = make_custom_zip("missing_mod_tensors.zip", missing_mod_tensors)
-    with pytest.raises(ValueError, match="Missing LoRA weights for configured target_modules"):
-        store.import_adapter_zip(zip_missing_mod)
-    assert not store.get_adapter_path(base_manifest["adapter_id"]).exists()
+    zip_missing_layers = make_custom_zip("missing_layers.zip", missing_layers_tensors)
+    with pytest.raises(ValueError, match="Missing canonical LoRA weights|missing declared adapter keys"):
+        store.import_adapter_zip(zip_missing_layers)
+    assert_not_registered(base_manifest["adapter_id"])
 
-    # 5. Positive case: Real TimesFM3 model load compatibility test
+    # 5. Wrong target module (unconfigured module dense_h_to_4h)
+    wrong_mod_tensors = {}
+    for l_idx in range(20):
+        for attn in ("seq_attn", "var_attn"):
+            wrong_mod_tensors[f"base_model.model.transformer_stack.layers.{l_idx}.{attn}.dense_h_to_4h.lora_A.weight"] = torch.zeros(4, 1280)
+            wrong_mod_tensors[f"base_model.model.transformer_stack.layers.{l_idx}.{attn}.dense_h_to_4h.lora_B.weight"] = torch.zeros(5120, 4)
+    zip_wrong_mod = make_custom_zip("wrong_mod_tensors.zip", wrong_mod_tensors)
+    with pytest.raises(ValueError, match="which does not match any configured target_modules|does not conform"):
+        store.import_adapter_zip(zip_wrong_mod)
+    assert_not_registered(base_manifest["adapter_id"])
+
+    # 6. Positive case: Real PEFT package generated from TimesFM3Torch goes through EXACT Web import path (base_model=None)
     from timesfm import TimesFM3Torch
     from paxg_lab.model.lora import build_lora_timesfm3, load_lora_adapter
 
     base_model = TimesFM3Torch()
     real_peft_model = build_lora_timesfm3(base_model, lora_r=4, lora_alpha=8)
 
-    real_adapter_id = "paxg_1h_real_loadable"
+    real_adapter_id = "paxg_1h_real_web_import"
     real_manifest_data = {**base_manifest, "adapter_id": real_adapter_id}
     real_m_bytes = json.dumps(real_manifest_data).encode("utf-8")
 
@@ -1362,19 +1389,23 @@ def test_safe_zip_import_rejects_semantic_lora_weights_mismatches(tmp_path: Path
             f"{hashlib.sha256(real_s_bytes).hexdigest()}  adapter_model.safetensors\n"
             f"{hashlib.sha256(real_c_bytes).hexdigest()}  adapter_config.json\n"
         )
-        real_zip = tmp_path / "real_peft_package.zip"
+        real_zip = tmp_path / "real_peft_web_package.zip"
         with zipfile.ZipFile(real_zip, "w") as zf:
             zf.writestr("paxg_manifest.json", real_m_bytes)
             zf.writestr("adapter_model.safetensors", real_s_bytes)
             zf.writestr("adapter_config.json", real_c_bytes)
             zf.writestr("checksums.sha256", real_chk)
 
-    # Import with explicit base_model verification
-    fresh_base = TimesFM3Torch()
-    imported_id = store.import_adapter_zip(real_zip, base_model=fresh_base)
+    # Import via EXACT DEFAULT Web path (base_model=None)
+    imported_id = store.import_adapter_zip(real_zip)
     assert imported_id == real_adapter_id
 
-    # Verify adapter loads cleanly into TimesFM3 model without error
+    # Verified that registry row is created ONLY after compatibility validation succeeded
+    reg_meta = store.get_registry_metadata(real_adapter_id)
+    assert reg_meta.get("adapter_id") == real_adapter_id
+
+    # Verify adapter loads cleanly into fresh TimesFM3 model without warning or error
+    fresh_base = TimesFM3Torch()
     loaded_adapter = load_lora_adapter(fresh_base, store.get_adapter_path(imported_id))
     assert loaded_adapter is not None
 
