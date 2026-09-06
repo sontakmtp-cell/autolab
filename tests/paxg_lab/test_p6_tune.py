@@ -2198,7 +2198,7 @@ def test_stopped_race_condition_never_resurrects_or_enqueues(temp_dir: Path, moc
         job_type=JobType.AUTO_TRIAL.value,
         timeframe="1h",
         priority=JobPriority.AUTO.value,
-        payload={"timeframe": "1h"},
+        payload={"timeframe": "1h", "snapshot_path": str(temp_dir)},
         status=JobStatus.QUEUED.value,
     )
     storage.submit_job(job)
