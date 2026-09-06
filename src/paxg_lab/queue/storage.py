@@ -73,6 +73,36 @@ class GPUJobStorage:
                     value TEXT NOT NULL,
                     updated_at REAL NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS locked_verification_ledger (
+                    timeframe TEXT NOT NULL,
+                    test_start_idx INTEGER NOT NULL,
+                    test_end_idx INTEGER NOT NULL,
+                    snapshot_hash TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    consumed_at REAL NOT NULL,
+                    verdict TEXT NOT NULL,
+                    PRIMARY KEY (timeframe, test_start_idx, test_end_idx, snapshot_hash)
+                );
+
+                CREATE TABLE IF NOT EXISTS auto_tune_runs (
+                    timeframe TEXT PRIMARY KEY,
+                    snapshot_path TEXT NOT NULL,
+                    snapshot_hash TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    current_trial INTEGER NOT NULL DEFAULT 0,
+                    max_trials INTEGER NOT NULL DEFAULT 30,
+                    best_trial_num INTEGER,
+                    best_score REAL,
+                    best_spec_json TEXT,
+                    best_epoch INTEGER,
+                    multi_seed_results_json TEXT,
+                    final_candidate_id TEXT,
+                    final_candidate_path TEXT,
+                    last_consumed_candles INTEGER,
+                    last_run_completed_at REAL,
+                    updated_at REAL NOT NULL
+                );
             """)
 
     def submit_job(self, job_spec: JobSpec, reject_if_stopped: bool = False) -> str:
@@ -207,6 +237,16 @@ class GPUJobStorage:
             cur = conn.execute(" ".join(query), params)
             rows = cur.fetchall()
             return [JobSpec.from_row(dict(r)) for r in rows]
+
+    def list_recent_jobs(
+        self,
+        status: str | None = None,
+        job_type: str | None = None,
+        timeframe: str | None = None,
+        limit: int = 50,
+    ) -> list[JobSpec]:
+        """Convenience alias for list_jobs."""
+        return self.list_jobs(status=status, job_type=job_type, timeframe=timeframe, limit=limit)
 
     def acquire_next_job(self, last_auto_timeframe: str | None = None) -> JobSpec | None:
         """Atomically selects and marks the next eligible job as RUNNING.
@@ -644,4 +684,123 @@ class GPUJobStorage:
                 except Exception:
                     return None
             return None
+
+    def is_locked_range_consumed(
+        self,
+        timeframe: str,
+        test_start_idx: int,
+        test_end_idx: int,
+        snapshot_hash: str,
+    ) -> bool:
+        """Checks if a locked verification test range has already been consumed."""
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT 1 FROM locked_verification_ledger
+                WHERE timeframe = ? AND test_start_idx = ? AND test_end_idx = ? AND snapshot_hash = ?;
+                """,
+                (timeframe, test_start_idx, test_end_idx, snapshot_hash),
+            )
+            return cur.fetchone() is not None
+
+    def record_locked_consumption(
+        self,
+        timeframe: str,
+        test_start_idx: int,
+        test_end_idx: int,
+        snapshot_hash: str,
+        candidate_id: str,
+        verdict: str = "PENDING",
+    ) -> None:
+        """Atomically records consumption of a locked verification test range into the audit ledger."""
+        now = time.time()
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(
+                """
+                INSERT INTO locked_verification_ledger (
+                    timeframe, test_start_idx, test_end_idx, snapshot_hash, candidate_id, consumed_at, verdict
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(timeframe, test_start_idx, test_end_idx, snapshot_hash)
+                DO UPDATE SET candidate_id = excluded.candidate_id, consumed_at = excluded.consumed_at, verdict = excluded.verdict;
+                """,
+                (timeframe, test_start_idx, test_end_idx, snapshot_hash, candidate_id, now, verdict),
+            )
+            conn.commit()
+
+    def get_auto_tune_run(self, timeframe: str) -> dict[str, Any] | None:
+        """Retrieves persistent state of an ongoing autonomous tuning run for timeframe."""
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM auto_tune_runs WHERE timeframe = ?;
+                """,
+                (timeframe,),
+            )
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+            return None
+
+    def save_auto_tune_run(
+        self,
+        timeframe: str,
+        snapshot_path: str,
+        snapshot_hash: str,
+        phase: str,
+        current_trial: int = 0,
+        max_trials: int = 30,
+        best_trial_num: int | None = None,
+        best_score: float | None = None,
+        best_spec_json: str | None = None,
+        best_epoch: int | None = None,
+        multi_seed_results_json: str | None = None,
+        final_candidate_id: str | None = None,
+        final_candidate_path: str | None = None,
+        last_consumed_candles: int | None = None,
+        last_run_completed_at: float | None = None,
+    ) -> None:
+        """Upserts persistent state of an autonomous tuning run."""
+        now = time.time()
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(
+                """
+                INSERT INTO auto_tune_runs (
+                    timeframe, snapshot_path, snapshot_hash, phase, current_trial, max_trials,
+                    best_trial_num, best_score, best_spec_json, best_epoch, multi_seed_results_json,
+                    final_candidate_id, final_candidate_path, last_consumed_candles, last_run_completed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(timeframe) DO UPDATE SET
+                    snapshot_path = excluded.snapshot_path,
+                    snapshot_hash = excluded.snapshot_hash,
+                    phase = excluded.phase,
+                    current_trial = excluded.current_trial,
+                    max_trials = excluded.max_trials,
+                    best_trial_num = COALESCE(excluded.best_trial_num, auto_tune_runs.best_trial_num),
+                    best_score = COALESCE(excluded.best_score, auto_tune_runs.best_score),
+                    best_spec_json = COALESCE(excluded.best_spec_json, auto_tune_runs.best_spec_json),
+                    best_epoch = COALESCE(excluded.best_epoch, auto_tune_runs.best_epoch),
+                    multi_seed_results_json = COALESCE(excluded.multi_seed_results_json, auto_tune_runs.multi_seed_results_json),
+                    final_candidate_id = COALESCE(excluded.final_candidate_id, auto_tune_runs.final_candidate_id),
+                    final_candidate_path = COALESCE(excluded.final_candidate_path, auto_tune_runs.final_candidate_path),
+                    last_consumed_candles = COALESCE(excluded.last_consumed_candles, auto_tune_runs.last_consumed_candles),
+                    last_run_completed_at = COALESCE(excluded.last_run_completed_at, auto_tune_runs.last_run_completed_at),
+                    updated_at = excluded.updated_at;
+                """,
+                (
+                    timeframe, snapshot_path, snapshot_hash, phase, current_trial, max_trials,
+                    best_trial_num, best_score, best_spec_json, best_epoch, multi_seed_results_json,
+                    final_candidate_id, final_candidate_path, last_consumed_candles, last_run_completed_at, now,
+                ),
+            )
+            conn.commit()
+
+    def reset_auto_tune_run(self, timeframe: str) -> None:
+        """Resets the auto tune run state for a fresh tuning cycle."""
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute("DELETE FROM auto_tune_runs WHERE timeframe = ?;", (timeframe,))
+            conn.commit()
+
 

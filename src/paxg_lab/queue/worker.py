@@ -19,7 +19,7 @@ from typing import Any
 import psutil
 
 from .storage import GPUJobStorage
-from .types import JobPriority, JobSpec, JobStatus, JobType
+from .types import AutoRunState, JobPriority, JobSpec, JobStatus, JobType
 
 logging.basicConfig(
     level=logging.INFO,
@@ -506,14 +506,47 @@ class GPUWorker:
             db_path=self.storage.db_path,
         )
 
+        run_entire_cycle = bool(payload.get("run_entire_cycle", False))
+
         try:
-            run_result = protocol.run_tuning_cycle(
-                max_trials=max_trials,
-                is_cancelled_func=lambda: self.stop_event.is_set(),
-                progress_callback=progress_cb,
-                fast_dev_mode=fast_dev_mode,
-            )
-            return run_result if isinstance(run_result, dict) else run_result.to_dict()
+            if run_entire_cycle:
+                run_result = protocol.run_tuning_cycle(
+                    max_trials=max_trials,
+                    is_cancelled_func=lambda: self.stop_event.is_set(),
+                    progress_callback=progress_cb,
+                    fast_dev_mode=fast_dev_mode,
+                )
+                return run_result if isinstance(run_result, dict) else run_result.to_dict()
+            else:
+                step_res = protocol.execute_step(
+                    max_trials=max_trials,
+                    is_cancelled_func=lambda: self.stop_event.is_set(),
+                    progress_callback=progress_cb,
+                    fast_dev_mode=fast_dev_mode,
+                )
+                current_phase = step_res.get("phase")
+                auto_state = self.storage.get_auto_run_state(timeframe)
+
+                # If tuning cycle has remaining steps and auto run is active, submit next step to queue
+                if current_phase != "WAITING_DATA" and auto_state in (AutoRunState.SEARCHING, AutoRunState.VALIDATING):
+                    next_job_id = f"auto_step_{timeframe}_{int(time.time() * 1000)}"
+                    next_spec = JobSpec(
+                        job_id=next_job_id,
+                        job_type=JobType.AUTO_TRIAL.value,
+                        timeframe=timeframe,
+                        priority=JobPriority.AUTO.value,
+                        payload={
+                            "timeframe": timeframe,
+                            "snapshot_path": snapshot_path,
+                            "max_trials": max_trials,
+                            "fast_dev_mode": fast_dev_mode,
+                        },
+                        timeout_seconds=1200.0,
+                    )
+                    self.storage.submit_job(next_spec)
+                    logger.info("Submitted next bounded auto job '%s' (phase=%s, priority=%d)", next_job_id, current_phase, next_spec.priority)
+
+                return step_res
         except InterruptedError as int_err:
             logger.info("Auto tuning job '%s' cancelled: %s", job.job_id, int_err)
             return {"status": "cancelled", "message": str(int_err)}

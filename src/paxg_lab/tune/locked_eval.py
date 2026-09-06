@@ -84,18 +84,14 @@ def run_locked_verification(
     candidate_adapter_path: Path | str,
     store: AdapterStore | None = None,
     batch_size: int = 16,
+    storage: Any | None = None,
 ) -> LockedVerificationReport:
     """Executes single-pass evaluation strictly on the locked test set [test_start, test_end).
 
-    Args:
-        snapshot: DatasetSnapshot containing full historical data.
-        candidate_manifest: Manifest of the candidate adapter to evaluate.
-        candidate_adapter_path: Path to the candidate adapter directory.
-        store: AdapterStore instance to look up current recommended model.
-        batch_size: Batch size for GPU inference.
-
-    Returns:
-        LockedVerificationReport containing all locked metrics required by Gatekeeper.
+    Enforces:
+    - Statistical lock: test range must not be re-evaluated if already consumed in ledger
+    - Forecast origin alignment: all models evaluated strictly on common forecast origins
+    - Contemporaneous baseline: current recommended adapter evaluated on the exact same locked set
     """
     timeframe = str(candidate_manifest.timeframe).lower().strip()
     horizon = get_horizon_for_timeframe(timeframe)
@@ -108,6 +104,27 @@ def run_locked_verification(
     )
     test_start = split_plan.test_start
     test_end = split_plan.test_end
+    snapshot_hash = ""
+    if hasattr(snapshot, "metadata") and hasattr(snapshot.metadata, "sha256"):
+        snapshot_hash = str(snapshot.metadata.sha256)
+
+    # 1. Enforce statistical lock via SQLite audit ledger
+    if storage is not None:
+        if storage.is_locked_range_consumed(timeframe, test_start, test_end, snapshot_hash):
+            raise RuntimeError(
+                f"Statistical lock violation: locked verification range [{test_start}, {test_end}) "
+                f"for timeframe '{timeframe}' and snapshot hash '{snapshot_hash[:8]}' has already been consumed. "
+                "Refusing to reuse locked exam for another candidate."
+            )
+        # Atomically mark consumption before inference begins
+        storage.record_locked_consumption(
+            timeframe=timeframe,
+            test_start_idx=test_start,
+            test_end_idx=test_end,
+            snapshot_hash=snapshot_hash,
+            candidate_id=candidate_manifest.adapter_id,
+            verdict="IN_PROGRESS",
+        )
 
     logger.info(
         "Starting locked test verification for %s [%d, %d) on candidate '%s'...",
@@ -122,7 +139,7 @@ def run_locked_verification(
     targets = snapshot.features_a[:, 0]
     timestamps = snapshot.timestamps
 
-    # 1. Partition locked test set into 3 consecutive stability segments
+    # 2. Partition locked test set into 3 consecutive stability segments
     total_test_candles = test_end - test_start
     seg_size = total_test_candles // 3
     segments = [
@@ -131,8 +148,8 @@ def run_locked_verification(
         ("seg3", test_start + 2 * seg_size, test_end),
     ]
 
-    # 2. Extract full test sliding windows
-    cand_ctx, cand_fut, cand_origins = extract_windows(
+    # 3. Extract candidate & base raw test sliding windows
+    cand_ctx_raw, cand_fut_raw, cand_origins = extract_windows(
         features=features,
         targets=targets,
         context_len=candidate_manifest.context_len,
@@ -143,7 +160,7 @@ def run_locked_verification(
         timestamps=timestamps,
         timeframe=timeframe,
     )
-    base_ctx, base_fut, base_origins = extract_windows(
+    base_ctx_raw, base_fut_raw, base_origins = extract_windows(
         features=base_features,
         targets=targets,
         context_len=256,
@@ -155,43 +172,18 @@ def run_locked_verification(
         timeframe=timeframe,
     )
 
-    if len(cand_ctx) == 0:
-        raise ValueError(f"No test windows could be extracted for range [{test_start}, {test_end}).")
-
-    # 3. Single-pass candidate inference on locked test set
-    cand_predictor = TimesFM3Predictor(adapter_path=candidate_adapter_path)
-    cand_preds, cand_quantiles = cand_predictor.predict(
-        contexts=cand_ctx,
-        horizon=horizon,
-        batch_size=batch_size,
-    )
-
-    # 4. Single-pass Base reference inference on locked test set
-    base_predictor = TimesFM3Predictor()
-    base_preds, base_quantiles = base_predictor.predict(
-        contexts=base_ctx,
-        horizon=horizon,
-        batch_size=batch_size,
-    )
-
-    # 5. Naive flat baseline on locked test set
-    origin_prices = np.asarray([targets[orig] for orig in cand_origins], dtype=np.float64)
-    naive_preds = np.repeat(origin_prices[:, np.newaxis], horizon, axis=1)
-
-    # 6. Evaluate Current Recommended adapter if one exists in store
+    # 4. Extract current recommended adapter windows if present in store
     current_rec_id = store.get_recommended(timeframe) if store else None
-    current_rec_score = 0.0
-    rec_preds = None
-    baseline_name = "TimesFM3-Base"
-
+    rec_ctx_raw = None
+    rec_fut_raw = None
+    rec_origins = None
+    rec_path = None
     if current_rec_id and store:
         try:
             rec_path = store.get_adapter_path(current_rec_id)
             rec_manifest = AdapterManifest.load_json(rec_path / "paxg_manifest.json")
-            current_rec_score = float(rec_manifest.metrics.get("score_v1", 0.0))
-
             rec_feat = snapshot.get_features(rec_manifest.feature_set)
-            rec_ctx, _, _ = extract_windows(
+            rec_ctx_raw, rec_fut_raw, rec_origins = extract_windows(
                 features=rec_feat,
                 targets=targets,
                 context_len=rec_manifest.context_len,
@@ -202,22 +194,82 @@ def run_locked_verification(
                 timestamps=timestamps,
                 timeframe=timeframe,
             )
+        except Exception as exc:
+            logger.warning("Could not extract windows for current recommended adapter '%s': %s", current_rec_id, exc)
+            rec_ctx_raw = None
+            rec_origins = None
+            rec_path = None
+
+    # 5. Intersect common forecast origins across candidate, base, and current recommended
+    common_set = set(cand_origins) & set(base_origins)
+    if rec_origins is not None:
+        common_set = common_set & set(rec_origins)
+
+    common_origins = sorted(common_set)
+    if len(common_origins) == 0:
+        raise ValueError(
+            f"No common forecast origins across candidate, base, and recommended models in [{test_start}, {test_end})."
+        )
+
+    # Filter all context and target arrays strictly to common origins
+    cand_orig_to_idx = {orig: i for i, orig in enumerate(cand_origins)}
+    base_orig_to_idx = {orig: i for i, orig in enumerate(base_origins)}
+    cand_indices = [cand_orig_to_idx[orig] for orig in common_origins]
+    base_indices = [base_orig_to_idx[orig] for orig in common_origins]
+
+    cand_ctx = cand_ctx_raw[cand_indices]
+    cand_fut = cand_fut_raw[cand_indices]
+    base_ctx = base_ctx_raw[base_indices]
+
+    rec_ctx = None
+    if rec_ctx_raw is not None and rec_origins is not None:
+        rec_orig_to_idx = {orig: i for i, orig in enumerate(rec_origins)}
+        rec_indices = [rec_orig_to_idx[orig] for orig in common_origins]
+        rec_ctx = rec_ctx_raw[rec_indices]
+
+    # 6. Candidate inference
+    cand_predictor = TimesFM3Predictor(adapter_path=candidate_adapter_path)
+    cand_preds, cand_quantiles = cand_predictor.predict(
+        contexts=cand_ctx,
+        horizon=horizon,
+        batch_size=batch_size,
+    )
+
+    # 7. Base reference inference
+    base_predictor = TimesFM3Predictor()
+    base_preds, base_quantiles = base_predictor.predict(
+        contexts=base_ctx,
+        horizon=horizon,
+        batch_size=batch_size,
+    )
+
+    # 8. Current recommended inference (if exists)
+    rec_preds = None
+    rec_quantiles = None
+    baseline_name = "TimesFM3-Base"
+    if rec_ctx is not None and rec_path is not None:
+        try:
             rec_predictor = TimesFM3Predictor(adapter_path=rec_path)
-            rec_preds, _ = rec_predictor.predict(
+            rec_preds, rec_quantiles = rec_predictor.predict(
                 contexts=rec_ctx,
                 horizon=horizon,
                 batch_size=batch_size,
             )
             baseline_name = current_rec_id
-            logger.info("Loaded current recommended adapter '%s' for bootstrap baseline comparison.", current_rec_id)
+            logger.info("Contemporaneous evaluation of recommended adapter '%s' on %d windows.", current_rec_id, len(rec_preds))
         except Exception as exc:
-            logger.warning("Could not evaluate current recommended adapter '%s': %s", current_rec_id, exc)
+            logger.warning("Inference failed for recommended adapter '%s': %s", current_rec_id, exc)
             rec_preds = None
+            rec_quantiles = None
             baseline_name = "TimesFM3-Base"
+
+    # 9. Naive flat baseline on common origins
+    origin_prices = np.asarray([targets[orig] for orig in common_origins], dtype=np.float64)
+    naive_preds = np.repeat(origin_prices[:, np.newaxis], horizon, axis=1)
 
     bootstrap_baseline_preds = rec_preds if rec_preds is not None else base_preds
 
-    # 7. Overall MAE and metric computations
+    # 10. Overall MAE and metric computations
     cand_weighted_mae = calculate_weighted_mae(cand_preds, cand_fut, weights)
     base_weighted_mae = calculate_weighted_mae(base_preds, cand_fut, weights)
     naive_weighted_mae = calculate_weighted_mae(naive_preds, cand_fut, weights)
@@ -226,13 +278,14 @@ def run_locked_verification(
     mae_vs_base_ratio = cand_weighted_mae / max(base_weighted_mae, 1e-6)
     mae_vs_naive_ratio = cand_weighted_mae / max(naive_weighted_mae, 1e-6)
 
-    # 8. Stability segment analysis (3 segments) and composite Score v1
+    # 11. Stability segment analysis (3 segments) & Contemporaneous Score v1
     segment_mae_ratios = {}
     segment_losses = []
+    rec_segment_losses = []
 
-    cand_origins_arr = np.asarray(cand_origins, dtype=np.int64)
+    origins_arr = np.asarray(common_origins, dtype=np.int64)
     for seg_name, s_start, s_end in segments:
-        seg_mask = (cand_origins_arr >= s_start) & (cand_origins_arr < s_end)
+        seg_mask = (origins_arr >= s_start) & (origins_arr < s_end)
         if not np.any(seg_mask):
             continue
         c_seg_preds = cand_preds[seg_mask]
@@ -253,17 +306,34 @@ def run_locked_verification(
         segment_mae_ratios[seg_name] = float(ratio_mae)
         segment_losses.append(float(composite_l))
 
+        # Contemporaneous composite loss for current recommended model on the same segment
+        if rec_preds is not None and rec_quantiles is not None:
+            r_seg_preds = rec_preds[seg_mask]
+            r_seg_quant = rec_quantiles[seg_mask]
+            r_seg_mae = calculate_weighted_mae(r_seg_preds, t_seg_fut, weights)
+            r_seg_pinball = calculate_weighted_pinball_loss(r_seg_quant, t_seg_fut, weights)
+            r_ratio_mae = r_seg_mae / max(b_seg_mae, 1e-6)
+            r_ratio_pinball = r_seg_pinball / max(b_seg_pinball, 1e-6)
+            r_composite_l = 0.70 * r_ratio_mae + 0.30 * r_ratio_pinball
+            rec_segment_losses.append(float(r_composite_l))
+
     worst_segment_ratio = max(segment_mae_ratios.values()) if segment_mae_ratios else 1.0
     locked_score_v1 = compute_score_v1(segment_losses) if segment_losses else 0.0
+
+    if rec_segment_losses:
+        current_rec_score = compute_score_v1(rec_segment_losses)
+    else:
+        current_rec_score = 0.0
+
     score_diff = locked_score_v1 - current_rec_score
 
-    # 9. Uncertainty coverage & step metrics
+    # 12. Uncertainty coverage & step metrics
     cov_80 = calculate_coverage_80(cand_quantiles, cand_fut)
     width_80 = calculate_mean_width_80(cand_quantiles)
     dir_acc = calculate_directional_accuracy(cand_preds, cand_fut, origin_prices)
     step_maes = calculate_step_mae(cand_preds, cand_fut, timeframe=timeframe)
 
-    # 10. Non-overlapping 24h independent blocks & Block Bootstrap CI
+    # 13. Non-overlapping 24h independent blocks & Block Bootstrap CI
     bootstrap_res = compute_block_bootstrap_ci(
         candidate_predictions=cand_preds,
         baseline_predictions=bootstrap_baseline_preds,

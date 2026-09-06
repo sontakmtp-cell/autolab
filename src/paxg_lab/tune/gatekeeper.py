@@ -263,16 +263,44 @@ class LoRAGatekeeper:
                     self.store.export_adapter_zip(cid, backup_zip)
                     backup_path_str = str(backup_zip)
 
-                    # Reopen and strictly verify backup zip integrity and manifest
+                    # Reopen and strictly verify backup zip integrity, checksums sidecar, and files
+                    import hashlib
                     with zipfile.ZipFile(backup_zip, "r") as zf:
                         bad_file = zf.testzip()
                         if bad_file is not None:
                             raise ValueError(f"Corrupted file in backup zip: {bad_file}")
-                        names = zf.namelist()
-                        if not any("paxg_manifest.json" in n for n in names):
+                        names = set(zf.namelist())
+                        if "paxg_manifest.json" not in names:
                             raise FileNotFoundError("Backup zip missing paxg_manifest.json")
-                        if not any("checksums.sha256" in n for n in names):
+                        if "checksums.sha256" not in names:
                             raise FileNotFoundError("Backup zip missing checksums.sha256")
+                        if "adapter_model.safetensors" not in names:
+                            raise FileNotFoundError("Backup zip missing adapter_model.safetensors")
+                        if "adapter_config.json" not in names:
+                            raise FileNotFoundError("Backup zip missing adapter_config.json")
+
+                        # Parse checksums.sha256 and verify every entry against archived bytes
+                        cs_content = zf.read("checksums.sha256").decode("utf-8")
+                        verified_count = 0
+                        for line in cs_content.splitlines():
+                            line = line.strip()
+                            if not line or line.startswith("#"):
+                                continue
+                            parts = line.split(maxsplit=1)
+                            if len(parts) == 2:
+                                exp_hash, item_name = parts[0].strip(), parts[1].strip()
+                                if item_name not in names:
+                                    raise FileNotFoundError(f"File '{item_name}' in checksums.sha256 missing from backup zip.")
+                                file_bytes = zf.read(item_name)
+                                actual_hash = hashlib.sha256(file_bytes).hexdigest()
+                                if actual_hash != exp_hash:
+                                    raise ValueError(
+                                        f"Checksum mismatch for '{item_name}' in backup zip: "
+                                        f"expected {exp_hash}, got {actual_hash}"
+                                    )
+                                verified_count += 1
+                        if verified_count == 0:
+                            raise ValueError("checksums.sha256 in backup zip contained 0 valid checksum entries.")
 
                 check_smoke_backup = True
             except Exception as exc:

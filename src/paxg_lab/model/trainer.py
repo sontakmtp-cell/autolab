@@ -8,7 +8,7 @@ import logging
 import math
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -99,6 +99,7 @@ class LoRATrainer:
         fold_id: int | str = 1,
         explicit_train_range: tuple[int, int] | None = None,
         explicit_val_range: tuple[int, int] | None = None,
+        fixed_epochs: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
         """Prepares leak-free sliding training and validation early-stopping windows.
 
@@ -144,6 +145,12 @@ class LoRATrainer:
                     f"context={self.spec.context_len}, horizon={self.spec.horizon} in range [{train_start}, {train_end}]."
                 )
 
+        if fixed_epochs:
+            val_ctx = np.empty((0, self.spec.context_len, feat_matrix.shape[1]), dtype=np.float32)
+            val_fut = np.empty((0, self.spec.horizon), dtype=np.float32)
+            val_origins = np.empty((0,), dtype=np.int64)
+            selected_fold_id = fold_id
+        elif explicit_train_range is not None:
             # 4. Extract validation windows
             if explicit_val_range is not None:
                 val_start, val_end = explicit_val_range
@@ -284,6 +291,8 @@ class LoRATrainer:
         job_id: str | None = None,
         explicit_train_range: tuple[int, int] | None = None,
         explicit_val_range: tuple[int, int] | None = None,
+        fixed_epochs: bool = False,
+        is_cancelled_func: Callable[[], bool] | None = None,
     ) -> TrainingResult:
         """Runs the complete training loop, early stopping, and best checkpoint restoration."""
         start_wall_time = time.time()
@@ -318,6 +327,7 @@ class LoRATrainer:
             fold_id=fold_id,
             explicit_train_range=explicit_train_range,
             explicit_val_range=explicit_val_range,
+            fixed_epochs=fixed_epochs,
         )
 
         num_train_samples = len(train_ctx)
@@ -515,6 +525,11 @@ class LoRATrainer:
                     optimizer.zero_grad()
 
                     # Fine-grained step-level stop check as mandated by PLAN 4.2
+                    if is_cancelled_func is not None and is_cancelled_func():
+                        logger.info("Training stopped by is_cancelled_func at step %d (epoch %d).", global_step, epoch)
+                        stop_requested = True
+                        break
+
                     if progress_callback is not None:
                         step_record = {
                             "epoch": epoch,
@@ -585,78 +600,109 @@ class LoRATrainer:
                         )
                     except Exception as ckpt_err:
                         logger.warning("Failed to save stopped checkpoint: %s", ckpt_err)
+                else:
+                    if is_cancelled_func is not None and is_cancelled_func():
+                        raise InterruptedError("Training interrupted by cancellation request.")
                 break
 
             avg_train_loss = epoch_loss_sum / max(1, epoch_loss_batches)
             final_train_loss = avg_train_loss
 
-            # Validation phase on 14-day early stop segment
-            peft_model.eval()
-            val_loss_sum = 0.0
-            val_batches = 0
-            val_batch_size = max(self.spec.batch_size * 2, 4)
-
-            with torch.no_grad():
-                for v_i in range(0, len(val_ctx), val_batch_size):
-                    v_ctx_np = val_ctx[v_i : v_i + val_batch_size]
-                    v_fut_np = val_fut[v_i : v_i + val_batch_size]
-
-                    v_ctx_tensor = torch.from_numpy(np.transpose(v_ctx_np, (0, 2, 1))).to(self.device)
-                    v_fut_tensor = torch.from_numpy(v_fut_np).to(self.device)
-                    v_p0 = v_ctx_tensor[:, 0, -1]
-
-                    v_preds = self._forward_pass(peft_model, v_ctx_tensor)
-                    v_loss, _ = combined_forecast_loss(
-                        predictions=v_preds,
-                        targets=v_fut_tensor,
-                        last_context_price=v_p0,
-                    )
-                    val_loss_sum += v_loss.item()
-                    val_batches += 1
-
-            avg_val_loss = val_loss_sum / max(1, val_batches)
-            epoch_duration = time.time() - epoch_start
-
-            epoch_record = {
-                "epoch": epoch,
-                "train_loss": avg_train_loss,
-                "val_loss": avg_val_loss,
-                "learning_rate": scheduler.get_last_lr()[0],
-                "duration_sec": epoch_duration,
-            }
-            history.append(epoch_record)
-
-            logger.info(
-                "Epoch %d/%d: train_loss=%.6f, val_loss=%.6f, lr=%.2e (%.1fs)",
-                epoch,
-                self.spec.max_epochs,
-                avg_train_loss,
-                avg_val_loss,
-                scheduler.get_last_lr()[0],
-                epoch_duration,
-            )
-
-            # Early stopping check
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
+            if fixed_epochs:
+                avg_val_loss = avg_train_loss
+                best_val_loss = avg_train_loss
                 best_epoch = epoch
-                patience_counter = 0
-                # Snapshot best LoRA weights to host CPU memory
                 best_lora_state = {
                     k: v.cpu().clone()
                     for k, v in peft_model.state_dict().items()
                     if "lora" in k.lower()
                 }
-                logger.info("  --> New best validation loss: %.6f at epoch %d", best_val_loss, best_epoch)
-            else:
-                patience_counter += 1
+                epoch_duration = time.time() - epoch_start
+                epoch_record = {
+                    "epoch": epoch,
+                    "train_loss": avg_train_loss,
+                    "val_loss": avg_val_loss,
+                    "learning_rate": scheduler.get_last_lr()[0],
+                    "duration_sec": epoch_duration,
+                }
+                history.append(epoch_record)
                 logger.info(
-                    "  --> No improvement in val_loss. Patience: %d/%d",
-                    patience_counter,
-                    self.spec.early_stopping_patience,
+                    "Epoch %d/%d (fixed-epochs): train_loss=%.6f, lr=%.2e (%.1fs)",
+                    epoch,
+                    self.spec.max_epochs,
+                    avg_train_loss,
+                    scheduler.get_last_lr()[0],
+                    epoch_duration,
                 )
-                if patience_counter >= self.spec.early_stopping_patience:
-                    logger.info("Early stopping triggered at epoch %d.", epoch)
+            else:
+                # Validation phase on 14-day early stop segment
+                peft_model.eval()
+                val_loss_sum = 0.0
+                val_batches = 0
+                val_batch_size = max(self.spec.batch_size * 2, 4)
+
+                with torch.no_grad():
+                    for v_i in range(0, len(val_ctx), val_batch_size):
+                        v_ctx_np = val_ctx[v_i : v_i + val_batch_size]
+                        v_fut_np = val_fut[v_i : v_i + val_batch_size]
+
+                        v_ctx_tensor = torch.from_numpy(np.transpose(v_ctx_np, (0, 2, 1))).to(self.device)
+                        v_fut_tensor = torch.from_numpy(v_fut_np).to(self.device)
+                        v_p0 = v_ctx_tensor[:, 0, -1]
+
+                        v_preds = self._forward_pass(peft_model, v_ctx_tensor)
+                        v_loss, _ = combined_forecast_loss(
+                            predictions=v_preds,
+                            targets=v_fut_tensor,
+                            last_context_price=v_p0,
+                        )
+                        val_loss_sum += v_loss.item()
+                        val_batches += 1
+
+                avg_val_loss = val_loss_sum / max(1, val_batches)
+                epoch_duration = time.time() - epoch_start
+
+                epoch_record = {
+                    "epoch": epoch,
+                    "train_loss": avg_train_loss,
+                    "val_loss": avg_val_loss,
+                    "learning_rate": scheduler.get_last_lr()[0],
+                    "duration_sec": epoch_duration,
+                }
+                history.append(epoch_record)
+
+                logger.info(
+                    "Epoch %d/%d: train_loss=%.6f, val_loss=%.6f, lr=%.2e (%.1fs)",
+                    epoch,
+                    self.spec.max_epochs,
+                    avg_train_loss,
+                    avg_val_loss,
+                    scheduler.get_last_lr()[0],
+                    epoch_duration,
+                )
+
+                # Early stopping check
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    best_epoch = epoch
+                    patience_counter = 0
+                    # Snapshot best LoRA weights to host CPU memory
+                    best_lora_state = {
+                        k: v.cpu().clone()
+                        for k, v in peft_model.state_dict().items()
+                        if "lora" in k.lower()
+                    }
+                    logger.info("  --> New best validation loss: %.6f at epoch %d", best_val_loss, best_epoch)
+                else:
+                    patience_counter += 1
+                    logger.info(
+                        "  --> No improvement in val_loss. Patience: %d/%d",
+                        patience_counter,
+                        self.spec.early_stopping_patience,
+                    )
+                    if patience_counter >= self.spec.early_stopping_patience:
+                        logger.info("Early stopping triggered at epoch %d.", epoch)
+                        break
             if checkpoint_manager is not None and job_id is not None:
                 try:
                     f_spec = FEATURE_SPECS[self.spec.feature_set]

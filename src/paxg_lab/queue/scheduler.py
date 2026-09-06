@@ -13,6 +13,7 @@ Enforces:
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 from pathlib import Path
@@ -211,6 +212,37 @@ class GPUScheduler:
                 self.active_job_id = running_job.job_id
                 self.active_worker_pid = pid
                 self.active_worker_create_time = ctime
+        # Check active auto run recovery on startup (PLAN 4.2 & P6)
+        for tf in ("1h", "4h"):
+            try:
+                run_state = self.storage.get_auto_tune_run(tf)
+                if run_state is not None:
+                    auto_state = self.storage.get_auto_run_state(tf)
+                    if auto_state in (AutoRunState.SEARCHING, AutoRunState.VALIDATING):
+                        recent = self.storage.list_recent_jobs(job_type=JobType.AUTO_TRIAL.value, timeframe=tf, limit=5)
+                        has_active = any(j.status in (JobStatus.QUEUED.value, JobStatus.RUNNING.value) for j in recent)
+                        if not has_active:
+                            snap_dir = Path("var/paxg_lab/snapshots")
+                            candidates = sorted(snap_dir.glob(f"paxgusdt_{tf}_*"))
+                            snap_path = str(candidates[-1]) if candidates else ""
+                            resume_job_id = f"auto_step_{tf}_resume_{int(time.time() * 1000)}"
+                            resumed_spec = JobSpec(
+                                job_id=resume_job_id,
+                                job_type=JobType.AUTO_TRIAL.value,
+                                timeframe=tf,
+                                priority=JobPriority.AUTO.value,
+                                payload={"timeframe": tf, "snapshot_path": snap_path},
+                                timeout_seconds=1200.0,
+                            )
+                            self.storage.submit_job(resumed_spec)
+                            logger.info(
+                                "Startup Recovery: Auto mode was in %s for %s. Enqueued resumption job '%s'.",
+                                auto_state.value,
+                                tf,
+                                resume_job_id,
+                            )
+            except Exception as exc:
+                logger.warning("Error in auto tune startup recovery for %s: %s", tf, exc)
 
         return recovered_ids
 
@@ -337,6 +369,9 @@ class GPUScheduler:
                         self.active_worker_create_time = None
                         return
 
+        # Check auto wake-up for WAITING_DATA timeframes when >= 7 days of new data arrives
+        self._check_auto_tune_data_wakeup()
+
         # 2. Dispatch next job if no worker is active and scheduler is error-free
         if self.scheduler_error is None and self.active_worker is None and self.active_worker_pid is None:
             next_job = self.storage.acquire_next_job(last_auto_timeframe=self.last_auto_timeframe)
@@ -457,6 +492,68 @@ class GPUScheduler:
             self.active_worker_pid = None
             self.active_worker_create_time = None
             return False
+
+    def _check_auto_tune_data_wakeup(self) -> None:
+        """Checks if timeframes in WAITING_DATA have accumulated >= 7 days of new data.
+
+        If >= 7 days of new candles have arrived since the last completed auto run
+        (168 candles for 1h, 42 candles for 4h), resets the auto run and enqueues a new
+        AUTO_TRIAL step, transitioning state back to SEARCHING.
+        """
+        thresholds = {"1h": 168, "4h": 42}
+        snap_dir = Path("var/paxg_lab/snapshots")
+        if not snap_dir.exists():
+            return
+
+        for tf, req_new_candles in thresholds.items():
+            try:
+                auto_state = self.storage.get_auto_run_state(tf)
+                if auto_state != AutoRunState.WAITING_DATA:
+                    continue
+
+                recent = self.storage.list_recent_jobs(job_type=JobType.AUTO_TRIAL.value, timeframe=tf, limit=5)
+                if any(j.status in (JobStatus.QUEUED.value, JobStatus.RUNNING.value) for j in recent):
+                    continue
+
+                run_state = self.storage.get_auto_tune_run(tf)
+                if not run_state:
+                    continue
+
+                last_consumed = run_state.get("last_consumed_candles")
+                if last_consumed is None:
+                    continue
+
+                candidates = sorted(snap_dir.glob(f"paxgusdt_{tf}_*"))
+                if not candidates:
+                    continue
+                latest_snap = candidates[-1]
+                meta_file = latest_snap / "metadata.json"
+                if not meta_file.exists():
+                    continue
+
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                curr_candles = meta.get("total_candles", 0)
+
+                new_candles = curr_candles - last_consumed
+                if new_candles >= req_new_candles:
+                    logger.info(
+                        "Auto wake-up: %s has %d new candles (>= threshold %d). Requeuing auto tune.",
+                        tf, new_candles, req_new_candles,
+                    )
+                    self.storage.reset_auto_tune_run(tf)
+                    self.storage.set_auto_run_state(tf, AutoRunState.SEARCHING)
+                    auto_job = JobSpec(
+                        job_id=f"auto_step_{tf}_{int(time.time() * 1000)}",
+                        job_type=JobType.AUTO_TRIAL.value,
+                        timeframe=tf,
+                        priority=JobPriority.AUTO.value,
+                        payload={"timeframe": tf, "snapshot_path": str(latest_snap)},
+                        timeout_seconds=1200.0,
+                    )
+                    self.storage.submit_job(auto_job)
+            except Exception as exc:
+                logger.warning("Error checking auto tune data wakeup for %s: %s", tf, exc)
 
     def _handle_oom_retry_if_needed(self, job: JobSpec) -> str | None:
         """Handles CUDA OOM failures according to job-type and priority-specific policies.

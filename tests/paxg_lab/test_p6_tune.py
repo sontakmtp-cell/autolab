@@ -10,7 +10,9 @@ from typing import Any
 
 import numpy as np
 import optuna
+import pandas as pd
 import pytest
+import torch
 
 from paxg_lab.constants import TICK_SIZE, get_horizon_for_timeframe, get_horizon_weights
 from paxg_lab.data.snapshot import DatasetSnapshot, SnapshotMetadata
@@ -1116,7 +1118,7 @@ def test_backup_zip_integrity_verification(temp_dir: Path):
 
 
 def test_worker_auto_trial_production_dispatch(temp_dir: Path, mock_snapshot: DatasetSnapshot):
-    """Verifies that GPUWorker._handle_auto_trial_job executes run_tuning_cycle and honors cancel."""
+    """Verifies that GPUWorker._handle_auto_trial_job executes bounded execute_step and queues next step."""
     from unittest.mock import patch
     from paxg_lab.queue.worker import GPUWorker
 
@@ -1132,25 +1134,484 @@ def test_worker_auto_trial_production_dispatch(temp_dir: Path, mock_snapshot: Da
     )
 
     worker = GPUWorker(job_id="job_auto_p6", db_path=db_path)
+    worker.storage.set_auto_run_state("1h", AutoRunState.SEARCHING)
 
     with patch("pathlib.Path.exists", return_value=True), \
          patch("paxg_lab.data.snapshot.DatasetSnapshot.load", return_value=mock_snapshot), \
-         patch("paxg_lab.tune.protocol.AutonomousTuningProtocol.run_tuning_cycle") as mock_cycle:
-        mock_cycle.return_value = {
-            "status": "COMPLETED",
+         patch("paxg_lab.tune.protocol.AutonomousTuningProtocol.execute_step") as mock_step:
+        mock_step.return_value = {
+            "phase": "TRIAL",
+            "current_trial": 1,
             "timeframe": "1h",
-            "accepted": True,
-            "candidate_id": "cand_1h_optuna",
         }
 
         result = worker._handle_auto_trial_job(job_spec)
 
-        assert result["status"] == "COMPLETED"
-        assert result["accepted"] is True
-        assert result["candidate_id"] == "cand_1h_optuna"
-        assert mock_cycle.call_count == 1
-        _, kwargs = mock_cycle.call_args
+        assert result["phase"] == "TRIAL"
+        assert result["current_trial"] == 1
+        assert mock_step.call_count == 1
+        _, kwargs = mock_step.call_args
         assert kwargs["fast_dev_mode"] is True
         assert callable(kwargs["is_cancelled_func"])
         assert callable(kwargs["progress_callback"])
+
+        # Check next bounded auto job was submitted
+        recent_jobs = worker.storage.list_recent_jobs(job_type=JobType.AUTO_TRIAL.value, timeframe="1h")
+        assert len(recent_jobs) == 1
+        assert recent_jobs[0].job_id.startswith("auto_step_1h_")
+        assert recent_jobs[0].priority == JobPriority.AUTO.value
+
+
+# ---------------------------------------------------------------------------
+# Focused Regression and Integration Tests for PR #6 Blockers (Items 1 - 8)
+# ---------------------------------------------------------------------------
+
+
+def test_forecast_priority_interleaving_between_auto_steps(temp_dir: Path):
+    """Item 1: Proves that high-priority FORECAST jobs take precedence over subsequent bounded AUTO steps,
+    and auto steps alternate between 1h and 4h timeframes."""
+    db_path = temp_dir / "interleave_queue.db"
+    storage = GPUJobStorage(db_path)
+
+    # 1. Enqueue an AUTO_TRIAL job for 1h
+    auto_job_1h = JobSpec(
+        job_id="auto_step_1h_1",
+        job_type=JobType.AUTO_TRIAL.value,
+        timeframe="1h",
+        priority=JobPriority.AUTO.value,
+        payload={"timeframe": "1h"},
+    )
+    storage.submit_job(auto_job_1h)
+
+    # Acquire and simulate completion of auto_step_1h_1
+    acquired = storage.acquire_next_job()
+    assert acquired is not None and acquired.job_id == "auto_step_1h_1"
+    storage.mark_succeeded(acquired.job_id, result={"phase": "TRIAL", "current_trial": 1})
+
+    # Auto worker enqueues the next bounded auto step (Priority 3)
+    next_auto_1h = JobSpec(
+        job_id="auto_step_1h_2",
+        job_type=JobType.AUTO_TRIAL.value,
+        timeframe="1h",
+        priority=JobPriority.AUTO.value,
+        payload={"timeframe": "1h"},
+    )
+    storage.submit_job(next_auto_1h)
+
+    # Meanwhile, a user requests an immediate forecast (Priority 1)
+    forecast_job = JobSpec(
+        job_id="forecast_urgent",
+        job_type=JobType.FORECAST.value,
+        timeframe="1h",
+        priority=JobPriority.FORECAST.value,
+        payload={"timeframe": "1h"},
+    )
+    storage.submit_job(forecast_job)
+
+    # Also a 4h auto step is queued (Priority 3)
+    auto_job_4h = JobSpec(
+        job_id="auto_step_4h_1",
+        job_type=JobType.AUTO_TRIAL.value,
+        timeframe="4h",
+        priority=JobPriority.AUTO.value,
+        payload={"timeframe": "4h"},
+    )
+    storage.submit_job(auto_job_4h)
+
+    # Next job acquired MUST be the Priority 1 FORECAST job, NOT any auto job!
+    next_job = storage.acquire_next_job(last_auto_timeframe="1h")
+    assert next_job is not None
+    assert next_job.job_id == "forecast_urgent"
+    assert next_job.priority == JobPriority.FORECAST.value
+
+    # Complete the forecast job
+    storage.mark_succeeded(next_job.job_id, result={"predictions": []})
+
+    # Next job acquired for auto should alternate to 4h because last_auto_timeframe was 1h
+    next_auto = storage.acquire_next_job(last_auto_timeframe="1h")
+    assert next_auto is not None
+    assert next_auto.job_id == "auto_step_4h_1"
+    assert next_auto.timeframe == "4h"
+
+
+def test_continuous_auto_recovery_and_data_wakeup(temp_dir: Path, monkeypatch):
+    """Item 2: Verifies startup auto recovery from SQLite state and 7-day new data wake-up."""
+    from paxg_lab.queue.scheduler import GPUScheduler
+    from paxg_lab.queue.types import JobStatus
+
+    db_path = temp_dir / "recovery.db"
+    scheduler = GPUScheduler(db_path=db_path, acquire_coordinator_lock=False)
+
+    # 1. Startup recovery when state is SEARCHING but no active queued job
+    scheduler.storage.set_auto_run_state("1h", AutoRunState.SEARCHING)
+    scheduler.storage.save_auto_tune_run(
+        timeframe="1h",
+        snapshot_path=str(temp_dir / "snapshots" / "dummy_1h"),
+        snapshot_hash="hash123",
+        phase="TRIAL",
+        current_trial=2,
+    )
+    recovered = scheduler.recover_on_startup()
+    assert len(recovered) == 0  # No running jobs was interrupted
+    # Resumption job must be submitted!
+    recent = scheduler.storage.list_jobs(job_type=JobType.AUTO_TRIAL.value, timeframe="1h")
+    assert len(recent) == 1
+    assert recent[0].job_id.startswith("auto_step_1h_resume_")
+
+    # Clean up jobs
+    for j in recent:
+        scheduler.storage.mark_succeeded(j.job_id, result={})
+
+    # 2. Data wake-up mechanism when state is WAITING_DATA
+    scheduler.storage.set_auto_run_state("1h", AutoRunState.WAITING_DATA)
+    scheduler.storage.save_auto_tune_run(
+        timeframe="1h",
+        snapshot_path=str(temp_dir / "snapshots" / "paxgusdt_1h_mock"),
+        snapshot_hash="hash123",
+        phase="WAITING_DATA",
+        last_consumed_candles=1000,
+        last_run_completed_at=time.time() - 86400,
+    )
+
+    # Setup mock snapshot directory
+    snap_dir = temp_dir / "snapshots"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    snap_1h = snap_dir / "paxgusdt_1h_mock"
+    snap_1h.mkdir(parents=True, exist_ok=True)
+
+    # Case A: only 100 new candles (< 168 threshold for 1h)
+    with open(snap_1h / "metadata.json", "w") as f:
+        json.dump({"total_candles": 1100}, f)
+
+    monkeypatch.setattr("paxg_lab.queue.scheduler.Path", lambda p: snap_dir if p == "var/paxg_lab/snapshots" else Path(p))
+
+    scheduler._check_auto_tune_data_wakeup()
+    # Should NOT have submitted any job, state remains WAITING_DATA
+    assert scheduler.storage.get_auto_run_state("1h") == AutoRunState.WAITING_DATA
+
+    # Case B: 170 new candles (>= 168 threshold for 1h)
+    with open(snap_1h / "metadata.json", "w") as f:
+        json.dump({"total_candles": 1170}, f)
+
+    scheduler._check_auto_tune_data_wakeup()
+    # State must transition to SEARCHING and new job submitted
+    assert scheduler.storage.get_auto_run_state("1h") == AutoRunState.SEARCHING
+    new_jobs = scheduler.storage.list_jobs(job_type=JobType.AUTO_TRIAL.value, timeframe="1h", status=JobStatus.QUEUED.value)
+    assert len(new_jobs) == 1
+    assert new_jobs[0].job_id.startswith("auto_step_1h_")
+
+
+def test_statistical_lock_rejection_on_reuse(temp_dir: Path, mock_snapshot: DatasetSnapshot):
+    """Item 3: Verifies that attempting to evaluate a second candidate on an already-consumed locked range
+    is strictly rejected by statistical lock enforcement before inference."""
+    from unittest.mock import patch
+    from paxg_lab.tune.locked_eval import run_locked_verification
+
+    db_path = temp_dir / "lock_test.db"
+    storage = GPUJobStorage(db_path)
+    store = AdapterStore(temp_dir / "adapters")
+
+    cand1_dir = temp_dir / "cand_1"
+    cand1_dir.mkdir(parents=True, exist_ok=True)
+    cand1 = AdapterManifest(adapter_id="cand_1", timeframe="1h", horizon=24, context_len=256, feature_set="B", feature_columns=["close"])
+    cand1.save_json(cand1_dir / "paxg_manifest.json")
+
+    cand2_dir = temp_dir / "cand_2"
+    cand2_dir.mkdir(parents=True, exist_ok=True)
+    cand2 = AdapterManifest(adapter_id="cand_2", timeframe="1h", horizon=24, context_len=256, feature_set="B", feature_columns=["close"])
+    cand2.save_json(cand2_dir / "paxg_manifest.json")
+
+    dummy_preds = np.ones((600, 24)) * 2000.0
+    dummy_quantiles = np.ones((600, 24, 9)) * 2000.0
+
+    with patch("paxg_lab.eval.predictor.TimesFM3Predictor.load_adapter"), \
+         patch("paxg_lab.tune.locked_eval.TimesFM3Predictor.predict", return_value=(dummy_preds, dummy_quantiles)), \
+         patch("paxg_lab.tune.locked_eval.extract_windows", return_value=(np.zeros((600, 256, 1)), np.zeros((600, 24)), list(range(600)))):
+
+        # First candidate consumes the locked range
+        report1 = run_locked_verification(
+            snapshot=mock_snapshot,
+            candidate_manifest=cand1,
+            candidate_adapter_path=cand1_dir,
+            store=store,
+            storage=storage,
+        )
+        assert report1.candidate_id == "cand_1"
+
+        # Second candidate on the same snapshot range must be rejected before inference
+        with pytest.raises(RuntimeError, match="Statistical lock violation"):
+            run_locked_verification(
+                snapshot=mock_snapshot,
+                candidate_manifest=cand2,
+                candidate_adapter_path=cand2_dir,
+                store=store,
+                storage=storage,
+            )
+
+
+def test_contemporaneous_score_comparison(temp_dir: Path, mock_snapshot: DatasetSnapshot):
+    """Item 4: Verifies that current recommended score is computed contemporaneously on the exact same locked
+    segments rather than reading an old manifest score."""
+    from unittest.mock import patch
+    from paxg_lab.tune.locked_eval import run_locked_verification
+
+    store = AdapterStore(temp_dir / "adapters")
+    # Save a current recommended adapter with a stale manifest score
+    rec_id = "old_rec_adapter"
+    rec_dir = store.get_adapter_path(rec_id)
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    rec_manifest = AdapterManifest(
+        adapter_id=rec_id,
+        timeframe="1h",
+        horizon=24,
+        context_len=256,
+        feature_set="B",
+        feature_columns=["close"],
+        metrics={"score_v1": 99.0},  # Stale manifest score from older period
+        is_verified=True,
+    )
+    rec_manifest.save_json(rec_dir / "paxg_manifest.json")
+    store.set_recommended("1h", rec_id)
+
+    cand_dir = temp_dir / "new_cand"
+    cand_dir.mkdir(parents=True, exist_ok=True)
+    cand_manifest = AdapterManifest(
+        adapter_id="new_cand",
+        timeframe="1h",
+        horizon=24,
+        context_len=256,
+        feature_set="B",
+        feature_columns=["close"],
+    )
+    cand_manifest.save_json(cand_dir / "paxg_manifest.json")
+
+    dummy_preds = np.ones((600, 24)) * 2000.0
+    dummy_quantiles = np.ones((600, 24, 9)) * 2000.0
+
+    with patch("paxg_lab.eval.predictor.TimesFM3Predictor.load_adapter"), \
+         patch("paxg_lab.tune.locked_eval.TimesFM3Predictor.predict", return_value=(dummy_preds, dummy_quantiles)), \
+         patch("paxg_lab.tune.locked_eval.extract_windows", return_value=(np.zeros((600, 256, 1)), np.zeros((600, 24)), list(range(600)))):
+
+        report = run_locked_verification(
+            snapshot=mock_snapshot,
+            candidate_manifest=cand_manifest,
+            candidate_adapter_path=cand_dir,
+            store=store,
+        )
+
+        # Contemporaneous evaluation must NOT equal 99.0 from the stale manifest
+        assert report.current_recommended_score != 99.0
+        # Score diff must strictly be cand_score - contemporaneous current_rec_score
+        assert pytest.approx(report.score_diff, rel=1e-5) == report.score_v1 - report.current_recommended_score
+
+
+def test_origin_alignment_different_contexts_and_gaps():
+    """Item 5: Verifies that models with different context lengths (128 vs 256) evaluated across a
+    timestamp gap have their forecast origins strictly aligned to common origins."""
+    from paxg_lab.data.split import extract_windows
+
+    # Create synthetic series of 800 candles with a 5-hour timestamp gap at candle 200
+    n = 800
+    times = []
+    curr = 1700000000000
+    for i in range(n):
+        if i == 200:
+            curr += 5 * 3600000  # 5-hour gap
+        else:
+            curr += 3600000
+        times.append(curr)
+    timestamps = np.array(times, dtype=np.int64)
+    features = np.arange(n, dtype=np.float32)[:, np.newaxis]
+    targets = features[:, 0]
+
+    # Extract windows: candidate with context 128, base with context 256
+    c_ctx, c_fut, c_origins = extract_windows(
+        features=features, targets=targets, context_len=128, horizon=24,
+        start_idx=100, end_idx=750, step=1, timestamps=timestamps, timeframe="1h"
+    )
+    b_ctx, b_fut, b_origins = extract_windows(
+        features=features, targets=targets, context_len=256, horizon=24,
+        start_idx=100, end_idx=750, step=1, timestamps=timestamps, timeframe="1h"
+    )
+
+    assert len(c_origins) != len(b_origins)  # context 128 has more valid windows than 256
+    assert len(c_origins) > len(b_origins)
+
+    # Intersect common origins
+    common_set = set(c_origins) & set(b_origins)
+    common_origins = sorted(common_set)
+    assert len(common_origins) > 0
+
+    c_map = {o: i for i, o in enumerate(c_origins)}
+    b_map = {o: i for i, o in enumerate(b_origins)}
+
+    c_indices = [c_map[o] for o in common_origins]
+    b_indices = [b_map[o] for o in common_origins]
+
+    c_aligned_fut = c_fut[c_indices]
+    b_aligned_fut = b_fut[b_indices]
+
+    # Aligned targets must be identical row for row
+    assert c_aligned_fut.shape == b_aligned_fut.shape
+    np.testing.assert_array_equal(c_aligned_fut, b_aligned_fut)
+
+
+def test_cancellation_during_trainer_updates(temp_dir: Path, mock_snapshot: DatasetSnapshot):
+    """Item 6: Verifies that cancellation flag during trainer updates immediately raises InterruptedError."""
+    import torch.nn as nn
+    from paxg_lab.model.trainer import LoRATrainer
+
+    spec = TrainSpec(
+        timeframe="1h",
+        horizon=24,
+        context_len=128,
+        feature_set="A",
+        max_epochs=5,
+        batch_size=4,
+    )
+
+    class CleanBaseModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.query_proj = nn.Linear(10, 10)
+            self.value_proj = nn.Linear(10, 10)
+
+        def forward_decode(self, target, horizon):
+            B = target.shape[0]
+            return torch.zeros((B, 1, horizon, 9), dtype=torch.float32, device=target.device, requires_grad=True)
+
+    mock_base = CleanBaseModel()
+    trainer = LoRATrainer(base_model=mock_base, spec=spec)
+    features_df = pd.DataFrame({
+        "open_time": mock_snapshot.timestamps,
+        "close": mock_snapshot.features_a[:, 0],
+    })
+
+    # Cancel immediately
+    with pytest.raises(InterruptedError, match="Training interrupted by cancellation request"):
+        trainer.train(
+            features_df=features_df,
+            snapshot_hash="dummy_hash",
+            fold_id="fold_1",
+            explicit_train_range=(0, 500),
+            is_cancelled_func=lambda: True,
+        )
+
+
+def test_backup_checksum_corruption_rejection(temp_dir: Path):
+    """Item 7: Verifies that Gatekeeper parses checksums.sha256 in the backup ZIP, detects altered file bytes,
+    and rejects candidate without promoting to recommended."""
+    import zipfile
+    from unittest.mock import patch
+
+    store = AdapterStore(temp_dir / "adapters")
+    gatekeeper = LoRAGatekeeper(
+        store=store,
+        audit_dir=temp_dir / "audit",
+        backup_dir=temp_dir / "backups",
+    )
+
+    cid = "test_tampered_backup"
+    cand_dir = store.get_adapter_path(cid)
+    cand_dir.mkdir(parents=True, exist_ok=True)
+    manifest = AdapterManifest(
+        adapter_id=cid,
+        timeframe="1h",
+        horizon=24,
+        context_len=256,
+        feature_set="B",
+        feature_columns=["close"],
+        is_verified=False,
+    )
+    manifest.save_json(cand_dir / "paxg_manifest.json")
+
+    from safetensors.torch import save_file
+    import torch
+    save_file({
+        "base_model.model.seq_attn.0.query_proj.lora_A.weight": torch.zeros((4, 1280)),
+        "base_model.model.seq_attn.0.query_proj.lora_B.weight": torch.zeros((1280, 4)),
+    }, cand_dir / "adapter_model.safetensors")
+    with open(cand_dir / "adapter_config.json", "w") as f:
+        json.dump({"r": 4, "target_modules": ["query_proj"], "peft_type": "LORA"}, f)
+
+    locked_report = create_mock_locked_report(
+        candidate_id=cid,
+        timeframe="1h",
+        score_v1=8.5,
+        current_rec_score=0.0,
+    )
+
+    # Export a zip, but tamper with adapter_config.json inside without updating checksums.sha256
+    def tampered_export(adapter_id, out_zip):
+        import hashlib
+        out_path = Path(out_zip)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(out_path, "w") as zf:
+            zf.write(cand_dir / "paxg_manifest.json", "paxg_manifest.json")
+            zf.write(cand_dir / "adapter_model.safetensors", "adapter_model.safetensors")
+            # Write tampered bytes for config
+            zf.writestr("adapter_config.json", b'{"tampered": true}')
+            # Write checksum sidecar with old hash
+            old_hash = hashlib.sha256((cand_dir / "adapter_config.json").read_bytes()).hexdigest()
+            m_hash = hashlib.sha256((cand_dir / "paxg_manifest.json").read_bytes()).hexdigest()
+            s_hash = hashlib.sha256((cand_dir / "adapter_model.safetensors").read_bytes()).hexdigest()
+            cs_content = f"{m_hash}  paxg_manifest.json\n{s_hash}  adapter_model.safetensors\n{old_hash}  adapter_config.json\n"
+            zf.writestr("checksums.sha256", cs_content)
+        return out_path
+
+    with patch.object(store, "export_adapter_zip", side_effect=tampered_export):
+        decision = gatekeeper.evaluate_candidate(
+            candidate_manifest=manifest,
+            locked_report=locked_report,
+            perform_backup=True,
+        )
+        assert decision.accepted is False
+        assert decision.check_smoke_test_and_backup is False
+        assert store.get_recommended("1h") is None
+        assert any("Checksum mismatch" in r or "Smoke test load or backup export failed" in r for r in decision.reasons)
+
+
+def test_fixed_epochs_final_retrain(temp_dir: Path, mock_snapshot: DatasetSnapshot):
+    """Item 8: Verifies that LoRATrainer fixed_epochs mode trains on all pre-test data without validation split or early stopping."""
+    import torch.nn as nn
+    from paxg_lab.model.trainer import LoRATrainer
+
+    spec = TrainSpec(
+        timeframe="1h",
+        horizon=24,
+        context_len=128,
+        feature_set="A",
+        max_epochs=3,
+        batch_size=4,
+    )
+
+    class CleanBaseModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(10, 10)
+
+    mock_base = CleanBaseModel()
+    trainer = LoRATrainer(base_model=mock_base, spec=spec)
+    features_df = pd.DataFrame({
+        "open_time": mock_snapshot.timestamps,
+        "close": mock_snapshot.features_a[:, 0],
+    })
+
+    # Dataset preparation in fixed_epochs mode
+    train_ctx, train_fut, val_ctx, val_fut, t_range = trainer.prepare_dataset(
+        features_df=features_df,
+        fold_id="final_pre_test",
+        explicit_train_range=(0, 1000),
+        fixed_epochs=True,
+    )
+
+    # Validation set must be empty (no samples carved out from pre-test training range)
+    assert len(val_ctx) == 0
+    assert len(val_fut) == 0
+    assert t_range["num_val_windows"] == 0
+    assert t_range["num_train_windows"] == len(train_ctx)
+    assert t_range["train_end_idx"] == 1000
+
+
+
 
