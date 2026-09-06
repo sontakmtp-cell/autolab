@@ -10,6 +10,8 @@ import time
 import zipfile
 
 import pytest
+import safetensors.torch
+import torch
 
 from paxg_lab.constants import (
     ALLOWED_CONTEXT_LENGTHS,
@@ -32,6 +34,14 @@ from paxg_lab.ui.state import (
     timestamp_to_vietnam_str,
 )
 
+VALID_SAFETENSORS_BYTES = safetensors.torch.save({"base_model.model.lora_A.weight": torch.zeros(1, 1)})
+VALID_LORA_CONFIG = {
+    "peft_type": "LORA",
+    "r": 4,
+    "lora_alpha": 8,
+    "target_modules": ["query_proj", "value_proj"],
+}
+
 
 @pytest.fixture
 def temp_store(tmp_path: Path) -> AdapterStore:
@@ -49,13 +59,13 @@ def mock_adapter(temp_store: AdapterStore) -> str:
     target_dir = temp_store.get_adapter_path(adapter_id)
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Weights dummy safetensors
+    # 1. Weights valid safetensors
     weights_path = target_dir / "adapter_model.safetensors"
-    weights_path.write_bytes(b"DUMMY_SAFETENSORS_WEIGHTS_CONTENT")
+    weights_path.write_bytes(VALID_SAFETENSORS_BYTES)
 
-    # 2. Config dummy
+    # 2. Config valid LoRA
     config_path = target_dir / "adapter_config.json"
-    config_path.write_text(json.dumps({"r": 4, "lora_alpha": 8}), encoding="utf-8")
+    config_path.write_text(json.dumps(VALID_LORA_CONFIG), encoding="utf-8")
 
     # 3. Manifest
     manifest = AdapterManifest(
@@ -311,8 +321,8 @@ def test_safe_zip_import_rejection_of_manifest_traversal_adapter_id(temp_store: 
     """Verifies that zip archives with traversal adapter_id inside paxg_manifest.json are rejected."""
     malicious_ids = ["../../escape", "C:\\Windows\\System32", "/tmp/evil", "foo/bar"]
 
-    safetensors_bytes = b"DUMMY_SAFETENSORS_WEIGHTS"
-    config_bytes = json.dumps({"peft_type": "LORA", "r": 4}).encode("utf-8")
+    safetensors_bytes = VALID_SAFETENSORS_BYTES
+    config_bytes = json.dumps(VALID_LORA_CONFIG).encode("utf-8")
     s_hash = hashlib.sha256(safetensors_bytes).hexdigest()
     c_hash = hashlib.sha256(config_bytes).hexdigest()
 
@@ -542,8 +552,8 @@ def test_safe_zip_import_rejects_checksum_traversal_and_uncovered_files(temp_sto
     """Verifies that checksums.sha256 with traversal paths, absolute paths, or unverified files are strictly rejected."""
     import hashlib
 
-    safetensors_bytes = b"DUMMY_SAFETENSORS_WEIGHTS"
-    config_bytes = json.dumps({"peft_type": "LORA", "r": 4}).encode("utf-8")
+    safetensors_bytes = VALID_SAFETENSORS_BYTES
+    config_bytes = json.dumps(VALID_LORA_CONFIG).encode("utf-8")
     s_hash = hashlib.sha256(safetensors_bytes).hexdigest()
     c_hash = hashlib.sha256(config_bytes).hexdigest()
 
@@ -830,8 +840,8 @@ def test_safe_zip_import_static_compatibility_validation(tmp_path: Path):
     ) -> Path:
         p = tmp_path / filename
         m_bytes = json.dumps(manifest).encode("utf-8")
-        s_bytes = b"DUMMY_SAFETENSORS_WEIGHTS"
-        c_bytes = custom_config if custom_config is not None else json.dumps({"peft_type": "LORA", "r": 4}).encode("utf-8")
+        s_bytes = VALID_SAFETENSORS_BYTES
+        c_bytes = custom_config if custom_config is not None else json.dumps(VALID_LORA_CONFIG).encode("utf-8")
 
         lines = [f"{hashlib.sha256(m_bytes).hexdigest()}  paxg_manifest.json"]
         if include_safetensors:
@@ -955,8 +965,8 @@ def test_safe_zip_import_minimal_valid_package_registers_only_after_success(tmp_
         "best_val_loss": 0.015,
     }
     m_bytes = json.dumps(valid_manifest).encode("utf-8")
-    s_bytes = b"MINIMAL_VALID_SAFETENSORS_DATA"
-    c_bytes = json.dumps({"peft_type": "LORA", "r": 4, "lora_alpha": 8}).encode("utf-8")
+    s_bytes = VALID_SAFETENSORS_BYTES
+    c_bytes = json.dumps(VALID_LORA_CONFIG).encode("utf-8")
 
     m_hash = hashlib.sha256(m_bytes).hexdigest()
     s_hash = hashlib.sha256(s_bytes).hexdigest()
@@ -1009,6 +1019,232 @@ def test_safe_zip_import_minimal_valid_package_registers_only_after_success(tmp_
     assert manifest.base_model_revision == MODEL_REVISION
     assert manifest.feature_columns == ["close"]
     assert any(a.adapter_id == adapter_id for a in store.list_adapters())
+
+
+def test_safe_zip_import_overwrite_protection_pinned_and_recommended(tmp_path: Path):
+    """Verifies that import_adapter_zip(overwrite=True) strictly refuses to overwrite
+    pinned or recommended (winner) adapters, keeping existing files intact."""
+    models_dir = tmp_path / "models"
+    db_path = tmp_path / "test_paxg.db"
+    store = AdapterStore(base_dir=models_dir, db_path=db_path)
+
+    aid = "paxg_1h_protect_test"
+    target_dir = store.get_adapter_path(aid)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write initial adapter files with a marker file
+    (target_dir / "adapter_model.safetensors").write_bytes(VALID_SAFETENSORS_BYTES)
+    (target_dir / "adapter_config.json").write_text(json.dumps(VALID_LORA_CONFIG), encoding="utf-8")
+    orig_manifest = {
+        "adapter_id": aid,
+        "timeframe": "1h",
+        "horizon": 24,
+        "context_len": 256,
+        "feature_set": "A",
+        "feature_columns": ["close"],
+        "base_model_repo": MODEL_REPO,
+        "base_model_revision": MODEL_REVISION,
+        "best_val_loss": 0.05,
+    }
+    (target_dir / "paxg_manifest.json").write_text(json.dumps(orig_manifest), encoding="utf-8")
+    marker_file = target_dir / "original_marker.txt"
+    marker_file.write_text("ORIGINAL_CONTENT", encoding="utf-8")
+
+    # Generate checksums for initial directory
+    c_lines = []
+    for f in sorted(target_dir.iterdir()):
+        if f.is_file():
+            c_lines.append(f"{compute_file_sha256(f)}  {f.name}")
+    (target_dir / "checksums.sha256").write_text("\n".join(c_lines) + "\n", encoding="utf-8")
+
+    # Prepare a new replacement zip for the same adapter_id
+    new_manifest = {**orig_manifest, "best_val_loss": 0.001}
+    m_bytes = json.dumps(new_manifest).encode("utf-8")
+    s_bytes = VALID_SAFETENSORS_BYTES
+    c_bytes = json.dumps(VALID_LORA_CONFIG).encode("utf-8")
+    chk_str = (
+        f"{hashlib.sha256(m_bytes).hexdigest()}  paxg_manifest.json\n"
+        f"{hashlib.sha256(s_bytes).hexdigest()}  adapter_model.safetensors\n"
+        f"{hashlib.sha256(c_bytes).hexdigest()}  adapter_config.json\n"
+    )
+    new_zip = tmp_path / "replacement.zip"
+    with zipfile.ZipFile(new_zip, "w") as zf:
+        zf.writestr("paxg_manifest.json", m_bytes)
+        zf.writestr("adapter_model.safetensors", s_bytes)
+        zf.writestr("adapter_config.json", c_bytes)
+        zf.writestr("checksums.sha256", chk_str)
+
+    # 1. Pinned protection: overwrite=True MUST be rejected and original preserved
+    store.set_pinned(aid, True)
+    assert store.is_pinned(aid) is True
+
+    with pytest.raises(ValueError, match="đã được ghim chống xóa"):
+        store.import_adapter_zip(new_zip, overwrite=True)
+
+    # Original files must still exist and be untouched
+    assert marker_file.exists()
+    assert marker_file.read_text(encoding="utf-8") == "ORIGINAL_CONTENT"
+    cur_m = json.loads((target_dir / "paxg_manifest.json").read_text(encoding="utf-8"))
+    assert cur_m["best_val_loss"] == 0.05
+
+    # 2. Recommended protection: overwrite=True MUST be rejected and original preserved
+    store.set_pinned(aid, False)
+    store.set_recommended(aid, "1h")
+    assert store.get_recommended("1h") == aid
+
+    with pytest.raises(ValueError, match="adapter khuyến nghị"):
+        store.import_adapter_zip(new_zip, overwrite=True)
+
+    assert marker_file.exists()
+    assert marker_file.read_text(encoding="utf-8") == "ORIGINAL_CONTENT"
+
+    # 3. Unpinned & unrecommended with overwrite=False -> FileExistsError
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("UPDATE adapter_registry SET is_recommended = 0, is_pinned = 0 WHERE adapter_id = ?;", (aid,))
+        conn.commit()
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        store.import_adapter_zip(new_zip, overwrite=False)
+    assert marker_file.exists()
+
+    # 4. Unpinned & unrecommended with overwrite=True -> succeeds and atomically replaces
+    res_id = store.import_adapter_zip(new_zip, overwrite=True)
+    assert res_id == aid
+    assert not marker_file.exists()
+    updated_m = json.loads((target_dir / "paxg_manifest.json").read_text(encoding="utf-8"))
+    assert updated_m["best_val_loss"] == 0.001
+
+
+def test_safe_zip_import_rejects_corrupted_or_fake_safetensors(tmp_path: Path):
+    """Verifies that non-safetensors or corrupted safetensors files are rejected by safetensors.safe_open,
+    and neither canonical directory nor registry entry is created."""
+    models_dir = tmp_path / "models"
+    db_path = tmp_path / "test_paxg.db"
+    store = AdapterStore(base_dir=models_dir, db_path=db_path)
+
+    base_manifest = {
+        "adapter_id": "paxg_1h_corrupt_test",
+        "timeframe": "1h",
+        "horizon": 24,
+        "context_len": 256,
+        "feature_set": "A",
+        "feature_columns": ["close"],
+        "base_model_repo": MODEL_REPO,
+        "base_model_revision": MODEL_REVISION,
+        "best_val_loss": 0.01,
+    }
+    m_bytes = json.dumps(base_manifest).encode("utf-8")
+    c_bytes = json.dumps(VALID_LORA_CONFIG).encode("utf-8")
+
+    # Case A: Random corrupted bytes with .safetensors extension
+    fake_safetensors_bytes = b"RANDOM_CORRUPTED_FAKE_SAFETENSORS_HEADER_BYTES"
+    chk_str = (
+        f"{hashlib.sha256(m_bytes).hexdigest()}  paxg_manifest.json\n"
+        f"{hashlib.sha256(fake_safetensors_bytes).hexdigest()}  adapter_model.safetensors\n"
+        f"{hashlib.sha256(c_bytes).hexdigest()}  adapter_config.json\n"
+    )
+    zip_fake = tmp_path / "fake_safetensors.zip"
+    with zipfile.ZipFile(zip_fake, "w") as zf:
+        zf.writestr("paxg_manifest.json", m_bytes)
+        zf.writestr("adapter_model.safetensors", fake_safetensors_bytes)
+        zf.writestr("adapter_config.json", c_bytes)
+        zf.writestr("checksums.sha256", chk_str)
+
+    with pytest.raises(ValueError, match="Corrupted or invalid safetensors weights file"):
+        store.import_adapter_zip(zip_fake)
+
+    # Assert neither folder nor DB entry was created
+    assert not store.get_adapter_path(base_manifest["adapter_id"]).exists()
+    with sqlite3.connect(str(db_path)) as conn:
+        cur = conn.execute("SELECT 1 FROM adapter_registry WHERE adapter_id = ?;", (base_manifest["adapter_id"],))
+        assert cur.fetchone() is None
+
+    # Case B: Valid safetensors container format but empty keys
+    empty_safetensors_bytes = safetensors.torch.save({})
+    chk_empty = (
+        f"{hashlib.sha256(m_bytes).hexdigest()}  paxg_manifest.json\n"
+        f"{hashlib.sha256(empty_safetensors_bytes).hexdigest()}  adapter_model.safetensors\n"
+        f"{hashlib.sha256(c_bytes).hexdigest()}  adapter_config.json\n"
+    )
+    zip_empty = tmp_path / "empty_keys_safetensors.zip"
+    with zipfile.ZipFile(zip_empty, "w") as zf:
+        zf.writestr("paxg_manifest.json", m_bytes)
+        zf.writestr("adapter_model.safetensors", empty_safetensors_bytes)
+        zf.writestr("adapter_config.json", c_bytes)
+        zf.writestr("checksums.sha256", chk_empty)
+
+    with pytest.raises(ValueError, match="contains no tensor keys"):
+        store.import_adapter_zip(zip_empty)
+
+    assert not store.get_adapter_path(base_manifest["adapter_id"]).exists()
+    with sqlite3.connect(str(db_path)) as conn:
+        cur = conn.execute("SELECT 1 FROM adapter_registry WHERE adapter_id = ?;", (base_manifest["adapter_id"],))
+        assert cur.fetchone() is None
+
+
+def test_safe_zip_import_rejects_invalid_lora_config(tmp_path: Path):
+    """Verifies that non-LoRA PEFT configs or invalid rank configs are rejected,
+    without registering in database."""
+    models_dir = tmp_path / "models"
+    db_path = tmp_path / "test_paxg.db"
+    store = AdapterStore(base_dir=models_dir, db_path=db_path)
+
+    manifest = {
+        "adapter_id": "paxg_1h_cfg_test",
+        "timeframe": "1h",
+        "horizon": 24,
+        "context_len": 256,
+        "feature_set": "A",
+        "feature_columns": ["close"],
+        "base_model_repo": MODEL_REPO,
+        "base_model_revision": MODEL_REVISION,
+        "best_val_loss": 0.01,
+    }
+    m_bytes = json.dumps(manifest).encode("utf-8")
+    s_bytes = VALID_SAFETENSORS_BYTES
+
+    # Case A: peft_type is not LORA
+    bad_type_cfg = json.dumps({"peft_type": "PREFIX_TUNING", "r": 4}).encode("utf-8")
+    chk_bad_type = (
+        f"{hashlib.sha256(m_bytes).hexdigest()}  paxg_manifest.json\n"
+        f"{hashlib.sha256(s_bytes).hexdigest()}  adapter_model.safetensors\n"
+        f"{hashlib.sha256(bad_type_cfg).hexdigest()}  adapter_config.json\n"
+    )
+    zip_bad_type = tmp_path / "bad_peft_type.zip"
+    with zipfile.ZipFile(zip_bad_type, "w") as zf:
+        zf.writestr("paxg_manifest.json", m_bytes)
+        zf.writestr("adapter_model.safetensors", s_bytes)
+        zf.writestr("adapter_config.json", bad_type_cfg)
+        zf.writestr("checksums.sha256", chk_bad_type)
+
+    with pytest.raises(ValueError, match=r"'peft_type' must be 'LORA'"):
+        store.import_adapter_zip(zip_bad_type)
+    assert not store.get_adapter_path(manifest["adapter_id"]).exists()
+    with sqlite3.connect(str(db_path)) as conn:
+        cur = conn.execute("SELECT 1 FROM adapter_registry WHERE adapter_id = ?;", (manifest["adapter_id"],))
+        assert cur.fetchone() is None
+
+    # Case B: rank r is missing or non-positive
+    bad_r_cfg = json.dumps({"peft_type": "LORA", "r": 0}).encode("utf-8")
+    chk_bad_r = (
+        f"{hashlib.sha256(m_bytes).hexdigest()}  paxg_manifest.json\n"
+        f"{hashlib.sha256(s_bytes).hexdigest()}  adapter_model.safetensors\n"
+        f"{hashlib.sha256(bad_r_cfg).hexdigest()}  adapter_config.json\n"
+    )
+    zip_bad_r = tmp_path / "bad_rank.zip"
+    with zipfile.ZipFile(zip_bad_r, "w") as zf:
+        zf.writestr("paxg_manifest.json", m_bytes)
+        zf.writestr("adapter_model.safetensors", s_bytes)
+        zf.writestr("adapter_config.json", bad_r_cfg)
+        zf.writestr("checksums.sha256", chk_bad_r)
+
+    with pytest.raises(ValueError, match=r"'r' \(rank\) must be a positive integer"):
+        store.import_adapter_zip(zip_bad_r)
+    assert not store.get_adapter_path(manifest["adapter_id"]).exists()
+    with sqlite3.connect(str(db_path)) as conn:
+        cur = conn.execute("SELECT 1 FROM adapter_registry WHERE adapter_id = ?;", (manifest["adapter_id"],))
+        assert cur.fetchone() is None
+
 
 
 

@@ -14,6 +14,7 @@ import time
 from typing import Any
 import zipfile
 
+from safetensors import safe_open
 import torch
 import torch.nn as nn
 from peft import PeftModel
@@ -676,6 +677,41 @@ class AdapterStore:
             except Exception as err:
                 raise ValueError(f"Corrupted or invalid 'adapter_config.json': {err}") from err
 
+            # Validate essential LoRA PEFT config fields
+            peft_type = str(peft_cfg.get("peft_type", "")).strip().upper()
+            if peft_type != "LORA":
+                raise ValueError(
+                    f"Invalid PEFT config in 'adapter_config.json': 'peft_type' must be 'LORA', got '{peft_cfg.get('peft_type')}'."
+                )
+            r_val = peft_cfg.get("r")
+            if not isinstance(r_val, int) or r_val <= 0:
+                raise ValueError(
+                    f"Invalid LoRA config in 'adapter_config.json': 'r' (rank) must be a positive integer, got '{r_val}'."
+                )
+            if "lora_alpha" in peft_cfg:
+                alpha_val = peft_cfg["lora_alpha"]
+                if not isinstance(alpha_val, (int, float)) or alpha_val <= 0:
+                    raise ValueError(
+                        f"Invalid LoRA config in 'adapter_config.json': 'lora_alpha' must be positive, got '{alpha_val}'."
+                    )
+            if "target_modules" in peft_cfg:
+                tm_val = peft_cfg["target_modules"]
+                if not isinstance(tm_val, (list, tuple, str, set)) or not tm_val:
+                    raise ValueError(
+                        f"Invalid LoRA config in 'adapter_config.json': 'target_modules' cannot be empty, got '{tm_val}'."
+                    )
+
+            # 4.5. Validate safetensors container and tensor keys using safetensors library
+            safetensors_files = [f for f in temp_dir.rglob("*.safetensors") if f.is_file()]
+            for sf in safetensors_files:
+                try:
+                    with safe_open(str(sf), framework="pt") as f:
+                        tensor_keys = list(f.keys())
+                    if not tensor_keys:
+                        raise ValueError(f"Safetensors file '{sf.name}' contains no tensor keys.")
+                except Exception as err:
+                    raise ValueError(f"Corrupted or invalid safetensors weights file '{sf.name}': {err}") from err
+
             # 5. Check paxg_manifest.json and enforce strict base model provenance
             manifest_file = temp_dir / "paxg_manifest.json"
             try:
@@ -706,8 +742,14 @@ class AdapterStore:
             manifest = AdapterManifest.load_json(manifest_file)
             adapter_id = validate_adapter_id(manifest.adapter_id, self.base_dir)
             target_dir = self.get_adapter_path(adapter_id)
-            if target_dir.exists() and not overwrite:
-                raise FileExistsError(f"Adapter '{adapter_id}' already exists. Set overwrite=True to replace.")
+            if target_dir.exists():
+                if not overwrite:
+                    raise FileExistsError(f"Adapter '{adapter_id}' already exists. Set overwrite=True to replace.")
+                meta = self.get_registry_metadata(adapter_id)
+                if meta.get("is_recommended"):
+                    raise ValueError(f"Không thể ghi đè adapter '{adapter_id}' vì đang là adapter khuyến nghị.")
+                if self.is_pinned(adapter_id):
+                    raise ValueError(f"Không thể ghi đè adapter '{adapter_id}' vì đã được ghim chống xóa.")
 
             # 6. Static compatibility validation
             if manifest.timeframe not in ("1h", "4h"):
@@ -788,9 +830,23 @@ class AdapterStore:
                 raise ValueError(f"Import failed: archive contains unverified files not covered by checksums: {uncovered_names}")
 
             # 9. Atomic move to canonical target
+            backup_dir = None
             if target_dir.exists() and overwrite:
-                shutil.rmtree(target_dir, ignore_errors=True)
-            os.replace(temp_dir, target_dir)
+                backup_dir = target_dir.parent / f".bak_replace_{adapter_id}_{int(time.time() * 1000)}"
+                if backup_dir.exists():
+                    shutil.rmtree(backup_dir, ignore_errors=True)
+                os.replace(target_dir, backup_dir)
+
+            try:
+                os.replace(temp_dir, target_dir)
+                if backup_dir and backup_dir.exists():
+                    shutil.rmtree(backup_dir, ignore_errors=True)
+            except Exception:
+                if backup_dir and backup_dir.exists():
+                    if target_dir.exists():
+                        shutil.rmtree(target_dir, ignore_errors=True)
+                    os.replace(backup_dir, target_dir)
+                raise
 
             # 10. Register in DB (strictly after all validations and move have completed)
             self.set_alias(adapter_id, adapter_id)
