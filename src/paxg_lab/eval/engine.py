@@ -49,6 +49,7 @@ class BacktestEngine:
         contexts: np.ndarray,
         horizon: int,
         batch_size: int = 16,
+        progress_callback: Callable[[dict[str, Any]], bool | None] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Runs batched inference across windows to prevent GPU memory spikes."""
         if len(contexts) == 0:
@@ -61,11 +62,46 @@ class BacktestEngine:
         quantiles_list = []
 
         num_windows = len(contexts)
-        for i in range(0, num_windows, batch_size):
+        total_batches = (num_windows + batch_size - 1) // batch_size
+        for b_idx, i in enumerate(range(0, num_windows, batch_size)):
+            if progress_callback is not None:
+                try:
+                    should_cont = progress_callback({
+                        "stage": "batch_start",
+                        "batch_idx": b_idx,
+                        "total_batches": total_batches,
+                        "processed_windows": i,
+                        "total_windows": num_windows,
+                    })
+                    if should_cont is False:
+                        logger.info("predict_windows halted by progress_callback at batch %d/%d.", b_idx, total_batches)
+                        raise InterruptedError(f"Backtest halted by stop request at batch {b_idx}/{total_batches}.")
+                except InterruptedError:
+                    raise
+                except Exception as cb_exc:
+                    logger.warning("progress_callback raised exception: %s", cb_exc)
+
             batch_ctx = contexts[i : i + batch_size]
             p_pred, q_pred = self.predictor.predict_batch(batch_ctx, horizon=horizon)
             point_preds_list.append(p_pred)
             quantiles_list.append(q_pred)
+
+            if progress_callback is not None:
+                try:
+                    should_cont = progress_callback({
+                        "stage": "batch_done",
+                        "batch_idx": b_idx + 1,
+                        "total_batches": total_batches,
+                        "processed_windows": min(i + batch_size, num_windows),
+                        "total_windows": num_windows,
+                    })
+                    if should_cont is False:
+                        logger.info("predict_windows halted by progress_callback after batch %d/%d.", b_idx + 1, total_batches)
+                        raise InterruptedError(f"Backtest halted by stop request after batch {b_idx + 1}/{total_batches}.")
+                except InterruptedError:
+                    raise
+                except Exception as cb_exc:
+                    logger.warning("progress_callback raised exception: %s", cb_exc)
 
         point_preds = np.concatenate(point_preds_list, axis=0)
         quantiles = np.concatenate(quantiles_list, axis=0)
@@ -88,6 +124,7 @@ class BacktestEngine:
         is_in_sample: bool = False,
         in_sample_warning: str | None = None,
         custom_predictor_fn: Callable[[np.ndarray, int], tuple[np.ndarray, np.ndarray]] | None = None,
+        progress_callback: Callable[[dict[str, Any]], bool | None] | None = None,
     ) -> tuple[FoldMetrics, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Evaluates a model over a specific temporal boundary [start_idx, end_idx).
 
@@ -140,7 +177,12 @@ class BacktestEngine:
         if custom_predictor_fn is not None:
             predictions, quantiles = custom_predictor_fn(ctx_windows, horizon)
         else:
-            predictions, quantiles = self.predict_windows(ctx_windows, horizon=horizon, batch_size=batch_size)
+            predictions, quantiles = self.predict_windows(
+                ctx_windows,
+                horizon=horizon,
+                batch_size=batch_size,
+                progress_callback=progress_callback,
+            )
 
         origin_prices = np.asarray([targets[orig] for orig in origins], dtype=np.float64)
         origin_timestamps = np.asarray([timestamps[orig] for orig in origins], dtype=np.int64)
@@ -347,6 +389,7 @@ class BacktestEngine:
                 is_in_sample=is_in_sample,
                 in_sample_warning=overlap_warning,
                 custom_predictor_fn=custom_predictor_fn,
+                progress_callback=progress_callback,
             )
             fold_metrics_list.append(f_metric)
             if len(preds) > 0:
@@ -412,6 +455,7 @@ class BacktestEngine:
                 is_in_sample=test_is_in_sample,
                 in_sample_warning=test_overlap_warning,
                 custom_predictor_fn=custom_predictor_fn,
+                progress_callback=progress_callback,
             )
 
             naive_test_metric = self.evaluate_naive_baseline(
@@ -541,6 +585,7 @@ class BacktestEngine:
         model_name: str = "Final-Candidate",
         base_reference_test_metric: FoldMetrics | None = None,
         custom_predictor_fn: Callable[[np.ndarray, int], tuple[np.ndarray, np.ndarray]] | None = None,
+        progress_callback: Callable[[dict[str, Any]], bool | None] | None = None,
     ) -> FoldMetrics:
         """Runs locked test verification strictly for a single final verified candidate.
 
@@ -582,6 +627,7 @@ class BacktestEngine:
             base_weighted_mae=base_test_mae,
             base_weighted_pinball=base_test_pinball,
             custom_predictor_fn=custom_predictor_fn,
+            progress_callback=progress_callback,
         )
         return test_metric
 

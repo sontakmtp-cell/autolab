@@ -62,6 +62,11 @@ class GPUJobStorage:
                 CREATE INDEX IF NOT EXISTS idx_gpu_jobs_idempotency
                 ON gpu_jobs (idempotency_key);
 
+                -- Partial unique index guaranteeing at most one active job per idempotency_key
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_active_idempotency
+                ON gpu_jobs (idempotency_key)
+                WHERE status IN ('QUEUED', 'RUNNING');
+
                 CREATE TABLE IF NOT EXISTS scheduler_state (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -70,12 +75,14 @@ class GPUJobStorage:
             """)
 
     def submit_job(self, job_spec: JobSpec) -> str:
-        """Submits a job to the queue, enforcing idempotency deduplication on active jobs."""
+        """Submits a job to the queue, enforcing atomic idempotency deduplication on active jobs."""
         now = time.time()
         payload_json = json.dumps(job_spec.payload, default=str)
         result_json = json.dumps(job_spec.result, default=str) if job_spec.result is not None else None
 
         with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+
             # Check idempotency: if job with same key is QUEUED or RUNNING, return existing job_id
             if job_spec.idempotency_key:
                 cur = conn.execute(
@@ -88,41 +95,60 @@ class GPUJobStorage:
                 )
                 row = cur.fetchone()
                 if row:
+                    conn.commit()
                     return str(row["job_id"])
 
-            conn.execute(
-                """
-                INSERT INTO gpu_jobs (
-                    job_id, job_type, timeframe, priority, status,
-                    payload, result, error_message, idempotency_key,
-                    worker_pid, worker_create_time, timeout_seconds,
-                    created_at, started_at, finished_at, heartbeat_at,
-                    cancel_requested, progress_pct, progress_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """,
-                (
-                    job_spec.job_id,
-                    job_spec.job_type,
-                    job_spec.timeframe,
-                    job_spec.priority,
-                    JobStatus.QUEUED.value,
-                    payload_json,
-                    result_json,
-                    job_spec.error_message,
-                    job_spec.idempotency_key,
-                    job_spec.worker_pid,
-                    job_spec.worker_create_time,
-                    job_spec.timeout_seconds,
-                    job_spec.created_at or now,
-                    job_spec.started_at,
-                    job_spec.finished_at,
-                    job_spec.heartbeat_at,
-                    1 if job_spec.cancel_requested else 0,
-                    job_spec.progress_pct,
-                    job_spec.progress_message,
-                ),
-            )
-            return job_spec.job_id
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO gpu_jobs (
+                        job_id, job_type, timeframe, priority, status,
+                        payload, result, error_message, idempotency_key,
+                        worker_pid, worker_create_time, timeout_seconds,
+                        created_at, started_at, finished_at, heartbeat_at,
+                        cancel_requested, progress_pct, progress_message
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        job_spec.job_id,
+                        job_spec.job_type,
+                        job_spec.timeframe,
+                        job_spec.priority,
+                        JobStatus.QUEUED.value,
+                        payload_json,
+                        result_json,
+                        job_spec.error_message,
+                        job_spec.idempotency_key,
+                        job_spec.worker_pid,
+                        job_spec.worker_create_time,
+                        job_spec.timeout_seconds,
+                        job_spec.created_at or now,
+                        job_spec.started_at,
+                        job_spec.finished_at,
+                        job_spec.heartbeat_at,
+                        1 if job_spec.cancel_requested else 0,
+                        job_spec.progress_pct,
+                        job_spec.progress_message,
+                    ),
+                )
+                conn.commit()
+                return job_spec.job_id
+            except sqlite3.IntegrityError:
+                # Concurrent insertion raced with the same active idempotency_key
+                conn.rollback()
+                if job_spec.idempotency_key:
+                    cur = conn.execute(
+                        """
+                        SELECT job_id FROM gpu_jobs
+                        WHERE idempotency_key = ? AND status IN ('QUEUED', 'RUNNING')
+                        ORDER BY created_at DESC LIMIT 1;
+                        """,
+                        (job_spec.idempotency_key,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return str(row["job_id"])
+                raise
 
     def get_job(self, job_id: str) -> JobSpec | None:
         """Loads a JobSpec by its job_id."""
@@ -450,3 +476,68 @@ class GPUJobStorage:
         """Sets current AutoRunState for timeframe."""
         key = f"auto_run_state_{timeframe}"
         self.set_state(key, state.value)
+
+    def try_acquire_coordinator_lease(
+        self,
+        my_pid: int,
+        my_create_time: float,
+        lease_timeout: float = 30.0,
+    ) -> bool:
+        """Atomically attempts to claim coordinator lease in SQLite with race prevention."""
+        from .process_guard import is_process_alive
+        now = time.time()
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            cur = conn.execute("SELECT value FROM scheduler_state WHERE key = 'coordinator_lease';")
+            row = cur.fetchone()
+            if row:
+                try:
+                    lease = json.loads(row["value"])
+                    l_pid = int(lease.get("pid", -1))
+                    l_ctime = float(lease.get("create_time", 0.0))
+                    l_hb = float(lease.get("heartbeat", 0.0))
+
+                    if l_pid != my_pid and is_process_alive(l_pid, l_ctime):
+                        if (now - l_hb) < lease_timeout:
+                            conn.commit()
+                            return False
+                except Exception:
+                    pass
+
+            new_lease = json.dumps({"pid": my_pid, "create_time": my_create_time, "heartbeat": now})
+            conn.execute(
+                """
+                INSERT INTO scheduler_state (key, value, updated_at) VALUES ('coordinator_lease', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;
+                """,
+                (new_lease, now),
+            )
+            conn.commit()
+            return True
+
+    def renew_coordinator_lease(self, my_pid: int, my_create_time: float) -> None:
+        """Renews coordinator lease heartbeat."""
+        now = time.time()
+        new_lease = json.dumps({"pid": my_pid, "create_time": my_create_time, "heartbeat": now})
+        with self.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO scheduler_state (key, value, updated_at) VALUES ('coordinator_lease', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;
+                """,
+                (new_lease, now),
+            )
+
+    def release_coordinator_lease(self, my_pid: int) -> None:
+        """Releases coordinator lease if owned by my_pid."""
+        with self.get_connection() as conn:
+            cur = conn.execute("SELECT value FROM scheduler_state WHERE key = 'coordinator_lease';")
+            row = cur.fetchone()
+            if row:
+                try:
+                    lease = json.loads(row["value"])
+                    if int(lease.get("pid", -1)) == my_pid:
+                        conn.execute("DELETE FROM scheduler_state WHERE key = 'coordinator_lease';")
+                except Exception:
+                    pass
+

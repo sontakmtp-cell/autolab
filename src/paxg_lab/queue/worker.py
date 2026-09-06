@@ -122,7 +122,12 @@ class GPUWorker:
                 self.storage.mark_succeeded(self.job_id, result, progress_message="Completed successfully")
                 exit_code = 0
 
-        except Exception as exc:
+        except (Exception, KeyboardInterrupt) as exc:
+            if self.stop_event.is_set():
+                logger.info("Job '%s' stopped cleanly on cancellation.", self.job_id)
+                self.storage.mark_cancelled(self.job_id, "Cancelled by user request")
+                return 0
+
             err_msg = traceback.format_exc()
             logger.error("Job '%s' failed with error:\n%s", self.job_id, err_msg)
 
@@ -214,18 +219,30 @@ class GPUWorker:
         adapter_path = payload.get("adapter_path")
         feature_set = payload.get("feature_set", "A")
 
+        # Context features passed directly or loaded from snapshot - validate fail-fast before model loading
+        if "contexts" in payload:
+            ctx_array = np.array(payload["contexts"], dtype=np.float32)
+        elif "snapshot_path" in payload:
+            from paxg_lab.data.snapshot import DatasetSnapshot
+            snapshot_path = payload["snapshot_path"]
+            if not Path(snapshot_path).exists():
+                raise FileNotFoundError(f"Snapshot path '{snapshot_path}' not found.")
+            snapshot = DatasetSnapshot.load(snapshot_path)
+            feats = snapshot.get_features(feature_set)
+            if len(feats) < context_len:
+                raise ValueError(f"Snapshot has only {len(feats)} candles, less than required context_len={context_len}")
+            recent_ctx = feats[-context_len:]
+            ctx_array = np.transpose(recent_ctx, (1, 0))[np.newaxis, :, :]
+        else:
+            raise ValueError(
+                "Forecast request missing required 'contexts' array or valid 'snapshot_path'. "
+                "Forecasts must never fallback to synthetic random noise in production."
+            )
+
         self.progress_message = f"Loading model for {timeframe} forecast"
         predictor = TimesFM3Predictor()
         if adapter_path:
             predictor.load_adapter(adapter_path)
-
-        # Context features passed directly or loaded
-        if "contexts" in payload:
-            ctx_array = np.array(payload["contexts"], dtype=np.float32)
-        else:
-            # Dummy inference data if running isolated
-            num_features = 1 if feature_set == "A" else 9
-            ctx_array = np.random.randn(1, num_features, context_len).astype(np.float32)
 
         req = ForecastRequest(
             timeframe=timeframe,
@@ -279,7 +296,10 @@ class GPUWorker:
             epoch = info.get("epoch", 0)
             max_e = spec.max_epochs
             self.progress_pct = (epoch / max(1, max_e)) * 100.0
-            self.progress_message = f"Epoch {epoch}/{max_e}, val_loss: {info.get('val_loss', 0.0):.4f}"
+            if "step" in info:
+                self.progress_message = f"Epoch {epoch}/{max_e}, step {info['step']}, loss: {info.get('loss', 0.0):.4f}"
+            else:
+                self.progress_message = f"Epoch {epoch}/{max_e}, val_loss: {info.get('val_loss', 0.0):.4f}"
             # Check for cancellation
             return not self.stop_event.is_set()
 
@@ -336,11 +356,18 @@ class GPUWorker:
         engine = BacktestEngine(predictor=predictor)
 
         def progress_cb(info: dict[str, Any]) -> bool:
-            self.progress_message = info.get("message", "Evaluating fold")
+            if "batch_idx" in info and "total_batches" in info:
+                self.progress_message = f"Evaluating batch {info['batch_idx']}/{info['total_batches']}"
+            elif "message" in info:
+                self.progress_message = info["message"]
             return not self.stop_event.is_set()
 
-        report = engine.run_full_backtest(snapshot, spec, progress_callback=progress_cb)
-        return report.to_dict()
+        try:
+            report = engine.run_full_backtest(snapshot, spec, progress_callback=progress_cb)
+            return report.to_dict()
+        except InterruptedError:
+            logger.info("Backtest job interrupted by stop event.")
+            return {"status": "cancelled", "message": "Backtest interrupted"}
 
     def _handle_auto_trial_job(self, job: JobSpec) -> dict[str, Any]:
         """Handles single autonomous optimization trial."""

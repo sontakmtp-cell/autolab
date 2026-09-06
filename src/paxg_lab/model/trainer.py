@@ -305,6 +305,7 @@ class LoRATrainer:
             warmup_optimizer_steps,
         )
 
+        stop_requested = False
         for epoch in range(1, self.spec.max_epochs + 1):
             epoch_start = time.time()
             peft_model.train()
@@ -357,6 +358,38 @@ class LoRATrainer:
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
+
+                    # Fine-grained step-level stop check as mandated by PLAN 4.2
+                    if progress_callback is not None:
+                        step_record = {
+                            "epoch": epoch,
+                            "step": global_step,
+                            "type": "step_update",
+                            "loss": loss.item(),
+                        }
+                        try:
+                            should_cont = progress_callback(step_record)
+                            if should_cont is False:
+                                logger.info(
+                                    "Training stopped gracefully by progress_callback at step %d (epoch %d).",
+                                    global_step,
+                                    epoch,
+                                )
+                                stop_requested = True
+                                break
+                        except Exception as cb_err:
+                            logger.warning("progress_callback raised exception at step %d: %s", global_step, cb_err)
+                            stop_requested = True
+                            break
+
+            if stop_requested:
+                if best_lora_state is None:
+                    best_lora_state = {
+                        k: v.cpu().clone()
+                        for k, v in peft_model.state_dict().items()
+                        if "lora" in k.lower()
+                    }
+                break
 
             avg_train_loss = epoch_loss_sum / max(1, epoch_loss_batches)
             final_train_loss = avg_train_loss
