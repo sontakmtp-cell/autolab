@@ -1,6 +1,6 @@
 {
   "phase": "P4",
-  "timestamp": 1788661956.2335365,
+  "timestamp": 1788663084.0042238,
   "device": "NVIDIA GeForce RTX 5060 Ti",
   "python_version": "3.12.12 (main, Jan 14 2026, 19:30:21) [MSC v.1944 64 bit (AMD64)]",
   "scenarios": {
@@ -49,7 +49,7 @@
     },
     "heartbeat_hang_detection": {
       "status": "PASSED",
-      "worker_pid": 14684,
+      "worker_pid": 26336,
       "final_status": "FAILED",
       "error_message": "Heartbeat timed out after 1.5s without response (process hung).",
       "verified_rule": "Hung worker terminated after heartbeat timeout; status marked FAILED"

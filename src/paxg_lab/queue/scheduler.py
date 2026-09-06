@@ -147,6 +147,36 @@ class GPUScheduler:
                     reconcile_msg,
                 )
                 recovered_ids.append(running_job.job_id)
+
+                # Automatic single requeue / resumption for TRAIN and AUTO_TRIAL jobs with durable checkpoints
+                is_trainable = running_job.job_type in (JobType.TRAIN.value, JobType.AUTO_TRIAL.value)
+                resume_attempt = int(running_job.payload.get("resume_attempt", 0)) if running_job.payload else 0
+                if is_trainable and ckpt is not None and resume_attempt < 1:
+                    resumed_job_id = f"{running_job.job_id}_resumed"
+                    resumed_payload = copy.deepcopy(running_job.payload) if running_job.payload else {}
+                    resumed_payload["resume_from_job_id"] = running_job.job_id
+                    resumed_payload["resume_attempt"] = resume_attempt + 1
+
+                    resumed_spec = JobSpec(
+                        job_id=resumed_job_id,
+                        job_type=running_job.job_type,
+                        timeframe=running_job.timeframe,
+                        priority=running_job.priority,
+                        payload=resumed_payload,
+                        timeout_seconds=running_job.timeout_seconds,
+                    )
+                    self.storage.submit_job(resumed_spec)
+                    logger.info(
+                        "Crash Recovery: Automatically requeued resumed job '%s' from durable checkpoint of '%s' (epoch %d, step %d)",
+                        resumed_job_id,
+                        running_job.job_id,
+                        ckpt.epoch,
+                        ckpt.global_step,
+                    )
+                    if running_job.priority == JobPriority.AUTO.value and running_job.timeframe:
+                        curr_state = self.storage.get_auto_run_state(running_job.timeframe)
+                        if curr_state != AutoRunState.PAUSED_ERROR:
+                            self.storage.set_auto_run_state(running_job.timeframe, AutoRunState.SEARCHING)
             else:
                 logger.info(
                     "Startup: Job '%s' is actively running under alive worker PID %d. Adopting job with supervision.",

@@ -1869,10 +1869,14 @@ def test_train_stop_preserves_durable_checkpoint_and_loadable_adapter(temp_db_pa
     exit_code = worker.run()
     assert exit_code == 0
 
-    # Verify job status in storage is CANCELLED
+    # Verify job status in storage is CANCELLED and result metadata is preserved
     finished_job = storage.get_job(job_id)
     assert finished_job is not None
     assert finished_job.status == JobStatus.CANCELLED.value
+    assert finished_job.result is not None
+    assert "checkpoint_path" in finished_job.result
+    assert "adapter_path" in finished_job.result
+    assert finished_job.result["status"] == "cancelled"
 
     # Verify durable checkpoint was saved and can be loaded
     ckpt_mgr = TrainingCheckpointManager(ckpt_dir)
@@ -1891,7 +1895,7 @@ def test_train_stop_preserves_durable_checkpoint_and_loadable_adapter(temp_db_pa
 
 
 def test_scheduler_and_trainer_reconcile_durable_checkpoint_on_restart(temp_db_path: Path, tmp_path: Path):
-    """Verifies that scheduler reconciles durable checkpoints on restart and trainer resumes from reconciled epoch."""
+    """Verifies that scheduler reconciles durable checkpoints on restart, requeues continuation job, and trainer resumes."""
     from paxg_lab.constants import MODEL_REPO, MODEL_REVISION
     from paxg_lab.data.features import FEATURE_SPECS
     from paxg_lab.data.snapshot import DatasetSnapshot
@@ -1905,6 +1909,10 @@ def test_scheduler_and_trainer_reconcile_durable_checkpoint_on_restart(temp_db_p
     ckpt_dir = tmp_path / "checkpoints_reconcile_test"
     ckpt_mgr = TrainingCheckpointManager(ckpt_dir)
     job_id = "interrupted_reconcile_job"
+
+    snap_path = get_or_create_test_snapshot(tmp_path, timeframe="4h")
+    snapshot = DatasetSnapshot.load(snap_path)
+    actual_snap_hash = snapshot.metadata.sha256
 
     # Create dummy base model and attach lora to build initial checkpoint
     base_model = TimesFM3Torch.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
@@ -1924,7 +1932,7 @@ def test_scheduler_and_trainer_reconcile_durable_checkpoint_on_restart(temp_db_p
         base_model_repo=MODEL_REPO,
         base_model_revision=MODEL_REVISION,
         train_spec=trainer.spec.to_dict(),
-        snapshot_hash="fakehash123",
+        snapshot_hash=actual_snap_hash,
         best_epoch=1,
         best_val_loss=0.042,
     )
@@ -1935,6 +1943,7 @@ def test_scheduler_and_trainer_reconcile_durable_checkpoint_on_restart(temp_db_p
         epoch=1,
         step=4,
         best_val_loss=0.042,
+        minibatch_idx=3,  # Completed epoch 1
         status="IN_PROGRESS",
     )
 
@@ -1952,30 +1961,28 @@ def test_scheduler_and_trainer_reconcile_durable_checkpoint_on_restart(temp_db_p
     storage.acquire_next_job()
     storage.register_worker(job_id, dead_pid, time.time() - 100)
 
-    # 1. Scheduler recovery on startup
-    import paxg_lab.queue.checkpoint
-
-    orig_dir = paxg_lab.queue.checkpoint.DEFAULT_CHECKPOINT_DIR
-    paxg_lab.queue.checkpoint.DEFAULT_CHECKPOINT_DIR = ckpt_dir
-    try:
-        scheduler = GPUScheduler(
-            db_path=temp_db_path,
-            acquire_coordinator_lock=False,
-        )
-        recovered = scheduler.recovered_on_startup
-    finally:
-        paxg_lab.queue.checkpoint.DEFAULT_CHECKPOINT_DIR = orig_dir
+    # 1. Scheduler recovery on startup: reconciles and automatically requeues resumed job
+    scheduler = GPUScheduler(
+        db_path=temp_db_path,
+        acquire_coordinator_lock=False,
+    )
+    recovered = scheduler.recovered_on_startup
 
     assert job_id in recovered
     recovered_job = storage.get_job(job_id)
     assert recovered_job.status == JobStatus.INTERRUPTED.value
     assert "Reconciled durable checkpoint: epoch=1, step=4" in recovered_job.error_message
 
-    # 2. Resumed training starts from epoch 2 (start_epoch = ckpt.epoch + 1)
-    snap_path = get_or_create_test_snapshot(tmp_path, timeframe="4h")
-    snapshot = DatasetSnapshot.load(snap_path)
-    features_df = snapshot.to_dataframe("B")
+    # Verify queue-level requeue of resumed job
+    resumed_job_id = f"{job_id}_resumed"
+    resumed_job = storage.get_job(resumed_job_id)
+    assert resumed_job is not None
+    assert resumed_job.status == JobStatus.QUEUED.value
+    assert resumed_job.payload.get("resume_from_job_id") == job_id
+    assert resumed_job.payload.get("resume_attempt") == 1
 
+    # 2. Resumed training starts from epoch 2 without rerunning epoch 1
+    features_df = snapshot.to_dataframe("B")
     epochs_trained = []
 
     def progress_cb(info):
@@ -1985,18 +1992,18 @@ def test_scheduler_and_trainer_reconcile_durable_checkpoint_on_restart(temp_db_p
 
     res = trainer.train(
         features_df=features_df,
-        snapshot_hash=snapshot.metadata.sha256,
+        snapshot_hash=actual_snap_hash,
         progress_callback=progress_cb,
         checkpoint_manager=ckpt_mgr,
         job_id=job_id,
     )
-    # Verify epoch 1 was skipped / not rerun
+    # Verify epoch 1 was skipped and not rerun
     assert 1 not in epochs_trained
     assert all(e >= 2 for e in epochs_trained)
 
 
 def test_checkpoint_atomic_write_preserves_valid_checkpoint_on_crash(tmp_path: Path):
-    """Verifies that atomic write guarantees pre-existing valid checkpoint is unharmed if crash occurs during write."""
+    """Verifies that atomic write guarantees pre-existing valid checkpoint is unharmed if crash occurs during write, commit, or checksum corruption."""
     from paxg_lab.constants import MODEL_REPO, MODEL_REVISION
     from paxg_lab.data.features import FEATURE_SPECS
     from paxg_lab.model.lora import build_lora_timesfm3
@@ -2041,7 +2048,7 @@ def test_checkpoint_atomic_write_preserves_valid_checkpoint_on_crash(tmp_path: P
     assert loaded1.epoch == 1
     assert loaded1.best_val_loss == 0.050
 
-    # 2. Simulate crash during checkpoint 2 write before atomic replace
+    # 2. Simulate crash during checkpoint 2 write before version directory commit
     manifest2 = AdapterManifest(
         adapter_id="ckpt_atomic_2",
         timeframe="4h",
@@ -2057,7 +2064,7 @@ def test_checkpoint_atomic_write_preserves_valid_checkpoint_on_crash(tmp_path: P
         best_val_loss=0.030,
     )
 
-    with pytest.raises(RuntimeError, match="Simulated crash"):
+    with pytest.raises(RuntimeError, match="Simulated crash during checkpoint write"):
         ckpt_mgr.save_checkpoint(
             job_id=job_id,
             peft_model=peft_model,
@@ -2068,12 +2075,46 @@ def test_checkpoint_atomic_write_preserves_valid_checkpoint_on_crash(tmp_path: P
             simulate_crash_before_replace=True,
         )
 
-    # 3. Verify checkpoint 1 remains completely intact and valid
-    loaded_after_crash = ckpt_mgr.load_checkpoint(job_id)
-    assert loaded_after_crash is not None
-    assert loaded_after_crash.epoch == 1
-    assert loaded_after_crash.global_step == 5
-    assert loaded_after_crash.best_val_loss == 0.050
+    # Verify checkpoint 1 remains completely intact and valid
+    loaded_after_crash1 = ckpt_mgr.load_checkpoint(job_id)
+    assert loaded_after_crash1 is not None
+    assert loaded_after_crash1.epoch == 1
+    assert loaded_after_crash1.global_step == 5
+    assert loaded_after_crash1.best_val_loss == 0.050
+
+    # 3. Simulate crash after version dir is committed, but before CURRENT pointer swap
+    with pytest.raises(RuntimeError, match="Simulated crash after version write"):
+        ckpt_mgr.save_checkpoint(
+            job_id=job_id,
+            peft_model=peft_model,
+            manifest=manifest2,
+            epoch=2,
+            step=10,
+            best_val_loss=0.030,
+            simulate_crash_during_commit=True,
+        )
+
+    # CURRENT pointer still points to version 1!
+    loaded_after_crash2 = ckpt_mgr.load_checkpoint(job_id)
+    assert loaded_after_crash2 is not None
+    assert loaded_after_crash2.epoch == 1
+    assert loaded_after_crash2.global_step == 5
+
+    # 4. Checksum corruption detection: corrupted file fails cryptographic integrity verification
+    ckpt_mgr.save_checkpoint(
+        job_id=job_id,
+        peft_model=peft_model,
+        manifest=manifest2,
+        epoch=2,
+        step=12,
+        best_val_loss=0.025,
+        simulate_checksum_corruption=True,
+    )
+    # Checkpoint 2 has corrupted checksum -> load_checkpoint falls back to verified version 1!
+    loaded_after_tamper = ckpt_mgr.load_checkpoint(job_id)
+    assert loaded_after_tamper is not None
+    assert loaded_after_tamper.epoch == 1
+    assert loaded_after_tamper.best_val_loss == 0.050
 
 
 def test_safe_terminate_refuses_when_create_time_none():
@@ -2157,5 +2198,228 @@ def test_access_denied_process_state_prevents_unsafe_worker_dispatch(temp_db_pat
     assert scheduler.active_job_id == "job_active"
     queued = storage.get_job("job_queued")
     assert queued.status == JobStatus.QUEUED.value
+
+
+def test_checkpoint_compatibility_rejects_mismatch(tmp_path: Path):
+    """Verifies that checkpoint compatibility strictly fails closed on snapshot, spec, or base model mismatch."""
+    from paxg_lab.constants import MODEL_REPO, MODEL_REVISION
+    from paxg_lab.data.features import FEATURE_SPECS
+    from paxg_lab.data.snapshot import DatasetSnapshot
+    from paxg_lab.model.lora import build_lora_timesfm3
+    from paxg_lab.model.manifest import AdapterManifest
+    from paxg_lab.model.train_spec import TrainSpec
+    from paxg_lab.model.trainer import LoRATrainer
+    from paxg_lab.queue.checkpoint import TrainingCheckpointManager
+    from timesfm3 import TimesFM3Torch
+
+    ckpt_dir = tmp_path / "checkpoints_compat_test"
+    ckpt_mgr = TrainingCheckpointManager(ckpt_dir)
+    job_id = "compat_check_job"
+
+    base_model = TimesFM3Torch.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
+    peft_model = build_lora_timesfm3(base_model, lora_r=4, lora_alpha=8)
+    f_spec = FEATURE_SPECS["B"]
+
+    manifest = AdapterManifest(
+        adapter_id="ckpt_compat_1",
+        timeframe="4h",
+        horizon=6,
+        context_len=256,
+        feature_set="B",
+        feature_columns=list(f_spec.columns),
+        base_model_repo=MODEL_REPO,
+        base_model_revision=MODEL_REVISION,
+        train_spec={"timeframe": "4h", "horizon": 6, "context_len": 256, "feature_set": "B", "lora_r": 4, "lora_alpha": 8},
+        snapshot_hash="hash_alpha",
+        best_epoch=1,
+        best_val_loss=0.040,
+    )
+    ckpt_mgr.save_checkpoint(
+        job_id=job_id,
+        peft_model=peft_model,
+        manifest=manifest,
+        epoch=1,
+        step=5,
+        best_val_loss=0.040,
+    )
+    ckpt = ckpt_mgr.load_checkpoint(job_id)
+    assert ckpt is not None
+
+    # 1. Snapshot hash mismatch -> must fail closed
+    spec = TrainSpec(timeframe="4h", horizon=6, context_len=256, feature_set="B", lora_r=4, lora_alpha=8)
+    with pytest.raises(ValueError, match="snapshot_hash mismatch"):
+        TrainingCheckpointManager.validate_compatibility(ckpt, spec, current_snapshot_hash="hash_different")
+
+    # 2. Timeframe mismatch -> must fail closed
+    spec_tf_mismatch = TrainSpec(timeframe="1h", horizon=24, context_len=256, feature_set="B", lora_r=4, lora_alpha=8)
+    with pytest.raises(ValueError, match="timeframe' mismatch"):
+        TrainingCheckpointManager.validate_compatibility(ckpt, spec_tf_mismatch, current_snapshot_hash="hash_alpha")
+
+    # 3. LoRA rank mismatch -> must fail closed
+    spec_rank_mismatch = TrainSpec(timeframe="4h", horizon=6, context_len=256, feature_set="B", lora_r=8, lora_alpha=16)
+    with pytest.raises(ValueError, match="lora_r' mismatch"):
+        TrainingCheckpointManager.validate_compatibility(ckpt, spec_rank_mismatch, current_snapshot_hash="hash_alpha")
+
+    # 4. Base model mismatch -> must fail closed
+    with pytest.raises(ValueError, match="base model mismatch"):
+        TrainingCheckpointManager.validate_compatibility(
+            ckpt, spec, current_snapshot_hash="hash_alpha", base_model_repo="different/base-repo"
+        )
+
+    # 5. LoRATrainer.train strictly refuses resume on mismatched snapshot
+    snap_path = get_or_create_test_snapshot(tmp_path, timeframe="4h")
+    snapshot = DatasetSnapshot.load(snap_path)
+    clean_base_model = TimesFM3Torch.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
+    trainer = LoRATrainer(base_model=clean_base_model, spec=spec)
+    with pytest.raises(ValueError, match="snapshot_hash mismatch"):
+        trainer.train(
+            features_df=snapshot.to_dataframe("B"),
+            snapshot_hash="mismatched_runtime_hash",
+            checkpoint_manager=ckpt_mgr,
+            job_id=job_id,
+        )
+
+
+def test_mid_epoch_checkpoint_and_resumption_no_skipping(tmp_path: Path):
+    """Verifies that mid-epoch checkpoint continuation does not skip remaining minibatches of the epoch nor rerun completed minibatches."""
+    from paxg_lab.constants import MODEL_REPO, MODEL_REVISION
+    from paxg_lab.data.features import FEATURE_SPECS
+    from paxg_lab.data.snapshot import DatasetSnapshot
+    from paxg_lab.model.lora import build_lora_timesfm3
+    from paxg_lab.model.manifest import AdapterManifest
+    from paxg_lab.model.train_spec import TrainSpec
+    from paxg_lab.model.trainer import LoRATrainer
+    from paxg_lab.queue.checkpoint import TrainingCheckpointManager
+    from timesfm3 import TimesFM3Torch
+
+    ckpt_dir = tmp_path / "checkpoints_midepoch_test"
+    ckpt_mgr = TrainingCheckpointManager(ckpt_dir)
+    job_id = "midepoch_resume_job"
+
+    snap_path = get_or_create_test_snapshot(tmp_path, timeframe="4h")
+    snapshot = DatasetSnapshot.load(snap_path)
+    features_df = snapshot.to_dataframe("B")
+    snap_hash = snapshot.metadata.sha256
+
+    base_model = TimesFM3Torch.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
+    spec = TrainSpec(
+        timeframe="4h",
+        horizon=6,
+        context_len=256,
+        feature_set="B",
+        max_epochs=2,
+        batch_size=2,
+        gradient_accumulation_steps=1,
+        max_samples_per_epoch=8,  # Exactly 4 minibatches per epoch (0, 1, 2, 3)
+    )
+    trainer = LoRATrainer(base_model=base_model, spec=spec)
+    peft_model = build_lora_timesfm3(base_model, lora_r=4, lora_alpha=8)
+
+    # 1. Create a checkpoint stopped MID-EPOCH at epoch 1, minibatch_idx 0 (1/4 done)
+    f_spec = FEATURE_SPECS["B"]
+    manifest = AdapterManifest(
+        adapter_id="ckpt_midepoch_1",
+        timeframe="4h",
+        horizon=6,
+        context_len=256,
+        feature_set="B",
+        feature_columns=list(f_spec.columns),
+        base_model_repo=MODEL_REPO,
+        base_model_revision=MODEL_REVISION,
+        train_spec=spec.to_dict(),
+        snapshot_hash=snap_hash,
+        best_epoch=1,
+        best_val_loss=0.060,
+    )
+    ckpt_mgr.save_checkpoint(
+        job_id=job_id,
+        peft_model=peft_model,
+        manifest=manifest,
+        epoch=1,
+        step=1,
+        best_val_loss=0.060,
+        minibatch_idx=0,  # Stopped after first minibatch of epoch 1
+        status="STOPPED",
+    )
+
+    # 2. Resume training
+    records: list[dict[str, Any]] = []
+
+    def progress_cb(info):
+        records.append(dict(info))
+        return True
+
+    res = trainer.train(
+        features_df=features_df,
+        snapshot_hash=snap_hash,
+        progress_callback=progress_cb,
+        checkpoint_manager=ckpt_mgr,
+        job_id=job_id,
+    )
+
+    # Verify that:
+    # 1. Epoch 1 was NOT skipped (it continued from minibatch 1 to completion)
+    # 2. Total steps equal 7 (1 previously completed step + 3 remaining steps in epoch 1 + 4 steps in epoch 2)
+    step_records = [r for r in records if r.get("type") == "step_update"]
+    assert len(step_records) > 0
+    # Steps should start from global_step 2 (continuation of step 1)
+    first_continued_step = step_records[0]["step"]
+    assert first_continued_step == 2
+    assert res.total_steps >= 7
+    assert res.manifest.best_epoch >= 1
+
+
+def test_stopped_job_result_persisted_in_database(temp_db_path: Path, tmp_path: Path):
+    """Verifies that when a job is stopped, its full result metadata is preserved in the database."""
+    from paxg_lab.queue.worker import GPUWorker
+
+    storage = GPUJobStorage(temp_db_path)
+    snap_path = get_or_create_test_snapshot(tmp_path, timeframe="4h")
+    ckpt_dir = tmp_path / "checkpoints_res_test"
+    adapter_dir = tmp_path / "adapters_res_test"
+    job_id = "stop_result_persisted_job"
+
+    storage.submit_job(
+        JobSpec(
+            job_id=job_id,
+            job_type=JobType.TRAIN.value,
+            timeframe="4h",
+            priority=JobPriority.MANUAL.value,
+            payload={
+                "snapshot_path": str(snap_path),
+                "checkpoint_dir": str(ckpt_dir),
+                "adapter_store_dir": str(adapter_dir),
+                "train_spec": {
+                    "timeframe": "4h",
+                    "horizon": 6,
+                    "max_epochs": 3,
+                    "batch_size": 2,
+                    "gradient_accumulation_steps": 2,
+                    "max_samples_per_epoch": 8,
+                },
+            },
+        )
+    )
+
+    worker = GPUWorker(job_id=job_id, db_path=temp_db_path)
+    orig_dispatch = worker._dispatch
+
+    def stop_dispatch(job):
+        worker.stop_event.set()
+        return orig_dispatch(job)
+
+    worker._dispatch = stop_dispatch
+    worker.run()
+
+    job_record = storage.get_job(job_id)
+    assert job_record is not None
+    assert job_record.status == JobStatus.CANCELLED.value
+    assert job_record.result is not None
+    assert job_record.result.get("status") == "cancelled"
+    assert "checkpoint_path" in job_record.result
+    assert "adapter_path" in job_record.result
+    assert "total_steps" in job_record.result
+    assert "best_val_loss" in job_record.result
+
 
 

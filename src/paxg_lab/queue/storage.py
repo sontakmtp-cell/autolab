@@ -432,17 +432,23 @@ class GPUJobStorage:
                 (JobStatus.FAILED.value, error_message, now, job_id),
             )
 
-    def mark_cancelled(self, job_id: str, message: str = "Cancelled by user") -> None:
-        """Marks a job as CANCELLED."""
+    def mark_cancelled(
+        self,
+        job_id: str,
+        message: str = "Cancelled by user",
+        result: dict[str, Any] | None = None,
+    ) -> None:
+        """Marks a job as CANCELLED with optional result metadata."""
         now = time.time()
+        result_json = json.dumps(result, default=str) if result is not None else None
         with self.get_connection() as conn:
             conn.execute(
                 """
                 UPDATE gpu_jobs
-                SET status = ?, finished_at = ?, progress_message = ?
+                SET status = ?, result = ?, finished_at = ?, progress_message = ?
                 WHERE job_id = ?;
                 """,
-                (JobStatus.CANCELLED.value, now, message, job_id),
+                (JobStatus.CANCELLED.value, result_json, now, message, job_id),
             )
 
     def mark_interrupted(self, job_id: str, message: str = "Process interrupted") -> None:

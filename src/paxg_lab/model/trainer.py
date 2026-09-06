@@ -294,15 +294,29 @@ class LoRATrainer:
         global_step = 0
         final_train_loss = 0.0
         start_epoch = 1
+        start_minibatch_idx = 0
+        rng = np.random.default_rng(self.spec.seed)
 
         # Check for pre-existing durable checkpoint to reconcile / resume
         if checkpoint_manager is not None and job_id is not None:
             existing_ckpt = checkpoint_manager.load_checkpoint(job_id)
             if existing_ckpt is not None:
+                from paxg_lab.queue.checkpoint import TrainingCheckpointManager
+
+                # 1. Fail closed: strictly validate provenance and compatibility
+                TrainingCheckpointManager.validate_compatibility(
+                    checkpoint=existing_ckpt,
+                    current_spec=self.spec,
+                    current_snapshot_hash=snapshot_hash,
+                    base_model_repo=MODEL_REPO,
+                    base_model_revision=MODEL_REVISION,
+                )
+
                 logger.info(
-                    "Reconciling durable checkpoint for job '%s': resuming from epoch %d, step %d (best_val_loss=%.6f)",
+                    "Reconciling compatible checkpoint for job '%s': epoch=%d, minibatch_idx=%d, step=%d, best_val_loss=%.6f",
                     job_id,
                     existing_ckpt.epoch,
+                    existing_ckpt.minibatch_idx,
                     existing_ckpt.global_step,
                     existing_ckpt.best_val_loss,
                 )
@@ -313,7 +327,17 @@ class LoRATrainer:
                     saved_weights = torch.load(str(existing_ckpt.weights_path), map_location=self.device)
 
                 peft_model.load_state_dict(saved_weights, strict=False)
-                start_epoch = existing_ckpt.epoch + 1
+
+                # 2. Determine exact continuation boundary without skipping unfinished work
+                if existing_ckpt.minibatch_idx < 0 or existing_ckpt.minibatch_idx >= minibatches_per_epoch - 1:
+                    # Previous epoch was fully completed
+                    start_epoch = existing_ckpt.epoch + 1
+                    start_minibatch_idx = 0
+                else:
+                    # Stopped mid-epoch: resume right from next minibatch in the SAME epoch
+                    start_epoch = existing_ckpt.epoch
+                    start_minibatch_idx = existing_ckpt.minibatch_idx + 1
+
                 global_step = existing_ckpt.global_step
                 best_val_loss = existing_ckpt.best_val_loss
                 best_epoch = existing_ckpt.epoch
@@ -323,7 +347,23 @@ class LoRATrainer:
                     if "lora" in k.lower()
                 }
 
-        rng = np.random.default_rng(self.spec.seed)
+                # 3. Restore optimizer, scheduler, and RNG state if trainer_state.pt is present
+                if existing_ckpt.trainer_state_path and existing_ckpt.trainer_state_path.exists():
+                    try:
+                        t_state = torch.load(str(existing_ckpt.trainer_state_path), map_location=self.device)
+                        if "optimizer" in t_state:
+                            optimizer.load_state_dict(t_state["optimizer"])
+                        if "scheduler" in t_state:
+                            scheduler.load_state_dict(t_state["scheduler"])
+                        if "torch_rng" in t_state:
+                            torch.set_rng_state(t_state["torch_rng"])
+                        if "torch_cuda_rng" in t_state and t_state["torch_cuda_rng"] is not None and torch.cuda.is_available():
+                            torch.cuda.set_rng_state_all(t_state["torch_cuda_rng"])
+                        if "np_rng" in t_state:
+                            rng.bit_generator.state = t_state["np_rng"]
+                        logger.info("Restored optimizer, scheduler, and RNG states from durable checkpoint.")
+                    except Exception as state_err:
+                        logger.warning("Failed to restore trainer_state.pt: %s", state_err)
 
         logger.info(
             "Starting LoRA training: max_epochs=%d, batch_size=%d, grad_accum=%d (effective=%d), "
@@ -350,7 +390,13 @@ class LoRATrainer:
 
             optimizer.zero_grad()
 
-            for i in range(0, len(epoch_indices), self.spec.batch_size):
+            minibatch_start = start_minibatch_idx if epoch == start_epoch else 0
+            start_i = minibatch_start * self.spec.batch_size
+            last_processed_minibatch = minibatch_start - 1
+
+            for i in range(start_i, len(epoch_indices), self.spec.batch_size):
+                curr_minibatch = i // self.spec.batch_size
+                last_processed_minibatch = curr_minibatch
                 batch_idx = epoch_indices[i : i + self.spec.batch_size]
                 b_ctx_np = train_ctx[batch_idx]  # (B, context_len, num_features)
                 b_fut_np = train_fut[batch_idx]  # (B, horizon)
@@ -439,6 +485,16 @@ class LoRATrainer:
                             best_epoch=best_epoch,
                             best_val_loss=best_val_loss,
                         )
+                        trainer_state = {
+                            "optimizer": optimizer.state_dict(),
+                            "scheduler": scheduler.state_dict(),
+                            "torch_rng": torch.get_rng_state(),
+                            "torch_cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                            "np_rng": rng.bit_generator.state,
+                            "epoch": epoch,
+                            "minibatch_idx": last_processed_minibatch,
+                            "global_step": global_step,
+                        }
                         checkpoint_manager.save_checkpoint(
                             job_id=job_id,
                             peft_model=peft_model,
@@ -446,6 +502,8 @@ class LoRATrainer:
                             epoch=epoch,
                             step=global_step,
                             best_val_loss=best_val_loss,
+                            minibatch_idx=last_processed_minibatch,
+                            trainer_state=trainer_state,
                             status="STOPPED",
                         )
                     except Exception as ckpt_err:
@@ -539,6 +597,16 @@ class LoRATrainer:
                         best_epoch=best_epoch,
                         best_val_loss=best_val_loss,
                     )
+                    train_state_epoch = {
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                        "torch_rng": torch.get_rng_state(),
+                        "torch_cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                        "np_rng": rng.bit_generator.state,
+                        "epoch": epoch,
+                        "minibatch_idx": minibatches_per_epoch - 1,
+                        "global_step": global_step,
+                    }
                     checkpoint_manager.save_checkpoint(
                         job_id=job_id,
                         peft_model=peft_model,
@@ -546,6 +614,8 @@ class LoRATrainer:
                         epoch=epoch,
                         step=global_step,
                         best_val_loss=best_val_loss,
+                        minibatch_idx=minibatches_per_epoch - 1,
+                        trainer_state=train_state_epoch,
                         status="IN_PROGRESS",
                     )
                 except Exception as ckpt_err:
@@ -565,6 +635,8 @@ class LoRATrainer:
                                     epoch=epoch,
                                     step=global_step,
                                     best_val_loss=best_val_loss,
+                                    minibatch_idx=minibatches_per_epoch - 1,
+                                    trainer_state=train_state_epoch,
                                     status="STOPPED",
                                 )
                             except Exception as ckpt_err:

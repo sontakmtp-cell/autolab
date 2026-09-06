@@ -115,7 +115,7 @@ class GPUWorker:
 
             if self.stop_event.is_set():
                 logger.info("Job '%s' stopped cleanly on cancellation.", self.job_id)
-                self.storage.mark_cancelled(self.job_id, "Cancelled by user request")
+                self.storage.mark_cancelled(self.job_id, "Cancelled by user request", result=result)
                 exit_code = 0
             else:
                 logger.info("Job '%s' finished successfully.", self.job_id)
