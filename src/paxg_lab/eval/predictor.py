@@ -174,6 +174,26 @@ class TimesFM3Predictor:
 
         return point_predictions, sorted_quantiles
 
+    def predict(
+        self,
+        contexts: np.ndarray,
+        horizon: int,
+        batch_size: int = 16,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Runs batched inference over multiple contexts to avoid OOM."""
+        if len(contexts) == 0:
+            return np.empty((0, horizon), dtype=np.float32), np.empty((0, horizon, 9), dtype=np.float32)
+
+        point_preds = []
+        quantiles = []
+        for i in range(0, len(contexts), batch_size):
+            batch = contexts[i : i + batch_size]
+            p, q = self.predict_batch(batch, horizon=horizon)
+            point_preds.append(p)
+            quantiles.append(q)
+
+        return np.concatenate(point_preds, axis=0), np.concatenate(quantiles, axis=0)
+
     def forecast_request(
         self,
         request: ForecastRequest,

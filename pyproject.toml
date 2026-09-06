@@ -43,6 +43,7 @@ paxg-web = [
     "psutil>=5.9.0",
     "plotly>=5.20.0",
     "streamlit>=1.35.0",
+    "optuna>=3.6.0",
 ]
 
 [tool.ruff]

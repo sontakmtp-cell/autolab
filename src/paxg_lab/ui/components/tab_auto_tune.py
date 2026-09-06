@@ -127,7 +127,23 @@ def render_auto_tune_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> Non
         st.markdown("<div style='height: 0.8rem;'></div>", unsafe_allow_html=True)
         if st.button("▶ Bật Tự động", use_container_width=True, disabled=(current_state == AutoRunState.SEARCHING)):
             storage.set_auto_run_state(timeframe, AutoRunState.SEARCHING)
-            st.success(f"Đã kích hoạt chế độ tự động cho khung {timeframe}!")
+            recent_auto = list_recent_jobs(job_type=JobType.AUTO_TRIAL.value, timeframe=timeframe, limit=5, db_path=db_path)
+            has_pending = any(j.status in (JobStatus.QUEUED.value, JobStatus.RUNNING.value) for j in recent_auto)
+            if not has_pending:
+                snap_dir = Path("var/paxg_lab/snapshots")
+                candidates = sorted(snap_dir.glob(f"paxgusdt_{timeframe}_*"))
+                snap_path = str(candidates[-1]) if candidates else ""
+                job_id = f"auto_tune_{timeframe}_{int(time.time())}"
+                spec = JobSpec(
+                    job_id=job_id,
+                    job_type=JobType.AUTO_TRIAL.value,
+                    timeframe=timeframe,
+                    priority=JobPriority.AUTO.value,
+                    payload={"timeframe": timeframe, "snapshot_path": snap_path, "max_trials": 30},
+                    timeout_seconds=1200.0,
+                )
+                storage.submit_job(spec)
+            st.success(f"Đã kích hoạt chế độ tự động cho khung {timeframe} và đưa công việc vào hàng đợi GPU!")
             st.rerun()
 
     with col_btn_stop:
@@ -135,7 +151,10 @@ def render_auto_tune_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> Non
         if st.button("⏹ Dừng Tự động", use_container_width=True, disabled=(current_state == AutoRunState.STOPPED)):
             storage.set_auto_run_state(timeframe, AutoRunState.STOPPED)
             cancelled = storage.cancel_pending_auto_jobs(timeframe)
-            st.warning(f"Đã dừng chế độ tự động khung {timeframe} (Hủy {cancelled} job chờ).")
+            running_job = storage.get_running_job()
+            if running_job and running_job.priority == JobPriority.AUTO.value and (running_job.timeframe == timeframe or not running_job.timeframe):
+                storage.request_cancel(running_job.job_id)
+            st.warning(f"Đã dừng chế độ tự động khung {timeframe} (Hủy {cancelled} job chờ, yêu cầu dừng job đang chạy).")
             st.rerun()
 
     # Note regarding P6 implementation

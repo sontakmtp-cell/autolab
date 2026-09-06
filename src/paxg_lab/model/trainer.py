@@ -96,7 +96,9 @@ class LoRATrainer:
     def prepare_dataset(
         self,
         features_df: pd.DataFrame,
-        fold_id: int = 1,
+        fold_id: int | str = 1,
+        explicit_train_range: tuple[int, int] | None = None,
+        explicit_val_range: tuple[int, int] | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
         """Prepares leak-free sliding training and validation early-stopping windows.
 
@@ -114,78 +116,128 @@ class LoRATrainer:
         feat_matrix = features_df[list(f_spec.columns)].to_numpy(dtype=np.float32)
         target_series = features_df["close"].to_numpy(dtype=np.float32)
         timestamps = features_df["open_time"].to_numpy(dtype=np.int64)
+        candles_per_day = 24 if self.spec.timeframe == "1h" else 6
 
-        # 2. Split boundaries
-        split_plan = calculate_split_plan(
-            total_candles=len(features_df),
-            timeframe=self.spec.timeframe,
-        )
+        if explicit_train_range is not None:
+            train_start, train_end = explicit_train_range
+            if isinstance(self.spec.history_days, int):
+                max_candles = self.spec.history_days * candles_per_day
+                if train_end - train_start > max_candles:
+                    train_start = max(train_end - max_candles, 0)
 
-        selected_fold = None
-        for fold in split_plan.eval_folds:
-            if fold.fold_id == fold_id:
-                selected_fold = fold
-                break
-
-        if selected_fold is None:
-            selected_fold = split_plan.eval_folds[0]
-
-        train_start = selected_fold.train_start
-        train_end = selected_fold.train_end
-
-        # Restrict history if requested (e.g. 180 or 365 days)
-        if isinstance(self.spec.history_days, int):
-            candles_per_day = 24 if self.spec.timeframe == "1h" else 6
-            max_candles = self.spec.history_days * candles_per_day
-            if train_end - train_start > max_candles:
-                train_start = max(train_end - max_candles, 0)
-
-        # 3. Extract training windows
-        train_ctx, train_fut, train_origins = extract_windows(
-            features=feat_matrix,
-            targets=target_series,
-            context_len=self.spec.context_len,
-            horizon=self.spec.horizon,
-            start_idx=train_start,
-            end_idx=train_end,
-            step=1,
-            timestamps=timestamps,
-            timeframe=self.spec.timeframe,
-        )
-
-        if len(train_ctx) == 0:
-            raise ValueError(
-                f"Insufficient training samples extracted for timeframe '{self.spec.timeframe}', "
-                f"context={self.spec.context_len}, horizon={self.spec.horizon} in range [{train_start}, {train_end}]."
+            # 3. Extract training windows
+            train_ctx, train_fut, train_origins = extract_windows(
+                features=feat_matrix,
+                targets=target_series,
+                context_len=self.spec.context_len,
+                horizon=self.spec.horizon,
+                start_idx=train_start,
+                end_idx=train_end,
+                step=1,
+                timestamps=timestamps,
+                timeframe=self.spec.timeframe,
             )
 
-        # 4. Extract validation early stopping windows
-        val_ctx, val_fut, val_origins = extract_windows(
-            features=feat_matrix,
-            targets=target_series,
-            context_len=self.spec.context_len,
-            horizon=self.spec.horizon,
-            start_idx=selected_fold.val_early_stop_start,
-            end_idx=selected_fold.val_early_stop_end,
-            step=1,
-            timestamps=timestamps,
-            timeframe=self.spec.timeframe,
-        )
+            if len(train_ctx) == 0:
+                raise ValueError(
+                    f"Insufficient training samples extracted for timeframe '{self.spec.timeframe}', "
+                    f"context={self.spec.context_len}, horizon={self.spec.horizon} in range [{train_start}, {train_end}]."
+                )
 
-        if len(val_ctx) == 0:
-            raise ValueError(
-                f"Insufficient validation samples in early stop range "
-                f"[{selected_fold.val_early_stop_start}, {selected_fold.val_early_stop_end}]."
+            # 4. Extract validation windows
+            if explicit_val_range is not None:
+                val_start, val_end = explicit_val_range
+            else:
+                val_len = min(14 * candles_per_day, max(1, (train_end - train_start) // 4))
+                val_end = train_end
+                val_start = max(train_end - val_len, train_start)
+
+            val_ctx, val_fut, val_origins = extract_windows(
+                features=feat_matrix,
+                targets=target_series,
+                context_len=self.spec.context_len,
+                horizon=self.spec.horizon,
+                start_idx=val_start,
+                end_idx=val_end,
+                step=1,
+                timestamps=timestamps,
+                timeframe=self.spec.timeframe,
             )
+
+            selected_fold_id = fold_id
+        else:
+            # 2. Split boundaries from split plan
+            split_plan = calculate_split_plan(
+                total_candles=len(features_df),
+                timeframe=self.spec.timeframe,
+            )
+
+            selected_fold = None
+            for fold in split_plan.eval_folds:
+                if fold.fold_id == fold_id:
+                    selected_fold = fold
+                    break
+
+            if selected_fold is None:
+                selected_fold = split_plan.eval_folds[0]
+
+            train_start = selected_fold.train_start
+            train_end = selected_fold.train_end
+
+            # Restrict history if requested (e.g. 180 or 365 days)
+            if isinstance(self.spec.history_days, int):
+                max_candles = self.spec.history_days * candles_per_day
+                if train_end - train_start > max_candles:
+                    train_start = max(train_end - max_candles, 0)
+
+            # 3. Extract training windows
+            train_ctx, train_fut, train_origins = extract_windows(
+                features=feat_matrix,
+                targets=target_series,
+                context_len=self.spec.context_len,
+                horizon=self.spec.horizon,
+                start_idx=train_start,
+                end_idx=train_end,
+                step=1,
+                timestamps=timestamps,
+                timeframe=self.spec.timeframe,
+            )
+
+            if len(train_ctx) == 0:
+                raise ValueError(
+                    f"Insufficient training samples extracted for timeframe '{self.spec.timeframe}', "
+                    f"context={self.spec.context_len}, horizon={self.spec.horizon} in range [{train_start}, {train_end}]."
+                )
+
+            # 4. Extract validation early stopping windows
+            val_ctx, val_fut, val_origins = extract_windows(
+                features=feat_matrix,
+                targets=target_series,
+                context_len=self.spec.context_len,
+                horizon=self.spec.horizon,
+                start_idx=selected_fold.val_early_stop_start,
+                end_idx=selected_fold.val_early_stop_end,
+                step=1,
+                timestamps=timestamps,
+                timeframe=self.spec.timeframe,
+            )
+
+            if len(val_ctx) == 0:
+                raise ValueError(
+                    f"Insufficient validation samples in early stop range "
+                    f"[{selected_fold.val_early_stop_start}, {selected_fold.val_early_stop_end}]."
+                )
+
+            selected_fold_id = selected_fold.fold_id
 
         train_time_range = {
-            "fold_id": selected_fold.fold_id,
+            "fold_id": selected_fold_id,
             "train_start_idx": train_start,
             "train_end_idx": train_end,
             "train_start_time_ms": int(timestamps[train_origins[0] - self.spec.context_len + 1]),
             "train_end_time_ms": int(timestamps[train_origins[-1] + self.spec.horizon]),
-            "val_start_time_ms": int(timestamps[val_origins[0] - self.spec.context_len + 1]),
-            "val_end_time_ms": int(timestamps[val_origins[-1] + self.spec.horizon]),
+            "val_start_time_ms": int(timestamps[val_origins[0] - self.spec.context_len + 1]) if len(val_origins) > 0 else int(timestamps[train_origins[0] - self.spec.context_len + 1]),
+            "val_end_time_ms": int(timestamps[val_origins[-1] + self.spec.horizon]) if len(val_origins) > 0 else int(timestamps[train_origins[-1] + self.spec.horizon]),
             "num_train_windows": len(train_ctx),
             "num_val_windows": len(val_ctx),
         }
@@ -196,8 +248,8 @@ class LoRATrainer:
             train_origins[0],
             train_origins[-1],
             len(val_ctx),
-            val_origins[0],
-            val_origins[-1],
+            val_origins[0] if len(val_origins) > 0 else -1,
+            val_origins[-1] if len(val_origins) > 0 else -1,
         )
 
         return train_ctx, train_fut, val_ctx, val_fut, train_time_range
@@ -225,11 +277,13 @@ class LoRATrainer:
         self,
         features_df: pd.DataFrame,
         snapshot_hash: str = "",
-        fold_id: int = 1,
+        fold_id: int | str = 1,
         adapter_id: str | None = None,
         progress_callback: Any | None = None,
         checkpoint_manager: Any | None = None,
         job_id: str | None = None,
+        explicit_train_range: tuple[int, int] | None = None,
+        explicit_val_range: tuple[int, int] | None = None,
     ) -> TrainingResult:
         """Runs the complete training loop, early stopping, and best checkpoint restoration."""
         start_wall_time = time.time()
@@ -262,6 +316,8 @@ class LoRATrainer:
         train_ctx, train_fut, val_ctx, val_fut, data_meta = self.prepare_dataset(
             features_df=features_df,
             fold_id=fold_id,
+            explicit_train_range=explicit_train_range,
+            explicit_val_range=explicit_val_range,
         )
 
         num_train_samples = len(train_ctx)

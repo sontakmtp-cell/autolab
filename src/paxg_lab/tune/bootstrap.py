@@ -29,12 +29,13 @@ class BlockBootstrapResult:
     num_blocks: int
     candidate_weighted_mae: float
     baseline_weighted_mae: float
+    baseline_name: str
     mean_improvement_usdt: float
     relative_improvement_pct: float
     ci_95_lower: float
     ci_95_upper: float
     is_significant_positive: bool
-    num_resamples: int
+    num_resamples: int = 1000
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -42,7 +43,7 @@ class BlockBootstrapResult:
 
 def get_block_size_for_timeframe(timeframe: str) -> int:
     """Returns number of candles in one 24-hour block for the given timeframe.
-    
+
     1h: 24 candles (24 * 1h = 24h)
     4h: 6 candles (6 * 4h = 24h)
     """
@@ -59,21 +60,28 @@ def compute_block_bootstrap_ci(
     baseline_predictions: np.ndarray,
     targets: np.ndarray,
     timeframe: str,
+    baseline_name: str = "current_recommended",
     num_resamples: int = 1000,
     seed: int = 42,
     min_required_blocks: int = 20,
+    subsample_origins: bool = True,
 ) -> BlockBootstrapResult:
     """Partitions test predictions into 24-hour non-overlapping blocks and computes 95% bootstrap CI.
-    
+
+    Non-overlapping 24h evaluation ensures that forecast origins and target horizons do not overlap:
+    - 1h: origins spaced by 24 candles
+    - 4h: origins spaced by 6 candles
+
     Args:
         candidate_predictions: (N, horizon) candidate point predictions.
-        baseline_predictions: (N, horizon) baseline point predictions (e.g. base model or current recommended).
+        baseline_predictions: (N, horizon) baseline point predictions (current recommended adapter or base model).
         targets: (N, horizon) actual future close prices.
         timeframe: "1h" or "4h".
+        baseline_name: Identifier of the baseline model (e.g. adapter ID or "TimesFM3-Base").
         num_resamples: Number of bootstrap iterations (default 1000).
         seed: Random seed for bootstrap sampling.
         min_required_blocks: Minimum independent blocks required (default 20).
-        
+
     Returns:
         BlockBootstrapResult containing block count, MAEs, 95% CI bounds, and significance verdict.
     """
@@ -88,14 +96,17 @@ def compute_block_bootstrap_ci(
             f"baseline ({len(baseline_predictions)}), targets ({len(targets)}) must have same length."
         )
 
-    # In step=1 sliding windows, windows starting block_len apart are independent
-    # A single window has horizon length = block_len (24 for 1h, 6 for 4h).
-    # Therefore, taking non-overlapping window indices: origin, origin + block_len, origin + 2*block_len...
-    num_blocks = num_windows // block_len
+    # Determine non-overlapping forecast origins spaced by block_len (24 for 1h, 6 for 4h)
+    if subsample_origins:
+        origin_indices = np.arange(0, num_windows, block_len)
+    else:
+        origin_indices = np.arange(num_windows)
+
+    num_blocks = len(origin_indices)
     if num_blocks < min_required_blocks:
         raise ValueError(
             f"Insufficient independent 24-hour blocks: got {num_blocks}, but minimum {min_required_blocks} "
-            f"are required per PLAN 3.5 specification (need at least {min_required_blocks * block_len} test windows)."
+            f"are required per PLAN 3.5 specification."
         )
 
     # Calculate block-wise improvements across non-overlapping blocks
@@ -103,13 +114,10 @@ def compute_block_bootstrap_ci(
     block_cand_maes = []
     block_base_maes = []
 
-    for k in range(num_blocks):
-        start = k * block_len
-        end = start + block_len
-        # Slice block windows
-        c_block = candidate_predictions[start:end]
-        b_block = baseline_predictions[start:end]
-        t_block = targets[start:end]
+    for idx in origin_indices:
+        c_block = candidate_predictions[idx : idx + 1]
+        b_block = baseline_predictions[idx : idx + 1]
+        t_block = targets[idx : idx + 1]
 
         cand_mae = calculate_weighted_mae(c_block, t_block, weights)
         base_mae = calculate_weighted_mae(b_block, t_block, weights)
@@ -148,6 +156,7 @@ def compute_block_bootstrap_ci(
         num_blocks=num_blocks,
         candidate_weighted_mae=overall_cand_mae,
         baseline_weighted_mae=overall_base_mae,
+        baseline_name=baseline_name,
         mean_improvement_usdt=mean_imp,
         relative_improvement_pct=rel_imp_pct,
         ci_95_lower=ci_lower,

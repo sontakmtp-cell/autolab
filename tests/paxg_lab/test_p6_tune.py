@@ -58,15 +58,9 @@ def mock_snapshot(temp_dir: Path) -> DatasetSnapshot:
     timestamps = np.arange(1700000000000, 1700000000000 + n_candles * 3600000, 3600000, dtype=np.int64)
     # Synthetic prices
     base_price = 2000.0 + np.cumsum(np.random.default_rng(42).normal(0, 2.0, n_candles))
-    features_a = np.column_stack([
-        base_price,  # close
-        base_price + 1.0,  # open
-        base_price + 2.0,  # high
-        base_price - 2.0,  # low
-        np.ones(n_candles) * 100.0,  # volume
-    ])
-    features_b = np.column_stack([features_a, np.ones((n_candles, 5))])
-    features_c = np.column_stack([features_b, np.ones((n_candles, 5))])
+    features_a = base_price[:, np.newaxis]  # close (1 col)
+    features_b = np.column_stack([features_a, np.ones((n_candles, 8))])  # 9 cols
+    features_c = np.column_stack([features_b, np.ones((n_candles, 2))])  # 11 cols
 
     meta = SnapshotMetadata(
         snapshot_id="mock_1h_snap",
@@ -676,3 +670,487 @@ def test_auto_tune_stop_and_resume_recovery(temp_dir: Path):
     # Resume auto-run: transitions back to SEARCHING without data loss
     storage.set_auto_run_state("1h", AutoRunState.SEARCHING)
     assert storage.get_auto_run_state("1h") == AutoRunState.SEARCHING
+
+
+# ---------------------------------------------------------------------------
+# 8. Regression Tests for Code Review Comment 5558805566
+# ---------------------------------------------------------------------------
+
+
+def create_mock_locked_report(
+    candidate_id: str,
+    timeframe: str = "1h",
+    score_v1: float = 8.5,
+    current_rec_score: float = 0.0,
+    cand_mae: float = 9.8,
+    base_mae: float = 10.0,
+    naive_mae: float = 12.0,
+    worst_segment_ratio: float = 1.02,
+    coverage_80: float = 0.82,
+    bootstrap_result: BlockBootstrapResult | None = None,
+) -> Any:
+    from paxg_lab.tune.locked_eval import LockedVerificationReport
+
+    if bootstrap_result is None:
+        bootstrap_result = BlockBootstrapResult(
+            timeframe=timeframe,
+            block_size_candles=24 if timeframe == "1h" else 6,
+            num_blocks=25,
+            candidate_weighted_mae=cand_mae,
+            baseline_weighted_mae=base_mae,
+            baseline_name="current_recommended",
+            mean_improvement_usdt=base_mae - cand_mae,
+            relative_improvement_pct=((base_mae - cand_mae) / base_mae) * 100,
+            ci_95_lower=0.05,
+            ci_95_upper=0.35,
+            is_significant_positive=True,
+            num_resamples=1000,
+        )
+
+    return LockedVerificationReport(
+        timeframe=timeframe,
+        candidate_id=candidate_id,
+        test_start_idx=2400,
+        test_end_idx=3000,
+        score_v1=score_v1,
+        current_recommended_score=current_rec_score,
+        score_diff=score_v1 - current_rec_score,
+        candidate_weighted_mae=cand_mae,
+        base_weighted_mae=base_mae,
+        naive_weighted_mae=naive_mae,
+        baseline_weighted_mae=base_mae,
+        baseline_name=bootstrap_result.baseline_name,
+        mae_vs_base_ratio=cand_mae / base_mae,
+        mae_vs_naive_ratio=cand_mae / naive_mae,
+        segment_mae_ratios={"seg1": cand_mae / base_mae, "seg2": worst_segment_ratio, "seg3": 1.0},
+        worst_segment_ratio=worst_segment_ratio,
+        coverage_80=coverage_80,
+        mean_width_80=20.0,
+        directional_accuracy=0.60,
+        independent_24h_blocks=bootstrap_result.num_blocks,
+        bootstrap_result=bootstrap_result,
+        step_maes={1: cand_mae},
+        num_windows=600,
+        candidate_predictions=np.ones((600, 24 if timeframe == "1h" else 6)),
+        targets=np.ones((600, 24 if timeframe == "1h" else 6)),
+    )
+
+
+def test_locked_only_metrics_gatekeeper(temp_dir: Path):
+    """Verifies that Gatekeeper reads exclusively from LockedVerificationReport on [test_start, test_end).
+    The worst_segment_ratio must come from the 3 locked segments, strictly isolated from eval folds.
+    """
+    store = AdapterStore(temp_dir / "adapters")
+    gatekeeper = LoRAGatekeeper(
+        store=store,
+        audit_dir=temp_dir / "audit",
+        backup_dir=temp_dir / "backups",
+    )
+
+    cid = "cand_locked_only"
+    cand_dir = store.get_adapter_path(cid)
+    cand_dir.mkdir(parents=True, exist_ok=True)
+    manifest = AdapterManifest(
+        adapter_id=cid,
+        timeframe="1h",
+        horizon=24,
+        context_len=256,
+        feature_set="B",
+        feature_columns=["close"],
+        is_verified=False,
+    )
+    manifest.save_json(cand_dir / "paxg_manifest.json")
+
+    from safetensors.torch import save_file
+    import torch
+    save_file({
+        "base_model.model.seq_attn.0.query_proj.lora_A.weight": torch.zeros((4, 1280)),
+        "base_model.model.seq_attn.0.query_proj.lora_B.weight": torch.zeros((1280, 4)),
+    }, cand_dir / "adapter_model.safetensors")
+    with open(cand_dir / "adapter_config.json", "w") as f:
+        json.dump({"r": 4, "target_modules": ["query_proj"], "peft_type": "LORA"}, f)
+
+    locked_pass = create_mock_locked_report(
+        candidate_id=cid,
+        timeframe="1h",
+        score_v1=8.5,
+        current_rec_score=0.0,
+        cand_mae=9.8,
+        base_mae=10.0,
+        naive_mae=12.0,
+        worst_segment_ratio=1.02,
+        coverage_80=0.82,
+    )
+
+    dec_pass = gatekeeper.evaluate_candidate(
+        candidate_manifest=manifest,
+        locked_report=locked_pass,
+        perform_backup=True,
+    )
+    assert dec_pass.accepted is True
+    assert dec_pass.criteria_details["worst_segment_mae_ratio"] == 1.02
+
+    # Verify rejection when locked worst segment > 1.05
+    locked_fail_seg = create_mock_locked_report(
+        candidate_id=cid,
+        timeframe="1h",
+        score_v1=8.5,
+        current_rec_score=0.0,
+        cand_mae=9.8,
+        base_mae=10.0,
+        naive_mae=12.0,
+        worst_segment_ratio=1.08,
+        coverage_80=0.82,
+    )
+    dec_fail = gatekeeper.evaluate_candidate(
+        candidate_manifest=manifest,
+        locked_report=locked_fail_seg,
+        perform_backup=False,
+    )
+    assert dec_fail.accepted is False
+    assert dec_fail.check_no_segment_worse_5pct is False
+    assert any("max ratio=1.080 > 1.05" in r for r in dec_fail.reasons)
+
+
+def test_current_recommended_bootstrap_baseline(temp_dir: Path, mock_snapshot: DatasetSnapshot):
+    """Verifies that block bootstrap in locked verification sets baseline to current recommended adapter,
+    and falls back to TimesFM3-Base when no recommended adapter exists in store.
+    """
+    from unittest.mock import MagicMock, patch
+    from paxg_lab.tune.locked_eval import run_locked_verification
+
+    store = AdapterStore(temp_dir / "adapters")
+    cand_manifest = AdapterManifest(
+        adapter_id="cand_test",
+        timeframe="1h",
+        horizon=24,
+        context_len=256,
+        feature_set="B",
+        feature_columns=["close"],
+    )
+
+    with patch("paxg_lab.tune.locked_eval.TimesFM3Predictor") as mock_predictor_cls:
+        mock_pred_instance = MagicMock()
+        mock_predictor_cls.return_value = mock_pred_instance
+
+        def fake_predict(contexts, horizon, batch_size=16):
+            n = len(contexts)
+            return np.ones((n, horizon)) * 2000.0, np.ones((n, horizon, 9)) * 2000.0
+        mock_pred_instance.predict.side_effect = fake_predict
+
+        # Case A: No recommended adapter in store -> baseline is TimesFM3-Base
+        report_no_rec = run_locked_verification(
+            snapshot=mock_snapshot,
+            candidate_manifest=cand_manifest,
+            candidate_adapter_path=temp_dir / "cand",
+            store=store,
+        )
+        assert report_no_rec.bootstrap_result.baseline_name == "TimesFM3-Base"
+
+        # Case B: Recommended adapter is registered in store
+        rec_id = "rec_adapter_1h"
+        rec_dir = store.get_adapter_path(rec_id)
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        rec_m = AdapterManifest(
+            adapter_id=rec_id,
+            timeframe="1h",
+            horizon=24,
+            context_len=256,
+            feature_set="B",
+            feature_columns=["close"],
+        )
+        rec_m.save_json(rec_dir / "paxg_manifest.json")
+        store.set_recommended(rec_id, "1h")
+
+        report_with_rec = run_locked_verification(
+            snapshot=mock_snapshot,
+            candidate_manifest=cand_manifest,
+            candidate_adapter_path=temp_dir / "cand",
+            store=store,
+        )
+        assert report_with_rec.bootstrap_result.baseline_name == rec_id
+
+
+def test_non_overlapping_block_origins():
+    """Verifies that 1h blocks have 24-hour spacing (24 candles) and 4h blocks have 24-hour spacing (6 candles)."""
+    # 1h timeframe: 480 windows = 20 blocks of 24h
+    c_1h = np.ones((480, 24)) * 2000.0
+    b_1h = np.ones((480, 24)) * 2005.0
+    t_1h = np.ones((480, 24)) * 2000.0
+
+    res_1h = compute_block_bootstrap_ci(
+        candidate_predictions=c_1h,
+        baseline_predictions=b_1h,
+        targets=t_1h,
+        timeframe="1h",
+        min_required_blocks=20,
+    )
+    assert res_1h.block_size_candles == 24
+    assert res_1h.num_blocks == 20
+
+    # 4h timeframe: 480 windows = 80 blocks of 24h (spaced by 6 candles)
+    c_4h = np.ones((480, 6)) * 2000.0
+    b_4h = np.ones((480, 6)) * 2005.0
+    t_4h = np.ones((480, 6)) * 2000.0
+
+    res_4h = compute_block_bootstrap_ci(
+        candidate_predictions=c_4h,
+        baseline_predictions=b_4h,
+        targets=t_4h,
+        timeframe="4h",
+        min_required_blocks=20,
+    )
+    assert res_4h.block_size_candles == 6
+    assert res_4h.num_blocks == 80
+
+
+def test_three_independent_fold_trainings(temp_dir: Path, mock_snapshot: DatasetSnapshot):
+    """Verifies that an Optuna trial trains 3 separate adapters from clean Base for folds 1, 2, 3."""
+    from unittest.mock import MagicMock, patch
+    from paxg_lab.model.trainer import TrainingResult
+    from peft import PeftModel
+
+    proto = AutonomousTuningProtocol(
+        timeframe="1h",
+        snapshot=mock_snapshot,
+        db_path=temp_dir / "test.db",
+        optuna_db_path=temp_dir / "optuna.db",
+        adapter_store_dir=temp_dir / "adapters",
+        audit_dir=temp_dir / "audit",
+        backup_dir=temp_dir / "backups",
+    )
+
+    trained_folds: list[int] = []
+    mock_base_model = MagicMock(spec=["to", "eval", "train", "parameters", "named_parameters"])
+    mock_trained_peft = MagicMock(spec=PeftModel)
+
+    with patch("timesfm3.TimesFM3Torch.from_pretrained", return_value=mock_base_model) as mock_pretrained, \
+         patch("paxg_lab.tune.protocol.TimesFM3Predictor") as mock_predictor_cls, \
+         patch("paxg_lab.model.trainer.LoRATrainer.train") as mock_train, \
+         patch("paxg_lab.model.store.AdapterStore.save_adapter", return_value=temp_dir / "dummy_path"), \
+         patch("paxg_lab.eval.engine.BacktestEngine.evaluate_fold") as mock_eval_fold:
+
+        def fake_train(*args, **kwargs):
+            fold_id = kwargs.get("fold_id")
+            trained_folds.append(fold_id)
+            dummy_manifest = AdapterManifest(
+                adapter_id=f"dummy_{fold_id}",
+                timeframe="1h",
+                horizon=24,
+                context_len=256,
+                feature_set="B",
+                feature_columns=["close"],
+            )
+            return TrainingResult(
+                trained_model=mock_trained_peft,
+                manifest=dummy_manifest,
+                best_epoch=2,
+                best_val_loss=0.05,
+                final_train_loss=0.06,
+                train_spec=TrainSpec(timeframe="1h"),
+                training_range={},
+                total_steps=50,
+                total_training_time_sec=10.0,
+                history=[],
+            )
+
+        mock_train.side_effect = fake_train
+
+        dummy_fold_metric = FoldMetrics(
+            fold_id=1,
+            num_windows=100,
+            weighted_mae=10.0,
+            weighted_pinball=5.0,
+            rmse=12.0,
+            mae=10.0,
+            coverage_80=0.80,
+            mean_width_80=20.0,
+            directional_accuracy=0.60,
+            relative_mae_to_base=1.0,
+            relative_pinball_to_base=1.0,
+            composite_loss=0.05,
+        )
+        mock_eval_fold.return_value = (dummy_fold_metric, None, None, None, None, None)
+
+        spec = TrainSpec(timeframe="1h", lora_r=4)
+        base_ref_report = create_mock_score_report(10.0, 10.0, 10.0, 12.0, 1.0, 0.8)
+
+        score, epoch, val_loss = proto.run_trial_evaluation(
+            spec=spec,
+            base_reference_report=base_ref_report,
+            fast_dev_mode=True,
+        )
+
+        assert len(trained_folds) == 3
+        assert trained_folds == [1, 2, 3]
+        assert mock_pretrained.call_count == 3
+
+
+def test_final_candidate_full_pretest_boundary(temp_dir: Path, mock_snapshot: DatasetSnapshot):
+    """Verifies final candidate trains on full pre-test history explicit_train_range=(0, test_start - horizon)
+    without calling calculate_split_plan() again on a truncated slice.
+    """
+    from unittest.mock import MagicMock, patch
+    from paxg_lab.model.trainer import TrainingResult
+    from peft import PeftModel
+
+    proto = AutonomousTuningProtocol(
+        timeframe="1h",
+        snapshot=mock_snapshot,
+        db_path=temp_dir / "test.db",
+        optuna_db_path=temp_dir / "optuna.db",
+        adapter_store_dir=temp_dir / "adapters",
+        audit_dir=temp_dir / "audit",
+        backup_dir=temp_dir / "backups",
+    )
+
+    plan = proto.split_plan
+    expected_ceiling = plan.test_start - plan.horizon
+
+    mock_base_model = MagicMock(spec=["to", "eval", "train", "parameters", "named_parameters"])
+    mock_trained_peft = MagicMock(spec=PeftModel)
+
+    with patch("timesfm3.TimesFM3Torch.from_pretrained", return_value=mock_base_model), \
+         patch("paxg_lab.model.trainer.LoRATrainer.train") as mock_train, \
+         patch("paxg_lab.model.store.AdapterStore.save_adapter", return_value=temp_dir / "dummy_path"):
+
+        def fake_train(*args, **kwargs):
+            assert kwargs.get("fold_id") == "final_pre_test"
+            assert kwargs.get("explicit_train_range") == (0, expected_ceiling)
+            dummy_m = AdapterManifest(
+                adapter_id="dummy_final",
+                timeframe="1h",
+                horizon=24,
+                context_len=256,
+                feature_set="B",
+                feature_columns=["close"],
+            )
+            return TrainingResult(
+                trained_model=mock_trained_peft,
+                manifest=dummy_m,
+                best_epoch=3,
+                best_val_loss=0.03,
+                final_train_loss=0.04,
+                train_spec=TrainSpec(timeframe="1h"),
+                training_range={},
+                total_steps=100,
+                total_training_time_sec=20.0,
+                history=[],
+            )
+
+        mock_train.side_effect = fake_train
+
+        cand_spec = TrainSpec(timeframe="1h", lora_r=8)
+        cand_id, manifest, saved_dir = proto.train_final_candidate(
+            candidate_spec=cand_spec,
+            best_epoch=3,
+        )
+
+        assert cand_id.startswith("paxg_1h_r8_")
+        assert manifest.adapter_id == cand_id
+        assert manifest.is_verified is False
+        assert mock_train.call_count == 1
+
+
+def test_backup_zip_integrity_verification(temp_dir: Path):
+    """Verifies gatekeeper Criterion 7 rejects corrupted zip or zip missing checksums.sha256."""
+    from unittest.mock import patch
+    from paxg_lab.tune.locked_eval import LockedVerificationReport
+
+    store = AdapterStore(temp_dir / "adapters")
+    gatekeeper = LoRAGatekeeper(
+        store=store,
+        audit_dir=temp_dir / "audit",
+        backup_dir=temp_dir / "backups",
+    )
+
+    cid = "test_corrupt_backup"
+    cand_dir = store.get_adapter_path(cid)
+    cand_dir.mkdir(parents=True, exist_ok=True)
+    manifest = AdapterManifest(
+        adapter_id=cid,
+        timeframe="1h",
+        horizon=24,
+        context_len=256,
+        feature_set="B",
+        feature_columns=["close"],
+        is_verified=False,
+    )
+    manifest.save_json(cand_dir / "paxg_manifest.json")
+
+    from safetensors.torch import save_file
+    import torch
+    save_file({
+        "base_model.model.seq_attn.0.query_proj.lora_A.weight": torch.zeros((4, 1280)),
+        "base_model.model.seq_attn.0.query_proj.lora_B.weight": torch.zeros((1280, 4)),
+    }, cand_dir / "adapter_model.safetensors")
+    with open(cand_dir / "adapter_config.json", "w") as f:
+        json.dump({"r": 4, "target_modules": ["query_proj"], "peft_type": "LORA"}, f)
+
+    locked_report = create_mock_locked_report(
+        candidate_id=cid,
+        timeframe="1h",
+        score_v1=8.5,
+        current_rec_score=0.0,
+        cand_mae=9.8,
+        base_mae=10.0,
+        naive_mae=12.0,
+        worst_segment_ratio=1.02,
+        coverage_80=0.82,
+    )
+
+    def corrupt_export(adapter_id, out_zip):
+        with open(out_zip, "wb") as f:
+            f.write(b"not a valid zip file content")
+        return Path(out_zip)
+
+    with patch.object(store, "export_adapter_zip", side_effect=corrupt_export):
+        decision = gatekeeper.evaluate_candidate(
+            candidate_manifest=manifest,
+            locked_report=locked_report,
+            perform_backup=True,
+        )
+        assert decision.accepted is False
+        assert decision.check_smoke_test_and_backup is False
+        assert any("Smoke test load or backup export failed" in r for r in decision.reasons)
+
+
+def test_worker_auto_trial_production_dispatch(temp_dir: Path, mock_snapshot: DatasetSnapshot):
+    """Verifies that GPUWorker._handle_auto_trial_job executes run_tuning_cycle and honors cancel."""
+    from unittest.mock import patch
+    from paxg_lab.queue.worker import GPUWorker
+
+    db_path = temp_dir / "worker_queue.db"
+    snap_path = temp_dir / "dummy_snap"
+
+    job_spec = JobSpec(
+        job_id="job_auto_p6",
+        job_type=JobType.AUTO_TRIAL.value,
+        timeframe="1h",
+        priority=JobPriority.AUTO.value,
+        payload={"snapshot_path": str(snap_path), "fast_dev_mode": True, "max_trials": 2},
+    )
+
+    worker = GPUWorker(job_id="job_auto_p6", db_path=db_path)
+
+    with patch("pathlib.Path.exists", return_value=True), \
+         patch("paxg_lab.data.snapshot.DatasetSnapshot.load", return_value=mock_snapshot), \
+         patch("paxg_lab.tune.protocol.AutonomousTuningProtocol.run_tuning_cycle") as mock_cycle:
+        mock_cycle.return_value = {
+            "status": "COMPLETED",
+            "timeframe": "1h",
+            "accepted": True,
+            "candidate_id": "cand_1h_optuna",
+        }
+
+        result = worker._handle_auto_trial_job(job_spec)
+
+        assert result["status"] == "COMPLETED"
+        assert result["accepted"] is True
+        assert result["candidate_id"] == "cand_1h_optuna"
+        assert mock_cycle.call_count == 1
+        _, kwargs = mock_cycle.call_args
+        assert kwargs["fast_dev_mode"] is True
+        assert callable(kwargs["is_cancelled_func"])
+        assert callable(kwargs["progress_callback"])
+

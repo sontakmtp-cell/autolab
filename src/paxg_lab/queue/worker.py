@@ -469,8 +469,54 @@ class GPUWorker:
             return {"status": "cancelled", "message": "Backtest interrupted"}
 
     def _handle_auto_trial_job(self, job: JobSpec) -> dict[str, Any]:
-        """Handles single autonomous optimization trial."""
-        return self._handle_train_job(job)
+        """Handles autonomous optimization: full P6 tuning cycle or single training trial."""
+        payload = job.payload or {}
+        # If payload specifically provided a train_spec, run direct train job (legacy / unit test path)
+        if "train_spec" in payload:
+            return self._handle_train_job(job)
+
+        # Production P6 path: run full AutonomousTuningProtocol
+        from paxg_lab.data.snapshot import DatasetSnapshot
+        from paxg_lab.tune.protocol import AutonomousTuningProtocol
+
+        timeframe = payload.get("timeframe", job.timeframe or "1h")
+        snapshot_path = payload.get("snapshot_path")
+        if not snapshot_path or not Path(snapshot_path).exists():
+            # Discover latest snapshot for timeframe
+            snap_dir = Path("var/paxg_lab/snapshots")
+            candidates = sorted(snap_dir.glob(f"paxgusdt_{timeframe}_*"))
+            if not candidates:
+                raise FileNotFoundError(
+                    f"No dataset snapshot found for timeframe '{timeframe}' to run auto tuning."
+                )
+            snapshot_path = str(candidates[-1])
+
+        snapshot = DatasetSnapshot.load(snapshot_path)
+        max_trials = int(payload.get("max_trials", 30))
+        fast_dev_mode = bool(payload.get("fast_dev_mode", False))
+
+        def progress_cb(info: dict[str, Any]) -> None:
+            self.progress_message = info.get("message", "Running autonomous tuning...")
+            pct = float(info.get("progress_pct", 50.0))
+            self.progress_pct = max(0.0, min(pct, 100.0))
+
+        protocol = AutonomousTuningProtocol(
+            timeframe=timeframe,
+            snapshot=snapshot,
+            db_path=self.storage.db_path,
+        )
+
+        try:
+            run_result = protocol.run_tuning_cycle(
+                max_trials=max_trials,
+                is_cancelled_func=lambda: self.stop_event.is_set(),
+                progress_callback=progress_cb,
+                fast_dev_mode=fast_dev_mode,
+            )
+            return run_result if isinstance(run_result, dict) else run_result.to_dict()
+        except InterruptedError as int_err:
+            logger.info("Auto tuning job '%s' cancelled: %s", job.job_id, int_err)
+            return {"status": "cancelled", "message": str(int_err)}
 
 
 def run_worker(job_id: str, db_path: str | Path) -> int:

@@ -29,6 +29,7 @@ from ..constants import (
 from ..data.snapshot import DatasetSnapshot
 from ..data.split import calculate_split_plan
 from ..eval.engine import BacktestEngine
+from ..eval.metrics import compute_score_v1
 from ..eval.predictor import TimesFM3Predictor
 from ..eval.types import ScoreReport
 from ..model.manifest import AdapterManifest
@@ -38,7 +39,9 @@ from ..model.trainer import LoRATrainer
 from ..queue.storage import GPUJobStorage
 from ..queue.types import AutoRunState
 from .gatekeeper import GatekeeperDecision, LoRAGatekeeper
+from .locked_eval import LockedVerificationReport, run_locked_verification
 from .optimizer import DEFAULT_OPTUNA_DB_PATH, OptunaTPEOptimizer
+from .space import suggest_trial_spec
 
 logger = logging.getLogger(__name__)
 
@@ -117,59 +120,86 @@ class AutonomousTuningProtocol:
         base_reference_report: ScoreReport,
         custom_trainer_fn: Callable[[TrainSpec], Any] | None = None,
         custom_eval_fn: Callable[[Any, TrainSpec], ScoreReport] | None = None,
+        fast_dev_mode: bool = False,
     ) -> tuple[float, int, float]:
         """Trains and evaluates a candidate spec across 3 out-of-sample evaluation folds strictly without locked test.
 
+        Per PLAN 3.3: For each trial, 3 independent adapters are trained from clean Base
+        corresponding to Fold 1, Fold 2, and Fold 3 on pre-eval history.
+
         Returns:
-            Tuple of (Score v1, best_epoch, best_val_loss).
+            Tuple of (Score v1, median_best_epoch, avg_val_loss).
         """
-        # Ensure locked test data is NEVER passed to training or evaluation
         if custom_eval_fn is not None:
             report = custom_eval_fn(self.snapshot, spec)
             return float(report.score), 2, 0.05
 
-        # Standard pipeline: train on history before eval folds
-        from timesfm3 import TimesFM3Torch
-        base_model = TimesFM3Torch.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
-
         features_df = self.snapshot.to_dataframe(spec.feature_set)
-        trainer = LoRATrainer(base_model=base_model, spec=spec)
+        features = self.snapshot.get_features(spec.feature_set)
+        targets = self.snapshot.features_a[:, 0]
+        timestamps = self.snapshot.timestamps
 
-        # Train on pre-eval segment
-        train_res = trainer.train(
-            features_df=features_df,
-            snapshot_hash=self.snapshot.metadata.sha256,
-            fold_id=1,
-        )
+        from timesfm3 import TimesFM3Torch
 
-        # Save temporary trial adapter to store
-        trial_adapter_id = f"trial_tmp_{self.timeframe}_{int(time.time()*1000)}"
-        manifest = train_res.manifest
-        manifest.adapter_id = trial_adapter_id
-        saved_dir = self.store.save_adapter(
-            peft_model=train_res.trained_model,
-            manifest=manifest,
-            base_model=base_model,
-            smoke_test=False,
-        )
+        fold_losses = []
+        best_epochs = []
+        val_losses = []
 
-        # Evaluate on 3 evaluation folds (out-of-sample) strictly excluding locked test
-        predictor = TimesFM3Predictor(adapter_path=saved_dir)
-        engine = BacktestEngine(predictor=predictor)
-        report = engine.run_full_backtest(
-            snapshot=self.snapshot,
-            feature_set=spec.feature_set,
-            context_len=spec.context_len,
-            batch_size=16,
-            model_name=f"Trial-{trial_adapter_id}",
-            base_reference_metrics=base_reference_report,
-            include_locked_test=False,  # STRICTLY FALSE: test data never leaked into trials!
-        )
+        for fold in self.split_plan.eval_folds:
+            base_model = TimesFM3Torch.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
 
-        # Clean up temporary trial adapter from disk
-        self.store.delete_adapter(trial_adapter_id, use_trash=False)
+            eval_spec = TrainSpec.from_dict(spec.to_dict())
+            if fast_dev_mode:
+                eval_spec.max_epochs = 1
+                eval_spec.max_samples_per_epoch = 64
 
-        return float(report.score), int(train_res.best_epoch), float(train_res.best_val_loss)
+            trainer = LoRATrainer(base_model=base_model, spec=eval_spec)
+            train_res = trainer.train(
+                features_df=features_df,
+                snapshot_hash=self.snapshot.metadata.sha256,
+                fold_id=fold.fold_id,
+            )
+
+            trial_adapter_id = f"trial_tmp_{self.timeframe}_f{fold.fold_id}_{int(time.time()*1000)}"
+            manifest = train_res.manifest
+            manifest.adapter_id = trial_adapter_id
+            saved_dir = self.store.save_adapter(
+                peft_model=train_res.trained_model,
+                manifest=manifest,
+                base_model=base_model,
+                smoke_test=False,
+            )
+
+            predictor = TimesFM3Predictor(adapter_path=saved_dir)
+            engine = BacktestEngine(predictor=predictor)
+            base_m = base_reference_report.get_fold_metric(fold.fold_id)
+            base_w_mae = base_m.weighted_mae if base_m else None
+            base_w_pinball = base_m.weighted_pinball if base_m else None
+
+            f_metric, _, _, _, _, _ = engine.evaluate_fold(
+                features=features,
+                targets=targets,
+                timestamps=timestamps,
+                timeframe=self.timeframe,
+                start_idx=fold.eval_start,
+                end_idx=fold.eval_end,
+                context_len=spec.context_len,
+                batch_size=16,
+                fold_id=fold.fold_id,
+                base_weighted_mae=base_w_mae,
+                base_weighted_pinball=base_w_pinball,
+            )
+            fold_losses.append(f_metric.composite_loss)
+            best_epochs.append(train_res.best_epoch)
+            val_losses.append(train_res.best_val_loss)
+
+            self.store.delete_adapter(trial_adapter_id, use_trash=False)
+
+        score_v1 = compute_score_v1(fold_losses)
+        median_epoch = int(np.round(np.median(best_epochs))) if best_epochs else 2
+        avg_val_loss = float(np.mean(val_losses)) if val_losses else 0.0
+
+        return float(score_v1), median_epoch, avg_val_loss
 
     def run_multi_seed_verification(
         self,
@@ -177,6 +207,8 @@ class AutonomousTuningProtocol:
         base_reference_report: ScoreReport,
         custom_trainer_fn: Callable[[TrainSpec], Any] | None = None,
         custom_eval_fn: Callable[[Any, TrainSpec], ScoreReport] | None = None,
+        fast_dev_mode: bool = False,
+        is_cancelled_func: Callable[[], bool] | None = None,
     ) -> MultiSeedEvalSummary:
         """Evaluates best hyperparameter configuration across seeds [42, 123, 2026] and takes median."""
         scores = []
@@ -184,6 +216,9 @@ class AutonomousTuningProtocol:
 
         logger.info("Executing multi-seed verification on seeds %s for %s...", SEEDS_MULTI_RUN, self.timeframe)
         for seed in SEEDS_MULTI_RUN:
+            if is_cancelled_func is not None and is_cancelled_func():
+                raise InterruptedError("Multi-seed verification cancelled by user request.")
+
             seed_spec = TrainSpec.from_dict(best_spec.to_dict())
             seed_spec.seed = seed
 
@@ -192,6 +227,7 @@ class AutonomousTuningProtocol:
                 base_reference_report=base_reference_report,
                 custom_trainer_fn=custom_trainer_fn,
                 custom_eval_fn=custom_eval_fn,
+                fast_dev_mode=fast_dev_mode,
             )
             scores.append(score)
             best_epochs.append(b_epoch)
@@ -218,6 +254,7 @@ class AutonomousTuningProtocol:
         candidate_spec: TrainSpec,
         best_epoch: int,
         custom_trainer_fn: Callable[[TrainSpec, int], Any] | None = None,
+        fast_dev_mode: bool = False,
     ) -> tuple[str, AdapterManifest, Path]:
         """Trains final candidate model from base on all historical data prior to locked test set.
 
@@ -232,29 +269,31 @@ class AutonomousTuningProtocol:
 
         cand_id = f"paxg_{self.timeframe}_r{candidate_spec.lora_r}_{int(time.time())}"
         features_df = self.snapshot.to_dataframe(candidate_spec.feature_set)
-        # Train ceiling is strictly test_start - horizon (purge buffer)
         train_ceiling = self.split_plan.test_start - self.split_plan.horizon
-        train_df = features_df.iloc[:train_ceiling].copy()
 
         if custom_trainer_fn is not None:
             return custom_trainer_fn(candidate_spec, best_epoch)
 
         from timesfm3 import TimesFM3Torch
+
         base_model = TimesFM3Torch.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
 
         cand_spec = TrainSpec.from_dict(candidate_spec.to_dict())
         cand_spec.max_epochs = max(1, best_epoch)
+        if fast_dev_mode:
+            cand_spec.max_samples_per_epoch = 128
 
         trainer = LoRATrainer(base_model=base_model, spec=cand_spec)
         train_res = trainer.train(
-            features_df=train_df,
+            features_df=features_df,
             snapshot_hash=self.snapshot.metadata.sha256,
-            fold_id=1,
+            fold_id="final_pre_test",
+            explicit_train_range=(0, train_ceiling),
         )
 
         manifest = train_res.manifest
         manifest.adapter_id = cand_id
-        manifest.is_verified = False  # Not yet verified!
+        manifest.is_verified = False
 
         saved_dir = self.store.save_adapter(
             peft_model=train_res.trained_model,
@@ -269,8 +308,8 @@ class AutonomousTuningProtocol:
         candidate_manifest: AdapterManifest,
         candidate_adapter_path: Path,
         base_reference_report: ScoreReport,
-        custom_test_eval_fn: Callable[[DatasetSnapshot, AdapterManifest], tuple[ScoreReport, np.ndarray, np.ndarray, np.ndarray, float]] | None = None,
-    ) -> tuple[ScoreReport, GatekeeperDecision]:
+        custom_test_eval_fn: Any = None,
+    ) -> tuple[Any, GatekeeperDecision]:
         """Executes strict single evaluation on 90-day locked test set and triggers gatekeeper winner check."""
         logger.info(
             "Executing single locked verification on 90-day test set [%d, %d) for candidate '%s'...",
@@ -279,86 +318,153 @@ class AutonomousTuningProtocol:
             candidate_manifest.adapter_id,
         )
 
+        from timesfm3 import TimesFM3Torch
+
+        base_model = TimesFM3Torch.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
+
         if custom_test_eval_fn is not None:
-            cand_test_report, cand_preds, base_preds, tgts, naive_mae = custom_test_eval_fn(
-                self.snapshot,
-                candidate_manifest,
-            )
+            locked_report = custom_test_eval_fn(self.snapshot, candidate_manifest)
         else:
-            # 1. Base reference evaluation on test set
-            base_predictor = TimesFM3Predictor()
-            base_engine = BacktestEngine(predictor=base_predictor)
-            _, base_preds, _, tgts, _, _ = base_engine.evaluate_fold(
-                features=self.snapshot.get_features("A"),
-                targets=self.snapshot.features_a[:, 0],
-                timestamps=self.snapshot.timestamps,
-                timeframe=self.timeframe,
-                start_idx=self.split_plan.test_start,
-                end_idx=self.split_plan.test_end,
-                context_len=256,
-                batch_size=16,
-                fold_id="test_locked",
-            )
-
-            # 2. Naive baseline on test set
-            naive_metric = base_engine.evaluate_naive_baseline(
-                features=self.snapshot.get_features("A"),
-                targets=self.snapshot.features_a[:, 0],
-                timestamps=self.snapshot.timestamps,
-                timeframe=self.timeframe,
-                start_idx=self.split_plan.test_start,
-                end_idx=self.split_plan.test_end,
-                context_len=256,
-                fold_id="test_locked",
-            )
-            naive_mae = naive_metric.weighted_mae
-
-            # 3. Candidate evaluation on locked test set
-            cand_predictor = TimesFM3Predictor(adapter_path=candidate_adapter_path)
-            cand_engine = BacktestEngine(predictor=cand_predictor)
-            cand_test_report = cand_engine.run_full_backtest(
+            locked_report = run_locked_verification(
                 snapshot=self.snapshot,
-                feature_set=candidate_manifest.feature_set,
-                context_len=candidate_manifest.context_len,
+                candidate_manifest=candidate_manifest,
+                candidate_adapter_path=candidate_adapter_path,
+                store=self.store,
                 batch_size=16,
-                model_name=f"Candidate-{candidate_manifest.adapter_id}",
-                base_reference_metrics=base_reference_report,
-                include_locked_test=True,  # ONLY HERE: exactly 1 final evaluation on locked test!
-                adapter_manifest=candidate_manifest,
-            )
-            _, cand_preds, _, _, _, _ = cand_engine.evaluate_fold(
-                features=self.snapshot.get_features(candidate_manifest.feature_set),
-                targets=self.snapshot.features_a[:, 0],
-                timestamps=self.snapshot.timestamps,
-                timeframe=self.timeframe,
-                start_idx=self.split_plan.test_start,
-                end_idx=self.split_plan.test_end,
-                context_len=candidate_manifest.context_len,
-                batch_size=16,
-                fold_id="test_locked",
             )
 
-        # 4. Determine current recommended model score
-        current_rec_id = self.store.get_recommended(self.timeframe)
-        current_score = 0.0
-        if current_rec_id:
-            try:
-                rec_path = self.store.get_adapter_path(current_rec_id)
-                rec_manifest = AdapterManifest.load_json(rec_path / "paxg_manifest.json")
-                current_score = float(rec_manifest.metrics.get("score_v1", 0.0))
-            except Exception:
-                current_score = 0.0
-
-        # 5. Evaluate winning criteria via Gatekeeper
         decision = self.gatekeeper.evaluate_candidate(
             candidate_manifest=candidate_manifest,
-            candidate_test_report=cand_test_report,
-            candidate_test_preds=cand_preds,
-            base_test_preds=base_preds,
-            test_targets=tgts,
-            naive_test_mae=naive_mae,
-            current_recommended_score=current_score,
+            locked_report=locked_report,
+            base_model=base_model,
             perform_backup=True,
         )
 
-        return cand_test_report, decision
+        return locked_report, decision
+
+    def run_tuning_cycle(
+        self,
+        max_trials: int | None = None,
+        is_cancelled_func: Callable[[], bool] | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        fast_dev_mode: bool = False,
+    ) -> P6RunResult:
+        """Executes a full autonomous tuning cycle from Optuna TPE search to Gatekeeper verification."""
+        limit_trials = max_trials or self.max_trials
+        logger.info("Initiating autonomous tuning cycle for %s (max_trials=%d)...", self.timeframe, limit_trials)
+
+        self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.SEARCHING)
+
+        if progress_callback:
+            progress_callback({"message": "Computing base reference baseline on eval folds...", "progress_pct": 5.0})
+
+        # 1. Base reference metrics on eval folds
+        base_predictor = TimesFM3Predictor()
+        base_engine = BacktestEngine(predictor=base_predictor)
+        base_report = base_engine.run_full_backtest(
+            snapshot=self.snapshot,
+            feature_set="A",
+            context_len=256,
+            batch_size=16,
+            model_name="TimesFM3-Base-Ref",
+            is_base_reference=True,
+            include_locked_test=False,
+        )
+
+        # 2. Optuna TPE Optimization
+        optimizer = OptunaTPEOptimizer(
+            timeframe=self.timeframe,
+            snapshot=self.snapshot,
+            db_path=self.optuna_db_path,
+            max_trials=limit_trials,
+            startup_trials=min(self.startup_trials, max(2, limit_trials // 3)),
+            patience=self.patience,
+            seed=42,
+        )
+
+        def eval_trial(spec: TrainSpec, trial: optuna.Trial) -> float:
+            if is_cancelled_func is not None and is_cancelled_func():
+                raise InterruptedError(f"Trial #{trial.number} cancelled by user request.")
+
+            if progress_callback:
+                pct = 10.0 + (trial.number / limit_trials) * 50.0
+                progress_callback({
+                    "message": f"Evaluating Trial #{trial.number}/{limit_trials} across 3 eval folds...",
+                    "progress_pct": min(pct, 60.0),
+                })
+
+            score, _, _ = self.run_trial_evaluation(
+                spec=spec,
+                base_reference_report=base_report,
+                fast_dev_mode=fast_dev_mode,
+            )
+            return score
+
+        study = optimizer.optimize(eval_fn=eval_trial, is_cancelled_func=is_cancelled_func)
+        best_trial = study.best_trial
+        logger.info("Optuna study complete. Top trial #%d with score=%.2f", best_trial.number, best_trial.value)
+
+        # 3. Multi-seed verification on seeds [42, 123, 2026]
+        if is_cancelled_func is not None and is_cancelled_func():
+            raise InterruptedError("Cancelled before multi-seed verification.")
+
+        if progress_callback:
+            progress_callback({"message": "Running multi-seed verification across seeds [42, 123, 2026]...", "progress_pct": 65.0})
+
+        best_spec = suggest_trial_spec(best_trial, timeframe=self.timeframe, seed=42)
+        multi_seed_res = self.run_multi_seed_verification(
+            best_spec=best_spec,
+            base_reference_report=base_report,
+            fast_dev_mode=fast_dev_mode,
+            is_cancelled_func=is_cancelled_func,
+        )
+
+        # 4. State transition to VALIDATING and train final candidate
+        self.job_storage.set_auto_run_state(self.timeframe, AutoRunState.VALIDATING)
+
+        if is_cancelled_func is not None and is_cancelled_func():
+            raise InterruptedError("Cancelled before final candidate retrain.")
+
+        if progress_callback:
+            progress_callback({"message": "Training final candidate from Base model on full pre-test history...", "progress_pct": 80.0})
+
+        cand_id, cand_manifest, cand_path = self.train_final_candidate(
+            candidate_spec=best_spec,
+            best_epoch=multi_seed_res.median_best_epoch,
+            fast_dev_mode=fast_dev_mode,
+        )
+
+        # 5. Locked test verification and Gatekeeper
+        if is_cancelled_func is not None and is_cancelled_func():
+            raise InterruptedError("Cancelled before locked test verification.")
+
+        if progress_callback:
+            progress_callback({"message": "Executing single-pass locked test verification...", "progress_pct": 90.0})
+
+        locked_report, decision = self.run_locked_verification_and_gatekeeper(
+            candidate_manifest=cand_manifest,
+            candidate_adapter_path=cand_path,
+            base_reference_report=base_report,
+        )
+
+        resulting_state = self.job_storage.get_auto_run_state(self.timeframe)
+
+        if progress_callback:
+            progress_callback({
+                "message": f"Autonomous tuning cycle complete. Verdict: {decision.verdict} (State: {resulting_state.value})",
+                "progress_pct": 100.0,
+            })
+
+        return P6RunResult(
+            timeframe=self.timeframe,
+            snapshot_id=self.snapshot.metadata.snapshot_id,
+            study_name=study.study_name,
+            total_trials=len(study.trials),
+            best_trial_number=best_trial.number,
+            best_trial_params=best_trial.params,
+            multi_seed_summary=multi_seed_res.to_dict(),
+            final_candidate_id=cand_id,
+            test_score_report=locked_report.to_dict() if hasattr(locked_report, "to_dict") else {},
+            decision=decision.to_dict(),
+            resulting_auto_state=resulting_state.value,
+        )

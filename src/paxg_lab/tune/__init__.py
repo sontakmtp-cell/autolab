@@ -2,6 +2,7 @@
 
 from .bootstrap import BlockBootstrapResult, compute_block_bootstrap_ci, get_block_size_for_timeframe
 from .gatekeeper import GatekeeperDecision, LoRAGatekeeper
+from .locked_eval import LockedVerificationReport, run_locked_verification
 from .optimizer import EarlyStoppingStagnationCallback, OptunaTPEOptimizer
 from .protocol import AutonomousTuningProtocol, MultiSeedEvalSummary, P6RunResult
 from .space import (
@@ -22,10 +23,12 @@ __all__ = [
     "BlockBootstrapResult",
     "EarlyStoppingStagnationCallback",
     "GatekeeperDecision",
+    "LockedVerificationReport",
     "LoRAGatekeeper",
     "MultiSeedEvalSummary",
     "OptunaTPEOptimizer",
     "P6RunResult",
+    "run_locked_verification",
     "compute_block_bootstrap_ci",
     "get_block_size_for_timeframe",
     "suggest_trial_spec",

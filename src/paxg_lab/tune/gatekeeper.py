@@ -86,88 +86,108 @@ class LoRAGatekeeper:
     def evaluate_candidate(
         self,
         candidate_manifest: AdapterManifest,
-        candidate_test_report: ScoreReport,
-        candidate_test_preds: Any,
-        base_test_preds: Any,
-        test_targets: Any,
-        naive_test_mae: float,
+        candidate_test_report: ScoreReport | None = None,
+        candidate_test_preds: Any = None,
+        base_test_preds: Any = None,
+        test_targets: Any = None,
+        naive_test_mae: float | None = None,
         current_recommended_score: float = 0.0,
         perform_backup: bool = True,
         base_model: Any = None,
+        locked_report: Any = None,
     ) -> GatekeeperDecision:
         """Evaluates whether candidate satisfies all 7 winner recognition criteria."""
         tf = candidate_manifest.timeframe
         cid = candidate_manifest.adapter_id
         current_rec_id = self.store.get_recommended(tf)
 
-        # 1. Score improvement check: >= current_recommended + 2.0 points
-        cand_score = float(candidate_test_report.score)
-        score_diff = cand_score - current_recommended_score
-        check_score = bool(score_diff >= 2.0)
-
-        # 2. MAE vs Base & Naive: better by at least 1%
-        cand_mae = float(candidate_test_report.overall_weighted_mae)
-        base_mae_comp = candidate_test_report.baseline_comparisons.get("base_overall_weighted_mae")
-        if base_mae_comp is None:
-            # Look in test metrics
-            if candidate_test_report.test_metrics:
-                base_mae_comp = cand_mae / max(candidate_test_report.test_metrics.relative_mae_to_base, 1e-6)
-            else:
-                base_mae_comp = cand_mae
-
-        base_mae = float(base_mae_comp)
-        mae_vs_base_ratio = cand_mae / max(base_mae, 1e-6)
-        mae_vs_naive_ratio = cand_mae / max(naive_test_mae, 1e-6)
-
-        # Must be at least 1% better than both base and naive (ratio <= 0.99)
-        check_mae = bool(mae_vs_base_ratio <= 0.99 and mae_vs_naive_ratio <= 0.99)
-
-        # 3. No fold/segment worse than base by more than 5% (ratio <= 1.05)
-        worst_fold_ratio = 0.0
-        check_no_worse = True
-        all_folds_to_check: list[FoldMetrics] = []
-        if candidate_test_report.fold_metrics:
-            all_folds_to_check.extend(candidate_test_report.fold_metrics)
-        if candidate_test_report.test_metrics:
-            all_folds_to_check.append(candidate_test_report.test_metrics)
-
-        fold_ratios = {}
-        for fm in all_folds_to_check:
-            r = fm.relative_mae_to_base
-            fold_ratios[str(fm.fold_id)] = r
-            if r > worst_fold_ratio:
-                worst_fold_ratio = r
-            if r > 1.05:
-                check_no_worse = False
-
-        # 4. Coverage 80% range [0.65, 0.95]
-        cov80 = float(candidate_test_report.coverage_80)
-        check_cov80 = bool(0.65 <= cov80 <= 0.95)
-
-        # 5. Independent blocks & Block Bootstrap CI
-        bootstrap_res: BlockBootstrapResult | None = None
-        check_blocks = False
-        check_bootstrap = False
-        bootstrap_dict = {}
-
-        try:
-            bootstrap_res = compute_block_bootstrap_ci(
-                candidate_predictions=candidate_test_preds,
-                baseline_predictions=base_test_preds,
-                targets=test_targets,
-                timeframe=tf,
-                num_resamples=1000,
-                seed=42,
-                min_required_blocks=20,
-            )
+        if locked_report is not None:
+            # 1. Direct locked verification metrics (Zero Leakage)
+            cand_score = float(locked_report.score_v1)
+            current_recommended_score = float(locked_report.current_recommended_score)
+            score_diff = float(locked_report.score_diff)
+            cand_mae = float(locked_report.candidate_weighted_mae)
+            base_mae = float(locked_report.base_weighted_mae)
+            naive_mae_val = float(locked_report.naive_weighted_mae)
+            mae_vs_base_ratio = float(locked_report.mae_vs_base_ratio)
+            mae_vs_naive_ratio = float(locked_report.mae_vs_naive_ratio)
+            worst_fold_ratio = float(locked_report.worst_segment_ratio)
+            fold_ratios = dict(locked_report.segment_mae_ratios)
+            cov80 = float(locked_report.coverage_80)
+            bootstrap_res = locked_report.bootstrap_result
+            check_score = bool(score_diff >= 2.0)
+            check_mae = bool(mae_vs_base_ratio <= 0.99 and mae_vs_naive_ratio <= 0.99)
+            check_no_worse = bool(worst_fold_ratio <= 1.05)
+            check_cov80 = bool(0.65 <= cov80 <= 0.95)
             check_blocks = bool(bootstrap_res.num_blocks >= 20)
             check_bootstrap = bool(bootstrap_res.ci_95_lower > 0.0)
             bootstrap_dict = bootstrap_res.to_dict()
-        except Exception as exc:
-            logger.warning("Block bootstrap evaluation failed or had insufficient blocks: %s", exc)
-            bootstrap_dict = {"error": str(exc)}
+        else:
+            # Legacy / mock path using candidate_test_report
+            assert candidate_test_report is not None, "Either locked_report or candidate_test_report must be provided"
+            cand_score = float(candidate_test_report.score)
+            score_diff = cand_score - current_recommended_score
+            check_score = bool(score_diff >= 2.0)
+
+            cand_mae = float(candidate_test_report.overall_weighted_mae)
+            base_mae_comp = candidate_test_report.baseline_comparisons.get("base_overall_weighted_mae")
+            if base_mae_comp is None:
+                if candidate_test_report.test_metrics:
+                    base_mae_comp = cand_mae / max(candidate_test_report.test_metrics.relative_mae_to_base, 1e-6)
+                else:
+                    base_mae_comp = cand_mae
+
+            base_mae = float(base_mae_comp)
+            naive_mae_val = float(naive_test_mae) if naive_test_mae is not None else cand_mae
+            mae_vs_base_ratio = cand_mae / max(base_mae, 1e-6)
+            mae_vs_naive_ratio = cand_mae / max(naive_mae_val, 1e-6)
+
+            check_mae = bool(mae_vs_base_ratio <= 0.99 and mae_vs_naive_ratio <= 0.99)
+
+            worst_fold_ratio = 0.0
+            check_no_worse = True
+            all_folds_to_check: list[FoldMetrics] = []
+            if candidate_test_report.fold_metrics:
+                all_folds_to_check.extend(candidate_test_report.fold_metrics)
+            if candidate_test_report.test_metrics:
+                all_folds_to_check.append(candidate_test_report.test_metrics)
+
+            fold_ratios = {}
+            for fm in all_folds_to_check:
+                r = fm.relative_mae_to_base
+                fold_ratios[str(fm.fold_id)] = r
+                if r > worst_fold_ratio:
+                    worst_fold_ratio = r
+                if r > 1.05:
+                    check_no_worse = False
+
+            cov80 = float(candidate_test_report.coverage_80)
+            check_cov80 = bool(0.65 <= cov80 <= 0.95)
+
+            bootstrap_res: BlockBootstrapResult | None = None
             check_blocks = False
             check_bootstrap = False
+            bootstrap_dict = {}
+
+            if candidate_test_preds is not None and base_test_preds is not None and test_targets is not None:
+                try:
+                    bootstrap_res = compute_block_bootstrap_ci(
+                        candidate_predictions=candidate_test_preds,
+                        baseline_predictions=base_test_preds,
+                        targets=test_targets,
+                        timeframe=tf,
+                        num_resamples=1000,
+                        seed=42,
+                        min_required_blocks=20,
+                    )
+                    check_blocks = bool(bootstrap_res.num_blocks >= 20)
+                    check_bootstrap = bool(bootstrap_res.ci_95_lower > 0.0)
+                    bootstrap_dict = bootstrap_res.to_dict()
+                except Exception as exc:
+                    logger.warning("Block bootstrap evaluation failed or had insufficient blocks: %s", exc)
+                    bootstrap_dict = {"error": str(exc)}
+                    check_blocks = False
+                    check_bootstrap = False
 
         # Compile reasons
         reasons = []
@@ -218,12 +238,42 @@ class LoRAGatekeeper:
                     raise FileNotFoundError(f"Missing adapter_config.json in {cand_path}")
 
                 if base_model is not None:
+                    # Verify live PEFT adapter loading into base model
                     self.store.load_adapter(cid, base_model=base_model)
+                else:
+                    from safetensors.torch import load_file
+                    tensors = load_file(str(cand_path / "adapter_model.safetensors"))
+                    if not tensors:
+                        raise ValueError("adapter_model.safetensors contains 0 weight tensors.")
 
                 if perform_backup:
+                    import zipfile
+                    from ..model.store import compute_file_sha256, CHECKSUMS_FILENAME
+
+                    # Ensure sidecar checksums file exists before backup export
+                    checksums_file = cand_path / CHECKSUMS_FILENAME
+                    if not checksums_file.exists():
+                        with open(checksums_file, "w", encoding="utf-8") as cs_f:
+                            for item in sorted(cand_path.iterdir()):
+                                if item.is_file() and item.name != CHECKSUMS_FILENAME:
+                                    digest = compute_file_sha256(item)
+                                    cs_f.write(f"{digest}  {item.name}\n")
+
                     backup_zip = self.backup_dir / f"recommended_{tf}_{cid}_{int(time.time())}.zip"
                     self.store.export_adapter_zip(cid, backup_zip)
                     backup_path_str = str(backup_zip)
+
+                    # Reopen and strictly verify backup zip integrity and manifest
+                    with zipfile.ZipFile(backup_zip, "r") as zf:
+                        bad_file = zf.testzip()
+                        if bad_file is not None:
+                            raise ValueError(f"Corrupted file in backup zip: {bad_file}")
+                        names = zf.namelist()
+                        if not any("paxg_manifest.json" in n for n in names):
+                            raise FileNotFoundError("Backup zip missing paxg_manifest.json")
+                        if not any("checksums.sha256" in n for n in names):
+                            raise FileNotFoundError("Backup zip missing checksums.sha256")
+
                 check_smoke_backup = True
             except Exception as exc:
                 reasons.append(f"Smoke test load or backup export failed: {exc}")
