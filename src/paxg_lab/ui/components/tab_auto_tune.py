@@ -91,7 +91,7 @@ def render_auto_tune_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> Non
     auto_jobs = list_recent_jobs(job_type=JobType.AUTO_TRIAL.value, timeframe=timeframe, limit=20, db_path=db_path)
     leaderboard_data = []
 
-    # Populate leaderboard with real auto jobs or benchmark references
+    # Populate leaderboard from real auto trial jobs in DB
     if auto_jobs:
         for idx, j in enumerate(auto_jobs):
             res = j.result or {}
@@ -106,56 +106,46 @@ def render_auto_tune_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> Non
                 "Thời gian tạo": timestamp_to_vietnam_str(j.created_at * 1000),
             })
 
-    if not leaderboard_data:
-        # Initial baseline demonstration entries matching P3 proof benchmarks
-        leaderboard_data = [
-            {
-                "Hạng": 1,
-                "Trial ID": f"trial_{timeframe}_r4_lr5e5_best",
-                "LoRA Rank": 4,
-                "Learning Rate": "5e-05",
-                "Context": 256,
-                "Val Loss": "0.011693" if timeframe == "1h" else "0.012610",
-                "Trạng thái": "SUCCEEDED",
-                "Thời gian tạo": "05/09/2026 17:12",
-            },
-            {
-                "Hạng": 2,
-                "Trial ID": f"trial_{timeframe}_r2_lr3e5_cand",
-                "LoRA Rank": 2,
-                "Learning Rate": "3e-05",
-                "Context": 256,
-                "Val Loss": "0.012450",
-                "Trạng thái": "SUCCEEDED",
-                "Thời gian tạo": "05/09/2026 16:40",
-            },
-        ]
-
-    st.dataframe(pd.DataFrame(leaderboard_data), use_container_width=True, hide_index=True)
+    if leaderboard_data:
+        st.dataframe(pd.DataFrame(leaderboard_data), use_container_width=True, hide_index=True)
+    else:
+        st.info(f"Chưa có kết quả thử nghiệm tự động nào cho khung {timeframe}. Nhấn 'Bật Tự động' hoặc 'Gửi thử 1 Auto Job vào Hàng đợi' để khởi tạo.")
 
     # 3. Decision Audit Log (Lý do công nhận / từ chối)
     st.markdown("#### 📜 Nhật ký Thẩm định & Tiêu chí Thắng (PLAN 3.5)")
-    audit_logs = [
-        {
-            "Thời điểm": "05/09/2026 17:15",
-            "Mã Thử nghiệm": f"trial_{timeframe}_r4_lr5e5_best",
-            "Kết luận": "✅ CÔNG NHẬN ỨNG VIÊN",
-            "Lý do": "Val loss cải thiện tốt hơn Base (>1%), dải 80% bao phủ đạt 75-80%, kiểm tra smoke test thành công.",
-        },
-        {
-            "Thời điểm": "05/09/2026 16:20",
-            "Mã Thử nghiệm": f"trial_{timeframe}_r16_lr3e4_high",
-            "Kết luận": "❌ TỪ CHỐI",
-            "Lý do": "Loss bão hòa sớm tại epoch 2, dấu hiệu overfitting trên tập dừng sớm 14 ngày.",
-        },
-        {
-            "Thời điểm": "05/09/2026 15:50",
-            "Mã Thử nghiệm": f"trial_{timeframe}_r8_lr1e4_bad",
-            "Kết luận": "❌ TỪ CHỐI",
-            "Lý do": "Score v1 < 0 (không vượt qua được Base chuẩn trên các fold ngoài mẫu).",
-        },
-    ]
-    st.dataframe(pd.DataFrame(audit_logs), use_container_width=True, hide_index=True)
+    audit_logs = []
+    if auto_jobs:
+        for j in auto_jobs:
+            res = j.result or {}
+            time_str = timestamp_to_vietnam_str(j.finished_at * 1000) if j.finished_at else timestamp_to_vietnam_str(j.created_at * 1000)
+            if j.status == JobStatus.SUCCEEDED.value:
+                val_loss = res.get("best_val_loss")
+                val_str = f" (Val loss: {val_loss:.6f})" if val_loss is not None else ""
+                audit_logs.append({
+                    "Thời điểm": time_str,
+                    "Mã Thử nghiệm": j.job_id,
+                    "Kết luận": "✅ HOÀN THÀNH",
+                    "Lý do": f"Thử nghiệm huấn luyện tự động thành công{val_str}. Checkpoint hợp lệ đã được lưu trữ an toàn.",
+                })
+            elif j.status == JobStatus.FAILED.value:
+                audit_logs.append({
+                    "Thời điểm": time_str,
+                    "Mã Thử nghiệm": j.job_id,
+                    "Kết luận": "❌ THẤT BẠI",
+                    "Lý do": j.error_message or "Tiến trình worker báo lỗi trong quá trình thực thi.",
+                })
+            elif j.status == JobStatus.CANCELLED.value:
+                audit_logs.append({
+                    "Thời điểm": time_str,
+                    "Mã Thử nghiệm": j.job_id,
+                    "Kết luận": "⏹ ĐÃ DỪNG",
+                    "Lý do": "Thử nghiệm đã được dừng an toàn theo yêu cầu người dùng.",
+                })
+
+    if audit_logs:
+        st.dataframe(pd.DataFrame(audit_logs), use_container_width=True, hide_index=True)
+    else:
+        st.info("Chưa có nhật ký thẩm định nào. Nhật ký sẽ được ghi nhận tự động khi các thử nghiệm hoàn thành.")
 
     # 4. Dispatch Dry-Run Auto Trial (For test verification of queue interaction)
     with st.expander("🧪 Thử nghiệm Gửi Công việc Tự động (Dry-run test)", expanded=False):

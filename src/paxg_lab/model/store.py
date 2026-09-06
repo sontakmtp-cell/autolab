@@ -7,6 +7,7 @@ import logging
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import time
@@ -26,6 +27,31 @@ logger = logging.getLogger(__name__)
 DEFAULT_ADAPTER_STORE_DIR = Path("var/paxg_lab/adapters")
 DEFAULT_DB_PATH = Path("var/paxg_lab/paxg_lab.db")
 CHECKSUMS_FILENAME = "checksums.sha256"
+ADAPTER_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-\.]{0,127}$")
+
+
+def validate_adapter_id(adapter_id: str, base_dir: Path | None = None) -> str:
+    """Validates that adapter_id is a safe slug and strictly does not escape base_dir."""
+    if not isinstance(adapter_id, str) or not adapter_id.strip():
+        raise ValueError(f"Invalid adapter_id: must be a non-empty string, got '{adapter_id}'")
+    clean_id = adapter_id.strip()
+    if ".." in clean_id or "/" in clean_id or "\\" in clean_id or ":" in clean_id:
+        raise ValueError(f"Path traversal characters detected in adapter_id: '{clean_id}'")
+    if not ADAPTER_ID_PATTERN.match(clean_id):
+        raise ValueError(f"Invalid adapter_id format: '{clean_id}'. Must be an alphanumeric slug.")
+    if clean_id in (".", ".."):
+        raise ValueError(f"Reserved path component cannot be used as adapter_id: '{clean_id}'")
+
+    if base_dir is not None:
+        resolved_base = Path(base_dir).resolve()
+        resolved_target = (Path(base_dir) / clean_id).resolve()
+        try:
+            rel = resolved_target.relative_to(resolved_base)
+            if rel == Path(".") or rel.parts == ():
+                raise ValueError(f"adapter_id cannot resolve to base directory itself: '{clean_id}'")
+        except ValueError:
+            raise ValueError(f"Path traversal detected: '{clean_id}' escapes base directory {base_dir}")
+    return clean_id
 
 
 def compute_file_sha256(path: str | Path) -> str:
@@ -55,8 +81,9 @@ class AdapterStore:
             self._init_registry()
 
     def get_adapter_path(self, adapter_id: str) -> Path:
-        """Returns the canonical directory path for an adapter."""
-        return self.base_dir / adapter_id
+        """Returns the canonical directory path for an adapter after strictly validating adapter_id."""
+        clean_id = validate_adapter_id(adapter_id, base_dir=self.base_dir)
+        return self.base_dir / clean_id
 
     def save_adapter(
         self,

@@ -41,6 +41,7 @@ def render_forecast_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
 
     model_options = ["TimesFM 3.0 Base (Chuẩn không adapter)"]
     adapter_id_map: dict[str, str | None] = {"TimesFM 3.0 Base (Chuẩn không adapter)": None}
+    adapter_manifest_map: dict[str, Any] = {"TimesFM 3.0 Base (Chuẩn không adapter)": None}
 
     for a in valid_adapters:
         alias = adapter_store.get_alias(a.adapter_id)
@@ -48,6 +49,7 @@ def render_forecast_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
         label = f"LoRA: {alias}{star} (val_loss: {a.best_val_loss:.4f})"
         model_options.append(label)
         adapter_id_map[label] = a.adapter_id
+        adapter_manifest_map[label] = a
 
     # Form to select model and generate forecast without duplicate triggers
     with st.form(key=f"form_forecast_{timeframe}"):
@@ -61,6 +63,7 @@ def render_forecast_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
                 help="Chọn TimesFM 3.0 Base hoặc adapter LoRA đã huấn luyện tương thích với khung giờ này.",
             )
             selected_adapter_id = adapter_id_map[selected_model_label]
+            selected_manifest = adapter_manifest_map[selected_model_label]
 
         with col_c:
             candles_display_count = st.slider(
@@ -91,17 +94,26 @@ def render_forecast_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
         # Build job specification
         job_id = f"fc_{timeframe}_{uuid.uuid4().hex[:8]}"
         idempotency_key = f"fc_{timeframe}_{selected_adapter_id or 'base'}_{last_candle_time}"
-        
-        adapter_dir = str(adapter_store.get_adapter_path(selected_adapter_id)) if selected_adapter_id else None
-        feature_set = "B" if selected_adapter_id else "A"
+
+        if selected_manifest is not None:
+            adapter_dir = str(adapter_store.get_adapter_path(selected_adapter_id))
+            context_len = int(selected_manifest.context_len)
+            feature_set = str(selected_manifest.feature_set)
+            columns = list(selected_manifest.feature_columns)
+        else:
+            adapter_dir = None
+            context_len = 256
+            feature_set = "A"
+            columns = ["close"]
 
         payload = {
             "timeframe": timeframe,
             "horizon": horizon,
-            "context_len": 256,
+            "context_len": context_len,
             "snapshot_path": str(snapshot_path),
             "adapter_path": adapter_dir,
             "feature_set": feature_set,
+            "columns": columns,
         }
 
         job_spec = JobSpec(
@@ -245,26 +257,47 @@ def render_forecast_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
 def _parse_forecast_result(result_dict: dict[str, Any], timeframe: str) -> list[dict[str, Any]]:
     """Normalizes ForecastResult dictionary into a step list for charts and tables."""
     steps_list = []
-    
-    # Check if result has standard structure
-    timestamps = result_dict.get("timestamps", [])
-    q50_arr = result_dict.get("q50", [])
-    q10_arr = result_dict.get("q10", [])
-    q90_arr = result_dict.get("q90", [])
-    quantiles_matrix = result_dict.get("quantiles", [])  # (horizon, 9)
+
+    # Read standard domain ForecastResult schema keys first, with backward-compatible fallbacks
+    target_timestamps = result_dict.get("target_timestamps") or result_dict.get("timestamps", [])
+    point_forecast = result_dict.get("point_forecast") or result_dict.get("q50", [])
+    uncertainty_lower = result_dict.get("uncertainty_lower") or result_dict.get("q10", [])
+    uncertainty_upper = result_dict.get("uncertainty_upper") or result_dict.get("q90", [])
+    quantiles_matrix = result_dict.get("quantiles", [])  # shape (horizon, 9)
+    forecast_origin_time = result_dict.get("forecast_origin_time")
 
     horizon = get_horizon_for_timeframe(timeframe)
-    num_steps = len(q50_arr) if q50_arr else (len(quantiles_matrix) if quantiles_matrix else horizon)
+    interval_ms = 4 * 3600 * 1000 if timeframe == "4h" else 1 * 3600 * 1000
+
+    num_steps = (
+        len(point_forecast)
+        if point_forecast
+        else (
+            len(target_timestamps)
+            if target_timestamps
+            else (len(quantiles_matrix) if quantiles_matrix else horizon)
+        )
+    )
 
     for i in range(num_steps):
         step_num = i + 1
-        ts_ms = timestamps[i] if (timestamps and i < len(timestamps)) else None
-        time_vn = timestamp_to_vietnam_str(ts_ms) if ts_ms else f"+{step_num * (4 if timeframe == '4h' else 1)}h"
+        if target_timestamps and i < len(target_timestamps):
+            ts_ms = int(target_timestamps[i])
+        elif forecast_origin_time is not None:
+            ts_ms = int(forecast_origin_time) + step_num * interval_ms
+        else:
+            ts_ms = None
 
-        if q50_arr and i < len(q50_arr):
-            q50 = float(q50_arr[i])
-            q10 = float(q10_arr[i]) if (q10_arr and i < len(q10_arr)) else q50 * 0.99
-            q90 = float(q90_arr[i]) if (q90_arr and i < len(q90_arr)) else q50 * 1.01
+        time_vn = timestamp_to_vietnam_str(ts_ms) if ts_ms is not None else f"Bước +{step_num}"
+
+        if point_forecast and i < len(point_forecast):
+            q50 = float(point_forecast[i])
+            q10 = float(uncertainty_lower[i]) if (uncertainty_lower and i < len(uncertainty_lower)) else (
+                float(quantiles_matrix[i][0]) if (quantiles_matrix and i < len(quantiles_matrix)) else q50 * 0.99
+            )
+            q90 = float(uncertainty_upper[i]) if (uncertainty_upper and i < len(uncertainty_upper)) else (
+                float(quantiles_matrix[i][8]) if (quantiles_matrix and i < len(quantiles_matrix)) else q50 * 1.01
+            )
         elif quantiles_matrix and i < len(quantiles_matrix):
             row = quantiles_matrix[i]
             q10 = float(row[0])

@@ -218,10 +218,11 @@ def render_training_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
                     f"Best Epoch: {res.get('best_epoch', 1)} &bull; Best Val Loss: {res.get('best_val_loss', 0.0):.6f}"
                 )
                 st.session_state["last_trained_adapter_id"] = res.get("adapter_id")
+                st.session_state["last_training_result"] = res
                 st.session_state.pop("active_train_job_id", None)
 
             elif track_job.status == JobStatus.CANCELLED.value:
-                st.warning(f"Huấn luyện đã được dừng an toàn theo yêu cầu. Checkpoint hợp lệ đã được bảo toàn.")
+                st.warning("Huấn luyện đã được dừng an toàn theo yêu cầu. Checkpoint hợp lệ đã được bảo toàn.")
                 st.session_state.pop("active_train_job_id", None)
 
             elif track_job.status == JobStatus.FAILED.value:
@@ -230,14 +231,30 @@ def render_training_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
 
     # 6. Training Loss History Chart
     st.markdown("#### 📈 Biểu đồ Loss Huấn luyện Gần nhất")
-    # Sample illustrative training curves for completed jobs
-    fig_loss = build_loss_chart(
-        train_losses=[0.0245, 0.0182, 0.0143, 0.0121, 0.0114],
-        val_losses=[0.0210, 0.0165, 0.0132, 0.0118, 0.0116],
-        epochs=[1, 2, 3, 4, 5],
-        title=f"Đường cong Loss Huấn luyện LoRA ({timeframe})",
-    )
-    st.plotly_chart(fig_loss, use_container_width=True)
+    training_history: list[dict[str, Any]] = []
+    last_res = st.session_state.get("last_training_result")
+    if last_res and isinstance(last_res, dict) and last_res.get("history"):
+        training_history = last_res["history"]
+    else:
+        recent_succeeded = storage.list_jobs(
+            job_type=JobType.TRAIN.value, timeframe=timeframe, status=JobStatus.SUCCEEDED.value, limit=1
+        )
+        if recent_succeeded and recent_succeeded[0].result and recent_succeeded[0].result.get("history"):
+            training_history = recent_succeeded[0].result["history"]
+
+    if training_history:
+        epochs = [int(h.get("epoch", i + 1)) for i, h in enumerate(training_history)]
+        train_losses = [float(h.get("train_loss", 0.0)) for h in training_history]
+        val_losses = [float(h.get("val_loss", 0.0)) for h in training_history]
+        fig_loss = build_loss_chart(
+            train_losses=train_losses,
+            val_losses=val_losses,
+            epochs=epochs,
+            title=f"Đường cong Loss Huấn luyện LoRA Thực tế ({timeframe})",
+        )
+        st.plotly_chart(fig_loss, use_container_width=True)
+    else:
+        st.info("Chưa có kết quả huấn luyện nào trong phiên hiện tại. Biểu đồ Loss sẽ hiển thị sau khi hoàn thành lượt huấn luyện thực tế.")
 
     # 7. Recent Training Jobs
     with st.expander("📜 Danh sách các đợt huấn luyện gần nhất", expanded=False):

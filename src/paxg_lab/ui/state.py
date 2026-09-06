@@ -136,12 +136,15 @@ def get_gpu_queue_summary(db_path: Path = DEFAULT_DB_PATH) -> dict[str, Any]:
 
 
 def get_latest_snapshot_path(timeframe: str = TIMEFRAME_1H, snapshots_dir: Path = Path("var/paxg_lab/snapshots")) -> Path | None:
-    """Finds the most recent valid snapshot file for the timeframe."""
+    """Finds the most recent valid snapshot directory or file for the timeframe."""
     if not snapshots_dir.exists():
         return None
     tf = timeframe.lower().strip()
     matches = sorted(
-        [p for p in snapshots_dir.glob(f"paxgusdt_{tf}_*.npz")],
+        [
+            p for p in snapshots_dir.glob(f"paxgusdt_{tf}_*")
+            if (p.is_dir() and (p / "data.npz").exists()) or (p.is_file() and p.suffix == ".npz")
+        ],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )

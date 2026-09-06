@@ -69,14 +69,17 @@ def build_candlestick_forecast_chart(
         q90_vals = [last_close]
 
         for s in forecast_steps:
-            # step dictionary contains 'time_vn', 'q50', 'q10', 'q90'
-            t_str = s.get("time_vn")
-            if isinstance(t_str, str):
-                t_dt = pd.to_datetime(t_str)
-            elif isinstance(s.get("timestamp_ms"), (int, float)):
-                t_dt = pd.to_datetime(s["timestamp_ms"], unit="ms", utc=True).tz_convert(VIETNAM_TZ)
+            # Prefer numeric millisecond epoch timestamp converted to Vietnam timezone
+            t_ms = s.get("timestamp_ms")
+            if isinstance(t_ms, (int, float)) and t_ms > 0:
+                t_dt = pd.to_datetime(t_ms, unit="ms", utc=True).tz_convert(VIETNAM_TZ)
             else:
-                t_dt = last_time + pd.Timedelta(hours=len(future_times) * (4 if timeframe == "4h" else 1))
+                t_str = s.get("time_vn")
+                try:
+                    t_dt = pd.to_datetime(t_str)
+                except Exception:
+                    step_offset = len(future_times)
+                    t_dt = last_time + pd.Timedelta(hours=step_offset * (4 if timeframe == "4h" else 1))
 
             future_times.append(t_dt)
             q50_vals.append(float(s["q50"]))

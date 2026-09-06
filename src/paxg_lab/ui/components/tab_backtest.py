@@ -165,7 +165,8 @@ def render_backtest_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
             history = []
             for j in recent_bt_jobs:
                 res = j.result or {}
-                score_str = f"{res.get('score_v1', 0.0):.2f}" if "score_v1" in res else "N/A"
+                score_val = res.get("score", res.get("score_v1"))
+                score_str = f"{float(score_val):.2f}" if score_val is not None else "N/A"
                 history.append({
                     "Mã Job": j.job_id,
                     "Thời gian tạo": timestamp_to_vietnam_str(j.created_at * 1000),
@@ -180,9 +181,9 @@ def render_backtest_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> None
 def _render_backtest_report_view(report: dict[str, Any], timeframe: str) -> None:
     """Renders comprehensive backtest cards, charts, comparisons, and export buttons."""
     model_name = report.get("model_name", "TimesFM3")
-    score_v1 = float(report.get("score_v1", 0.0))
-    weighted_mae = float(report.get("weighted_mae", 0.0))
-    weighted_pinball = float(report.get("weighted_pinball", 0.0))
+    score_v1 = float(report.get("score", report.get("score_v1", 0.0)))
+    weighted_mae = float(report.get("overall_weighted_mae", report.get("weighted_mae", 0.0)))
+    weighted_pinball = float(report.get("overall_weighted_pinball", report.get("weighted_pinball", 0.0)))
     cov_80 = float(report.get("coverage_80", 0.0)) * 100.0
     dir_acc = float(report.get("directional_accuracy", 0.0)) * 100.0
 
@@ -191,7 +192,6 @@ def _render_backtest_report_view(report: dict[str, Any], timeframe: str) -> None
     # Metrics row
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        score_color = "normal" if score_v1 >= 0 else "inverse"
         st.metric("Score v1 (Chuẩn Base=0.0)", f"{score_v1:+.2f}", help="Score v1 theo công thức PLAN 3.4. Điểm dương: tốt hơn Base.")
     with c2:
         st.metric("MAE có trọng số", f"${weighted_mae:.2f}")
@@ -206,17 +206,25 @@ def _render_backtest_report_view(report: dict[str, Any], timeframe: str) -> None
     col_chart, col_tbl = st.columns([1.3, 1.0])
 
     step_mae_dict: dict[int, float] = {}
-    base_step_mae_dict: dict[int, float] = {}
 
-    # Extract step metrics from fold_metrics
-    fold_metrics = report.get("fold_metrics", [])
-    if fold_metrics:
-        # Average step MAE across folds
+    # Extract step metrics: read report-level step_mae first, fallback to fold_metrics
+    raw_step_mae = report.get("step_mae", {})
+    if raw_step_mae and isinstance(raw_step_mae, dict):
+        for k, v in raw_step_mae.items():
+            try:
+                step_mae_dict[int(k)] = float(v)
+            except (ValueError, TypeError):
+                pass
+    elif report.get("fold_metrics"):
+        fold_metrics = report.get("fold_metrics", [])
         for fm in fold_metrics:
             s_dict = fm.get("step_mae", {})
             for step_str, val in s_dict.items():
-                s_int = int(step_str)
-                step_mae_dict[s_int] = step_mae_dict.get(s_int, 0.0) + float(val) / max(1, len(fold_metrics))
+                try:
+                    s_int = int(step_str)
+                    step_mae_dict[s_int] = step_mae_dict.get(s_int, 0.0) + float(val) / max(1, len(fold_metrics))
+                except (ValueError, TypeError):
+                    pass
 
     # Relevant steps according to PLAN 4.4
     key_steps = [1, 6, 12, 24] if timeframe == "1h" else [1, 2, 3, 6]
@@ -242,8 +250,35 @@ def _render_backtest_report_view(report: dict[str, Any], timeframe: str) -> None
             })
         st.dataframe(pd.DataFrame(step_rows), use_container_width=True, hide_index=True)
 
-    # Three-way Comparison Table: Candidate vs Base vs Naive
+    # Three-way Comparison Table: Candidate vs Base vs Naive (No hardcoded fake values)
     st.markdown("#### ⚖️ Bảng đối chiếu hiệu năng với các chuẩn tham chiếu")
+    base_comps = report.get("baseline_comparisons", {})
+    naive_w_mae = base_comps.get("naive_flat_eval_weighted_mae")
+
+    is_base = bool(
+        report.get("metadata", {}).get("is_base_reference")
+        or model_name == "TimesFM3-Base"
+        or ("Base" in model_name and "LoRA" not in model_name)
+    )
+
+    if is_base:
+        base_mae_str = f"${weighted_mae:.2f}"
+        base_pinball_str = f"{weighted_pinball:.2f}"
+        base_cov_str = f"{cov_80:.1f}%"
+        base_da_str = f"{dir_acc:.1f}%"
+        base_note = "Mô hình hiện tại (Chuẩn đối chiếu)"
+    else:
+        base_mae = base_comps.get("base_overall_weighted_mae")
+        base_pin = base_comps.get("base_overall_weighted_pinball")
+        base_c = base_comps.get("base_coverage_80")
+        base_d = base_comps.get("base_directional_accuracy")
+
+        base_mae_str = f"${base_mae:.2f}" if base_mae is not None else "N/A"
+        base_pinball_str = f"{base_pin:.2f}" if base_pin is not None else "N/A"
+        base_cov_str = f"{base_c * 100:.1f}%" if base_c is not None else "N/A"
+        base_da_str = f"{base_d * 100:.1f}%" if base_d is not None else "N/A"
+        base_note = "Chuẩn đối chiếu (Score=0.00)"
+
     comp_rows = [
         {
             "Mô hình": model_name,
@@ -252,25 +287,25 @@ def _render_backtest_report_view(report: dict[str, Any], timeframe: str) -> None
             "Pinball Loss": f"{weighted_pinball:.2f}",
             "Độ bao phủ 80%": f"{cov_80:.1f}%",
             "Đúng hướng": f"{dir_acc:.1f}%",
-            "Ghi chú": "Mô hình hiện tại",
+            "Ghi chú": "Mô hình đang đánh giá",
         },
         {
             "Mô hình": "TimesFM 3.0 Base (Chuẩn)",
             "Score v1": "0.00",
-            "MAE có trọng số": f"${report.get('base_weighted_mae', weighted_mae):.2f}",
-            "Pinball Loss": f"{report.get('base_weighted_pinball', weighted_pinball):.2f}",
-            "Độ bao phủ 80%": "75.9% (1h) / 79.7% (4h)",
-            "Đúng hướng": "52.4%",
-            "Ghi chú": "Chuẩn đối chiếu (Score=0)",
+            "MAE có trọng số": base_mae_str,
+            "Pinball Loss": base_pinball_str,
+            "Độ bao phủ 80%": base_cov_str,
+            "Đúng hướng": base_da_str,
+            "Ghi chú": base_note,
         },
         {
             "Mô hình": "Chuẩn giữ nguyên giá (Naive)",
-            "Score v1": "-18.50",
-            "MAE có trọng số": f"${weighted_mae * 1.25:.2f}",
+            "Score v1": "N/A",
+            "MAE có trọng số": f"${naive_w_mae:.2f}" if naive_w_mae is not None else "N/A",
             "Pinball Loss": "N/A",
-            "Độ bao phủ 80%": "0.0%",
-            "Đúng hướng": "50.0%",
-            "Ghi chú": "Dự đoán giá tương lai = giá hiện tại",
+            "Độ bao phủ 80%": "N/A",
+            "Đúng hướng": "N/A",
+            "Ghi chú": "Dự đoán giá tương lai = giá hiện tại (đo đạc thực tế)",
         },
     ]
     st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)

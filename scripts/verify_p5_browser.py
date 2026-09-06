@@ -149,15 +149,30 @@ def run_browser_verification() -> dict:
             logger.info("Verifying Tab 1: Forecast in 1h mode...")
             page.wait_for_timeout(2000)
 
+            # Trigger real forecast submission via UI button
+            submit_btn = page.locator("button:has-text('Tạo Dự đoán')")
+            logger.info("Found 1h submit button: %d", submit_btn.count())
+            if submit_btn.count() > 0:
+                logger.info("Submitting 1h forecast job via UI...")
+                submit_btn.first.click()
+                try:
+                    page.wait_for_selector("text=Bảng số chi tiết 24 bước", timeout=45000)
+                    logger.info("1h forecast completed: 24 steps table confirmed in DOM!")
+                except Exception as e:
+                    logger.warning("Waiting for 24 steps table timed out: %s", e)
+
             # Screenshot Tab 1 (1h)
             tab1_1h_shot = EVIDENCE_DIR / "p5_tab1_forecast_1h_24steps.png"
             page.screenshot(path=str(tab1_1h_shot), full_page=True)
             evidence_report["screenshots"]["tab1_forecast_1h"] = str(tab1_1h_shot.name)
             logger.info("Captured screenshot: %s", tab1_1h_shot.name)
 
-            # Verify 24 steps horizon text
+            # Verify 24 steps horizon text and row count
             content_1h = page.content()
-            horizon_1h_ok = "horizon = 24 nến" in content_1h or "24 nến / 24h" in content_1h
+            horizon_1h_ok = (
+                ("Bảng số chi tiết 24 bước" in content_1h)
+                or ("24 nến" in content_1h and "24 giờ" in content_1h)
+            )
             evidence_report["checks"]["horizon_1h_24steps"] = horizon_1h_ok
 
             # ---------------------------------------------------------------
@@ -165,22 +180,39 @@ def run_browser_verification() -> dict:
             # ---------------------------------------------------------------
             logger.info("Switching to 4h mode...")
             try:
-                radio_4h = page.get_by_text("4h (6 nến / 24h)")
-                radio_4h.click()
+                radio_4h = page.locator("label:has-text('4h (6 nến / 24h)')")
+                if radio_4h.count() > 0:
+                    radio_4h.first.click()
+                else:
+                    page.get_by_text("4h (6 nến / 24h)").click()
                 time.sleep(3.0)
                 page.wait_for_load_state("networkidle")
             except Exception as e:
                 logger.warning("Could not click 4h radio: %s", e)
 
-            content_4h = page.content()
-            horizon_4h_ok = "horizon = 6 nến" in content_4h or "4h (6 nến / 24h)" in content_4h
-            evidence_report["checks"]["horizon_4h_6steps"] = horizon_4h_ok
+            submit_btn_4h = page.locator("button:has-text('Tạo Dự đoán')")
+            logger.info("Found 4h submit button: %d", submit_btn_4h.count())
+            if submit_btn_4h.count() > 0:
+                logger.info("Submitting 4h forecast job via UI...")
+                submit_btn_4h.first.click()
+                try:
+                    page.wait_for_selector("text=Bảng số chi tiết 6 bước", timeout=45000)
+                    logger.info("4h forecast completed: 6 steps table confirmed in DOM!")
+                except Exception as e:
+                    logger.warning("Waiting for 6 steps table timed out: %s", e)
 
             # Screenshot Tab 1 (4h)
             tab1_4h_shot = EVIDENCE_DIR / "p5_tab1_forecast_4h_6steps.png"
             page.screenshot(path=str(tab1_4h_shot), full_page=True)
             evidence_report["screenshots"]["tab1_forecast_4h"] = str(tab1_4h_shot.name)
             logger.info("Captured screenshot: %s", tab1_4h_shot.name)
+
+            content_4h = page.content()
+            horizon_4h_ok = (
+                ("Bảng số chi tiết 6 bước" in content_4h)
+                or ("6 nến" in content_4h and "24 giờ" in content_4h)
+            )
+            evidence_report["checks"]["horizon_4h_6steps"] = horizon_4h_ok
 
             # ---------------------------------------------------------------
             # TAB 2: Backtest
@@ -251,22 +283,40 @@ def run_browser_verification() -> dict:
             logger.info("Captured screenshot: %s", tab5_shot.name)
 
             # ---------------------------------------------------------------
-            # Check 6: Multi-tab & Reload Safety
+            # Check 6: Multi-tab & Reload Safety with Queue Verification
             # ---------------------------------------------------------------
-            logger.info("Verifying multi-tab & page reload safety...")
+            logger.info("Verifying multi-tab & page reload safety with SQLite queue verification...")
+            count_before = len(storage.list_jobs())
+
+            # 1. Reload page (F5 equivalent)
+            page.reload(wait_until="networkidle")
+            time.sleep(2.0)
+            count_after_reload = len(storage.list_jobs())
+            reload_jobs_unchanged = (count_after_reload == count_before)
+            logger.info(
+                "Reload check: jobs before=%d, after reload=%d (unchanged=%s)",
+                count_before,
+                count_after_reload,
+                reload_jobs_unchanged,
+            )
+
+            # 2. Open second concurrent tab
             page2 = context.new_page()
             page2.goto(URL, wait_until="networkidle", timeout=30000)
             time.sleep(2.0)
-            page2_ok = "PAXG Forecast Lab" in page2.content()
+            page2_title_ok = "PAXG Forecast Lab" in page2.content()
+            count_after_tab2 = len(storage.list_jobs())
+            tab2_jobs_unchanged = (count_after_tab2 == count_before)
+            logger.info(
+                "Second tab check: jobs after tab2=%d (unchanged=%s)",
+                count_after_tab2,
+                tab2_jobs_unchanged,
+            )
             page2.close()
 
-            # Reload original page
-            page.reload(wait_until="networkidle")
-            time.sleep(2.0)
-            reload_ok = "PAXG Forecast Lab" in page.content()
-
-            evidence_report["checks"]["multi_tab_and_reload_safe"] = page2_ok and reload_ok
-            logger.info("Check 6 - Multi-tab & Reload safe: %s", page2_ok and reload_ok)
+            safety_ok = reload_jobs_unchanged and tab2_jobs_unchanged and page2_title_ok
+            evidence_report["checks"]["multi_tab_and_reload_safe"] = safety_ok
+            logger.info("Check 6 - Multi-tab & Reload safe: %s", safety_ok)
 
             context.close()
             browser.close()

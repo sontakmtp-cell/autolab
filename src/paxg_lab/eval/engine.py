@@ -532,6 +532,13 @@ class BacktestEngine:
         if naive_test_metric is not None:
             baseline_comps["naive_flat_test_weighted_mae"] = naive_test_metric.weighted_mae
 
+        if base_reference_metrics is not None:
+            if isinstance(base_reference_metrics, ScoreReport):
+                baseline_comps["base_overall_weighted_mae"] = base_reference_metrics.overall_weighted_mae
+                baseline_comps["base_overall_weighted_pinball"] = base_reference_metrics.overall_weighted_pinball
+                baseline_comps["base_coverage_80"] = base_reference_metrics.coverage_80
+                baseline_comps["base_directional_accuracy"] = base_reference_metrics.directional_accuracy
+
         meta_dict: dict[str, Any] = {
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "snapshot_id": snapshot.metadata.snapshot_id,

@@ -370,6 +370,7 @@ class GPUWorker:
             "best_val_loss": train_result.best_val_loss,
             "training_time_sec": train_result.total_training_time_sec,
             "total_steps": train_result.total_steps,
+            "history": train_result.history,
         }
 
     def _handle_backtest_job(self, job: JobSpec) -> dict[str, Any]:
