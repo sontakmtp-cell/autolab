@@ -23,7 +23,7 @@ jobs:
         run: uv venv
       - name: Install dependencies
         run: |
-          uv pip install build pytest requests pandas peft einops ".[torch,flax]"
+          uv pip install build pytest ".[torch,flax,paxg-web]"
       - name: Build package
         run: uv run python -m build
       - name: Run Tests (PAXG Lab & TimesFM3)
