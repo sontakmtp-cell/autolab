@@ -299,6 +299,10 @@ class GPUScheduler:
         ]
 
         logger.info("Spawning worker subprocess: %s (log: %s)", " ".join(cmd), log_path)
+        proc: subprocess.Popen | None = None
+        spawned_pid: int | None = None
+        spawned_create_time: float | None = None
+
         try:
             # Dedicated log file avoids pipe deadlocks when worker logs heavily
             log_file = open(log_path, "a", encoding="utf-8")
@@ -307,18 +311,48 @@ class GPUScheduler:
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
             )
+            spawned_pid = proc.pid
+            try:
+                spawned_create_time = psutil.Process(proc.pid).create_time()
+            except Exception:
+                spawned_create_time = None
+
+            # Register PID and create_time in storage
+            self.storage.register_worker(job.job_id, proc.pid, spawned_create_time)
 
             self.active_worker = proc
             self.active_job_id = job.job_id
             self.active_worker_pid = proc.pid
-            self.active_worker_create_time = psutil.Process(proc.pid).create_time()
-
-            # Register PID and create_time in storage
-            self.storage.register_worker(job.job_id, proc.pid, self.active_worker_create_time)
+            self.active_worker_create_time = spawned_create_time
             return True
         except Exception as exc:
-            logger.error("Failed to spawn worker subprocess for job '%s': %s", job.job_id, exc)
-            self.storage.mark_failed(job.job_id, f"Failed to spawn worker subprocess: {exc}")
+            logger.error("Failed to complete worker subprocess startup for job '%s': %s", job.job_id, exc)
+            if proc is not None and spawned_pid is not None:
+                # Subprocess was already created by Popen! Safely terminate child to prevent orphan GPU process
+                logger.warning("Terminating newly spawned child process PID %s after post-spawn failure...", spawned_pid)
+                term_ok = safe_terminate_process(spawned_pid, spawned_create_time, timeout=5.0)
+                if not term_ok or is_process_alive(spawned_pid, spawned_create_time):
+                    # Child cannot be killed! Block queue to preserve single GPU process invariant
+                    logger.critical(
+                        "CRITICAL: Failed to kill newly spawned child process PID %s after startup exception! "
+                        "Process remains alive. Blocking queue dispatch to protect GPU invariant.",
+                        spawned_pid,
+                    )
+                    self.active_worker = proc
+                    self.active_job_id = job.job_id
+                    self.active_worker_pid = spawned_pid
+                    self.active_worker_create_time = spawned_create_time
+                    self.scheduler_error = (
+                        f"Post-spawn failure on job '{job.job_id}' and worker PID {spawned_pid} "
+                        "could not be terminated."
+                    )
+                    return False
+
+            # Child was cleanly terminated or never spawned
+            try:
+                self.storage.mark_failed(job.job_id, f"Failed to spawn worker subprocess: {exc}")
+            except Exception:
+                pass
             self.active_worker = None
             self.active_job_id = None
             self.active_worker_pid = None
@@ -326,60 +360,84 @@ class GPUScheduler:
             return False
 
     def _handle_oom_retry_if_needed(self, job: JobSpec) -> str | None:
-        """Implements PLAN 4.1 OOM protocol: retry once with halved batch size and doubled accumulation."""
+        """Implements PLAN 4.1 OOM protocol: retry once with halved batch size and adjusted accumulation.
+
+        If batch_size is already 1, no further reduction is possible; transitions directly to PAUSED_ERROR.
+        Gradient accumulation is clamped to max 16 per PLAN 3.2 constraints.
+        """
         err = (job.error_message or "").lower()
         if "[cuda_oom]" not in err and "out of memory" not in err:
             return None
 
         retry_count = int(job.payload.get("oom_retry_count", 0))
-        if retry_count == 0:
-            retry_payload = copy.deepcopy(job.payload)
-            retry_payload["oom_retry_count"] = 1
-
-            if "train_spec" in retry_payload and isinstance(retry_payload["train_spec"], dict):
-                spec_d = retry_payload["train_spec"]
-                old_b = int(spec_d.get("batch_size", 2))
-                old_a = int(spec_d.get("gradient_accumulation_steps", 8))
-                new_b = max(1, old_b // 2)
-                new_a = old_a * 2
-                spec_d["batch_size"] = new_b
-                spec_d["gradient_accumulation_steps"] = new_a
-                retry_payload["train_spec"] = spec_d
-                retry_payload["original_batch_size"] = old_b
-                retry_payload["original_grad_accum"] = old_a
-                retry_payload["adjusted_batch_size"] = new_b
-                retry_payload["adjusted_grad_accum"] = new_a
-            elif "batch_size" in retry_payload:
-                old_b = int(retry_payload["batch_size"])
-                old_a = int(retry_payload.get("gradient_accumulation_steps", 1))
-                new_b = max(1, old_b // 2)
-                new_a = old_a * 2
-                retry_payload["batch_size"] = new_b
-                retry_payload["gradient_accumulation_steps"] = new_a
-                retry_payload["original_batch_size"] = old_b
-                retry_payload["original_grad_accum"] = old_a
-                retry_payload["adjusted_batch_size"] = new_b
-                retry_payload["adjusted_grad_accum"] = new_a
-
-            retry_job_id = f"{job.job_id}_oom_retry"
-            retry_spec = JobSpec(
-                job_id=retry_job_id,
-                job_type=job.job_type,
-                timeframe=job.timeframe,
-                priority=job.priority,
-                payload=retry_payload,
-                timeout_seconds=job.timeout_seconds,
-            )
-            self.storage.submit_job(retry_spec)
-            logger.info("CUDA OOM detected on job '%s'. Dispatched OOM retry job '%s'.", job.job_id, retry_job_id)
-            return retry_job_id
-        else:
+        if retry_count > 0:
             logger.error("CUDA OOM retry already failed for job '%s'. Setting PAUSED_ERROR.", job.job_id)
             tf = job.timeframe or "1h"
             self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
             if not job.timeframe:
                 self.storage.set_auto_run_state("4h", AutoRunState.PAUSED_ERROR)
             return None
+
+        # Inspect current batch_size and gradient_accumulation_steps
+        payload = job.payload
+        has_train_spec = "train_spec" in payload and isinstance(payload["train_spec"], dict)
+        spec_d = payload["train_spec"] if has_train_spec else payload
+
+        old_b = int(spec_d.get("batch_size", 2))
+        old_a = int(spec_d.get("gradient_accumulation_steps", 8))
+
+        # Boundary check: If batch_size cannot be reduced further (batch_size <= 1)
+        if old_b <= 1:
+            logger.error(
+                "CUDA OOM on job '%s' cannot be retried: batch_size=%d is already at minimum (1). "
+                "Setting PAUSED_ERROR directly per PLAN 4.1 protocol.",
+                job.job_id,
+                old_b,
+            )
+            tf = job.timeframe or "1h"
+            self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
+            if not job.timeframe:
+                self.storage.set_auto_run_state("4h", AutoRunState.PAUSED_ERROR)
+            return None
+
+        # Valid load reduction: halve batch_size, double grad_accum clamped to max 16 per PLAN 3.2
+        new_b = max(1, old_b // 2)
+        new_a = min(16, old_a * 2)
+
+        retry_payload = copy.deepcopy(job.payload)
+        retry_payload["oom_retry_count"] = 1
+        if has_train_spec:
+            retry_payload["train_spec"]["batch_size"] = new_b
+            retry_payload["train_spec"]["gradient_accumulation_steps"] = new_a
+        else:
+            retry_payload["batch_size"] = new_b
+            retry_payload["gradient_accumulation_steps"] = new_a
+
+        retry_payload["original_batch_size"] = old_b
+        retry_payload["original_grad_accum"] = old_a
+        retry_payload["adjusted_batch_size"] = new_b
+        retry_payload["adjusted_grad_accum"] = new_a
+
+        retry_job_id = f"{job.job_id}_oom_retry"
+        retry_spec = JobSpec(
+            job_id=retry_job_id,
+            job_type=job.job_type,
+            timeframe=job.timeframe,
+            priority=job.priority,
+            payload=retry_payload,
+            timeout_seconds=job.timeout_seconds,
+        )
+        self.storage.submit_job(retry_spec)
+        logger.info(
+            "CUDA OOM detected on job '%s' (batch=%d->%d, accum=%d->%d). Dispatched OOM retry job '%s'.",
+            job.job_id,
+            old_b,
+            new_b,
+            old_a,
+            new_a,
+            retry_job_id,
+        )
+        return retry_job_id
 
     def stop_auto_run(self, timeframe: str | None = None) -> None:
         """Stops autonomous tuning: sets state to STOPPED, cancels queued auto jobs,

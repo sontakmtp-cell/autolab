@@ -1442,3 +1442,343 @@ def test_coordinator_lease_takeover_prevents_stale_renewal(temp_db_path: Path):
     assert current_lease["owner_token"] == new_token_b
     assert current_lease["pid"] == new_pid_b
 
+
+# ---------------------------------------------------------------------------
+# 29. Review Round 3: E2E BACKTEST Job Execution for Base and LoRA Models
+# ---------------------------------------------------------------------------
+
+
+def test_backtest_job_e2e_base_and_lora(temp_db_path: Path, tmp_path: Path):
+    """Verifies that BACKTEST jobs execute cleanly via GPUWorker for both Base and LoRA models."""
+    from paxg_lab.queue.worker import GPUWorker
+
+    storage = GPUJobStorage(temp_db_path)
+
+    snap_4h_candidates = list(Path("var/paxg_lab/snapshots").glob("paxgusdt_4h_*"))
+    if not snap_4h_candidates:
+        pytest.skip("4h snapshot not found in var/paxg_lab/snapshots/")
+    snap_4h = snap_4h_candidates[0]
+
+    # 1. Base model backtest (establishes base reference)
+    job_id_base = "job_backtest_base_p4"
+    storage.submit_job(
+        JobSpec(
+            job_id=job_id_base,
+            job_type=JobType.BACKTEST.value,
+            timeframe="4h",
+            priority=JobPriority.MANUAL.value,
+            payload={
+                "snapshot_path": str(snap_4h),
+                "model_type": "base",
+                "is_base_reference": True,
+                "feature_set": "A",
+                "context_len": 256,
+                "batch_size": 32,
+            },
+        )
+    )
+
+    worker_base = GPUWorker(job_id=job_id_base, db_path=temp_db_path)
+    exit_code_base = worker_base.run()
+    assert exit_code_base == 0
+
+    job_base = storage.get_job(job_id_base)
+    assert job_base is not None
+    assert job_base.status == JobStatus.SUCCEEDED.value
+    res_base = job_base.result
+    assert res_base["timeframe"] == "4h"
+    assert res_base["model_name"] == "TimesFM3-Base"
+    assert np.isclose(res_base["score"], 0.0, atol=1e-4)
+    assert res_base["overall_weighted_mae"] > 0.0
+    assert len(res_base["fold_metrics"]) > 0
+
+    # 2. Train a fast LoRA adapter on the 4h snapshot
+    job_id_train = "job_train_adapter_for_backtest"
+    adapter_store_dir = tmp_path / "adapters_backtest"
+    storage.submit_job(
+        JobSpec(
+            job_id=job_id_train,
+            job_type=JobType.TRAIN.value,
+            timeframe="4h",
+            priority=JobPriority.MANUAL.value,
+            payload={
+                "snapshot_path": str(snap_4h),
+                "adapter_store_dir": str(adapter_store_dir),
+                "smoke_test": False,
+                "train_spec": {
+                    "timeframe": "4h",
+                    "context_len": 256,
+                    "horizon": 6,
+                    "feature_set": "B",
+                    "max_epochs": 1,
+                    "batch_size": 2,
+                    "gradient_accumulation_steps": 1,
+                    "max_samples_per_epoch": 2,
+                    "history_days": 180,
+                },
+            },
+        )
+    )
+    worker_train = GPUWorker(job_id=job_id_train, db_path=temp_db_path)
+    assert worker_train.run() == 0
+    trained_adapter_path = storage.get_job(job_id_train).result["adapter_path"]
+
+    # 3. LoRA candidate model backtest passing base_reference_metrics
+    job_id_lora = "job_backtest_lora_p4"
+    storage.submit_job(
+        JobSpec(
+            job_id=job_id_lora,
+            job_type=JobType.BACKTEST.value,
+            timeframe="4h",
+            priority=JobPriority.MANUAL.value,
+            payload={
+                "snapshot_path": str(snap_4h),
+                "model_type": "lora",
+                "adapter_path": trained_adapter_path,
+                "feature_set": "B",
+                "context_len": 256,
+                "batch_size": 32,
+                "base_reference_metrics": res_base,
+            },
+        )
+    )
+    worker_lora = GPUWorker(job_id=job_id_lora, db_path=temp_db_path)
+    exit_code_lora = worker_lora.run()
+    assert exit_code_lora == 0
+
+    job_lora = storage.get_job(job_id_lora)
+    assert job_lora is not None
+    assert job_lora.status == JobStatus.SUCCEEDED.value
+    res_lora = job_lora.result
+    assert res_lora["timeframe"] == "4h"
+    assert res_lora["model_name"] == "TimesFM3-LoRA"
+    assert "score" in res_lora
+    assert isinstance(res_lora["score"], (int, float))
+    assert len(res_lora["fold_metrics"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# 30. Review Round 3: Preservation of Full TrainSpec and history_days='all'
+# ---------------------------------------------------------------------------
+
+
+def test_train_spec_full_hyperparameters_and_history_all(temp_db_path: Path, tmp_path: Path):
+    """Verifies that custom TrainSpec hyperparameters and history_days='all' pass intact to the trainer and manifest."""
+    from paxg_lab.model.store import AdapterStore
+    from paxg_lab.queue.worker import GPUWorker
+
+    storage = GPUJobStorage(temp_db_path)
+    snap_4h_candidates = list(Path("var/paxg_lab/snapshots").glob("paxgusdt_4h_*"))
+    if not snap_4h_candidates:
+        pytest.skip("4h snapshot not found in var/paxg_lab/snapshots/")
+    snap_4h = snap_4h_candidates[0]
+
+    adapter_store_dir = tmp_path / "adapters_custom_spec"
+    job_id = "train_custom_spec_all"
+    storage.submit_job(
+        JobSpec(
+            job_id=job_id,
+            job_type=JobType.TRAIN.value,
+            timeframe="4h",
+            priority=JobPriority.MANUAL.value,
+            payload={
+                "snapshot_path": str(snap_4h),
+                "adapter_store_dir": str(adapter_store_dir),
+                "smoke_test": False,
+                "train_spec": {
+                    "timeframe": "4h",
+                    "horizon": 6,
+                    "feature_set": "B",
+                    "context_len": 256,
+                    "lora_r": 4,
+                    "lora_alpha": 8,
+                    "lora_dropout": 0.15,
+                    "learning_rate": 1e-4,
+                    "max_epochs": 1,
+                    "batch_size": 2,
+                    "gradient_accumulation_steps": 2,
+                    "weight_decay": 0.05,
+                    "early_stopping_patience": 3,
+                    "grad_clip_norm": 1.5,
+                    "history_days": "all",
+                    "max_samples_per_epoch": 2,
+                    "warmup_ratio": 0.05,
+                    "seed": 123,
+                },
+            },
+        )
+    )
+
+    worker = GPUWorker(job_id=job_id, db_path=temp_db_path)
+    exit_code = worker.run()
+    assert exit_code == 0
+
+    job = storage.get_job(job_id)
+    assert job is not None
+    assert job.status == JobStatus.SUCCEEDED.value
+
+    adapter_path = Path(job.result["adapter_path"])
+    from paxg_lab.model.manifest import AdapterManifest
+    manifest = AdapterManifest.load_json(adapter_path / "paxg_manifest.json")
+
+    # Verify custom hyperparameters were fully preserved
+    cfg = manifest.train_spec
+    assert cfg["weight_decay"] == 0.05
+    assert cfg["early_stopping_patience"] == 3
+    assert cfg["grad_clip_norm"] == 1.5
+    assert cfg["warmup_ratio"] == 0.05
+    assert cfg["history_days"] == "all"
+    assert cfg["learning_rate"] == 1e-4
+    assert cfg["lora_dropout"] == 0.15
+    assert cfg["seed"] == 123
+
+
+# ---------------------------------------------------------------------------
+# 31. Review Round 3: Spawn Failure Safety (Child Termination & Unkillable Queue Block)
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_failure_kills_child_and_blocks_if_unkillable(temp_db_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Verifies that if worker startup fails after Popen(), the child is killed without leaving an orphan.
+
+    If the child cannot be killed, the scheduler enters an error state and halts dispatches.
+    """
+    scheduler = GPUScheduler(db_path=temp_db_path, acquire_coordinator_lock=False)
+
+    # 1. Successful child kill on startup exception
+    job_id_fail = "job_post_spawn_fail"
+    job_id_next = "job_after_spawn_fail"
+    scheduler.storage.submit_job(
+        JobSpec(job_id=job_id_fail, job_type=JobType.DUMMY.value, priority=JobPriority.MANUAL.value)
+    )
+    scheduler.storage.submit_job(
+        JobSpec(job_id=job_id_next, job_type=JobType.DUMMY.value, priority=JobPriority.MANUAL.value, payload={"steps": 1, "step_sleep": 0.05})
+    )
+
+    # Monkeypatch register_worker to simulate a database failure after Popen succeeded
+    orig_register = scheduler.storage.register_worker
+
+    def fail_register(job_id, pid, create_time):
+        raise RuntimeError("Simulated database failure during register_worker after Popen")
+
+    monkeypatch.setattr(scheduler.storage, "register_worker", fail_register)
+
+    # Tick scheduler: Popen runs, register_worker fails -> child must be cleanly terminated
+    scheduler.tick()
+
+    job_fail = scheduler.storage.get_job(job_id_fail)
+    assert job_fail is not None
+    assert job_fail.status == JobStatus.FAILED.value
+    assert "Failed to spawn worker subprocess" in (job_fail.error_message or "")
+    assert scheduler.active_worker is None
+    assert scheduler.active_job_id is None
+    assert scheduler.active_worker_pid is None
+    assert scheduler.scheduler_error is None
+
+    # Restore register_worker: next job can be dispatched cleanly
+    monkeypatch.setattr(scheduler.storage, "register_worker", orig_register)
+    scheduler.tick()
+    assert scheduler.active_job_id == job_id_next
+    scheduler.stop()
+
+    # 2. Unkillable child process blocks scheduler
+    scheduler_b = GPUScheduler(db_path=temp_db_path, acquire_coordinator_lock=False)
+    job_id_unkillable = "job_unkillable_spawn"
+    scheduler_b.storage.submit_job(
+        JobSpec(job_id=job_id_unkillable, job_type=JobType.DUMMY.value, priority=JobPriority.MANUAL.value)
+    )
+
+    # Monkeypatch register_worker to fail AND safe_terminate_process to fail
+    monkeypatch.setattr(scheduler_b.storage, "register_worker", fail_register)
+    monkeypatch.setattr("paxg_lab.queue.scheduler.safe_terminate_process", lambda pid, ctime=None, timeout=5.0: False)
+    monkeypatch.setattr("paxg_lab.queue.scheduler.is_process_alive", lambda pid, ctime=None: True)
+
+    scheduler_b.tick()
+
+    assert scheduler_b.scheduler_error is not None
+    assert "could not be terminated" in scheduler_b.scheduler_error
+    assert scheduler_b.active_worker_pid is not None
+
+    # Verify subsequent tick refuses to dispatch any jobs
+    job_id_blocked = "job_blocked_by_error"
+    scheduler_b.storage.submit_job(
+        JobSpec(job_id=job_id_blocked, job_type=JobType.DUMMY.value, priority=JobPriority.MANUAL.value)
+    )
+    scheduler_b.tick()
+    assert scheduler_b.storage.get_job(job_id_blocked).status == JobStatus.QUEUED.value
+
+
+# ---------------------------------------------------------------------------
+# 32. Review Round 3: OOM Retry Boundary Handling (batch_size=1 and accum=16)
+# ---------------------------------------------------------------------------
+
+
+def test_oom_retry_boundaries_batch_1_and_accum_16(temp_db_path: Path):
+    """Verifies OOM retry boundaries: batch=1 transitions to PAUSED_ERROR, and accum is clamped to 16."""
+    from paxg_lab.model.train_spec import TrainSpec
+
+    scheduler = GPUScheduler(db_path=temp_db_path, acquire_coordinator_lock=False)
+
+    # 1. Boundary A: batch_size = 1 cannot be reduced further -> PAUSED_ERROR
+    job_id_b1 = "oom_batch_1_job"
+    scheduler.storage.submit_job(
+        JobSpec(
+            job_id=job_id_b1,
+            job_type=JobType.DUMMY.value,
+            timeframe="1h",
+            priority=JobPriority.AUTO.value,
+            payload={
+                "train_spec": {
+                    "batch_size": 1,
+                    "gradient_accumulation_steps": 8,
+                    "timeframe": "1h",
+                },
+            },
+        )
+    )
+    job_b1 = scheduler.storage.acquire_next_job()
+    assert job_b1 is not None
+    scheduler.storage.mark_failed(job_id_b1, "[CUDA_OOM] CUDA out of memory. Tried to allocate 2.00 GiB")
+
+    failed_b1 = scheduler.storage.get_job(job_id_b1)
+    retry_id_b1 = scheduler._handle_oom_retry_if_needed(failed_b1)
+    assert retry_id_b1 is None
+    assert scheduler.storage.get_auto_run_state("1h") == AutoRunState.PAUSED_ERROR
+
+    # 2. Boundary B: gradient_accumulation_steps = 16 clamped to 16, producing valid TrainSpec
+    scheduler.storage.set_auto_run_state("4h", AutoRunState.SEARCHING)
+    job_id_a16 = "oom_accum_16_job"
+    scheduler.storage.submit_job(
+        JobSpec(
+            job_id=job_id_a16,
+            job_type=JobType.DUMMY.value,
+            timeframe="4h",
+            priority=JobPriority.AUTO.value,
+            payload={
+                "train_spec": {
+                    "batch_size": 2,
+                    "gradient_accumulation_steps": 16,
+                    "timeframe": "4h",
+                },
+            },
+        )
+    )
+    job_a16 = scheduler.storage.acquire_next_job()
+    assert job_a16 is not None
+    scheduler.storage.mark_failed(job_id_a16, "[CUDA_OOM] CUDA out of memory. Tried to allocate 2.00 GiB")
+
+    failed_a16 = scheduler.storage.get_job(job_id_a16)
+    retry_id_a16 = scheduler._handle_oom_retry_if_needed(failed_a16)
+    assert retry_id_a16 is not None
+
+    retry_job = scheduler.storage.get_job(retry_id_a16)
+    assert retry_job is not None
+    retry_spec_d = retry_job.payload["train_spec"]
+    assert retry_spec_d["batch_size"] == 1
+    assert retry_spec_d["gradient_accumulation_steps"] == 16  # Clamped, not 32!
+
+    # Verify that TrainSpec validates successfully without raising ValueError
+    validated_spec = TrainSpec.from_dict(retry_spec_d)
+    assert validated_spec.batch_size == 1
+    assert validated_spec.gradient_accumulation_steps == 16
+

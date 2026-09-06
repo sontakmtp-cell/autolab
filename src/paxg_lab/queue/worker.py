@@ -282,23 +282,19 @@ class GPUWorker:
         from timesfm3 import TimesFM3Torch
 
         payload = job.payload
-        spec_dict = payload.get("train_spec", {})
-        spec = TrainSpec(
-            timeframe=spec_dict.get("timeframe", job.timeframe or "1h"),
-            context_len=int(spec_dict.get("context_len", 256)),
-            horizon=spec_dict.get("horizon"),
-            feature_set=spec_dict.get("feature_set", "B"),
-            lora_r=int(spec_dict.get("lora_r", 4)),
-            lora_alpha=spec_dict.get("lora_alpha"),
-            lora_dropout=float(spec_dict.get("lora_dropout", 0.10)),
-            learning_rate=float(spec_dict.get("learning_rate", 5e-5)),
-            max_epochs=int(spec_dict.get("max_epochs", 2)),
-            batch_size=int(spec_dict.get("batch_size", 2)),
-            gradient_accumulation_steps=int(spec_dict.get("gradient_accumulation_steps", 8)),
-            history_days=int(spec_dict["history_days"]) if "history_days" in spec_dict else 365,
-            max_samples_per_epoch=int(spec_dict["max_samples_per_epoch"]) if "max_samples_per_epoch" in spec_dict else 1024,
-            seed=int(spec_dict.get("seed", 42)),
-        )
+        raw_spec = payload.get("train_spec")
+        if raw_spec is None:
+            raw_spec = {k: v for k, v in payload.items() if k in TrainSpec.__dataclass_fields__}
+
+        if isinstance(raw_spec, TrainSpec):
+            spec = raw_spec
+        elif isinstance(raw_spec, dict):
+            spec_dict = dict(raw_spec)
+            if "timeframe" not in spec_dict and job.timeframe:
+                spec_dict["timeframe"] = job.timeframe
+            spec = TrainSpec.from_dict(spec_dict)
+        else:
+            raise TypeError(f"Invalid train_spec type in payload: {type(raw_spec)}")
 
         snapshot_path = payload.get("snapshot_path")
         if snapshot_path and Path(snapshot_path).exists():
@@ -357,7 +353,7 @@ class GPUWorker:
         from paxg_lab.data.snapshot import DatasetSnapshot
         from paxg_lab.eval.engine import BacktestEngine
         from paxg_lab.eval.predictor import TimesFM3Predictor
-        from paxg_lab.eval.types import BacktestSpec
+        from paxg_lab.eval.types import FoldMetrics, ScoreReport
 
         payload = job.payload
         timeframe = payload.get("timeframe", job.timeframe or "1h")
@@ -366,19 +362,41 @@ class GPUWorker:
             raise FileNotFoundError(f"Snapshot path required for backtest, got '{snapshot_path}'")
 
         snapshot = DatasetSnapshot.load(snapshot_path)
-        spec = BacktestSpec(
-            timeframe=timeframe,
-            model_type=payload.get("model_type", "base"),
-            adapter_path=payload.get("adapter_path"),
-            context_len=int(payload.get("context_len", 256)),
-            feature_set=payload.get("feature_set", "A"),
-        )
+        adapter_path = payload.get("adapter_path")
+        model_type = payload.get("model_type", "lora" if adapter_path else "base")
+        feature_set = payload.get("feature_set", "B" if adapter_path else "A")
+        context_len = int(payload.get("context_len", 256))
+        batch_size = int(payload.get("batch_size", 16))
+        include_locked_test = bool(payload.get("include_locked_test", False))
+        model_name = payload.get("model_name", "TimesFM3-LoRA" if adapter_path else "TimesFM3-Base")
 
-        predictor = TimesFM3Predictor()
-        if spec.adapter_path:
-            predictor.load_adapter(spec.adapter_path)
+        # Determine whether this is base reference or candidate
+        is_base_reference = bool(payload.get("is_base_reference", model_type == "base" and not adapter_path))
 
-        engine = BacktestEngine(predictor=predictor)
+        base_ref_data = payload.get("base_reference_metrics")
+        base_reference_metrics: ScoreReport | dict[int | str, FoldMetrics] | None = None
+        if base_ref_data is not None:
+            if isinstance(base_ref_data, ScoreReport):
+                base_reference_metrics = base_ref_data
+            elif isinstance(base_ref_data, dict):
+                if "fold_metrics" in base_ref_data:
+                    fold_metrics = [
+                        FoldMetrics(**m) if isinstance(m, dict) else m
+                        for m in base_ref_data["fold_metrics"]
+                    ]
+                    test_m = base_ref_data.get("test_metrics")
+                    if test_m and isinstance(test_m, dict):
+                        test_m = FoldMetrics(**test_m)
+                    base_reference_metrics = ScoreReport(
+                        **{k: v for k, v in base_ref_data.items() if k not in ("fold_metrics", "test_metrics")},
+                        fold_metrics=fold_metrics,
+                        test_metrics=test_m,
+                    )
+                else:
+                    base_reference_metrics = {
+                        k: FoldMetrics(**v) if isinstance(v, dict) else v
+                        for k, v in base_ref_data.items()
+                    }
 
         def progress_cb(info: dict[str, Any]) -> bool:
             if "batch_idx" in info and "total_batches" in info:
@@ -387,8 +405,38 @@ class GPUWorker:
                 self.progress_message = info["message"]
             return not self.stop_event.is_set()
 
+        # If candidate run lacks base reference metrics, compute base reference first using clean base predictor
+        if not is_base_reference and base_reference_metrics is None:
+            logger.info("Computing base reference baseline on snapshot for candidate backtest...")
+            base_predictor = TimesFM3Predictor()
+            base_engine = BacktestEngine(predictor=base_predictor)
+            base_report = base_engine.run_full_backtest(
+                snapshot=snapshot,
+                feature_set="A",
+                context_len=256,
+                batch_size=batch_size,
+                model_name="TimesFM3-Base",
+                is_base_reference=True,
+                include_locked_test=include_locked_test,
+                progress_callback=progress_cb,
+            )
+            base_reference_metrics = base_report
+
+        predictor = TimesFM3Predictor(adapter_path=adapter_path)
+        engine = BacktestEngine(predictor=predictor)
+
         try:
-            report = engine.run_full_backtest(snapshot, spec, progress_callback=progress_cb)
+            report = engine.run_full_backtest(
+                snapshot=snapshot,
+                feature_set=feature_set,
+                context_len=context_len,
+                batch_size=batch_size,
+                model_name=model_name,
+                is_base_reference=is_base_reference,
+                base_reference_metrics=base_reference_metrics,
+                include_locked_test=include_locked_test,
+                progress_callback=progress_cb,
+            )
             return report.to_dict()
         except InterruptedError:
             logger.info("Backtest job interrupted by stop event.")
