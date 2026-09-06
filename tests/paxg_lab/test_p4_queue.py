@@ -1448,16 +1448,54 @@ def test_coordinator_lease_takeover_prevents_stale_renewal(temp_db_path: Path):
 # ---------------------------------------------------------------------------
 
 
+def get_or_create_test_snapshot(tmp_path: Path, timeframe: str = "4h") -> Path:
+    """Returns an existing snapshot or synthesizes a cryptographically valid snapshot for CI."""
+    candidates = list(Path("var/paxg_lab/snapshots").glob(f"paxgusdt_{timeframe}_*"))
+    if candidates:
+        return candidates[0]
+
+    import numpy as np
+    import pandas as pd
+    from paxg_lab.data.features import build_features
+    from paxg_lab.data.snapshot import DatasetSnapshot
+
+    n_rows = 600
+    base_ts = 1700000000
+    step_sec = 14400 if timeframe == "4h" else 3600
+    timestamps = [base_ts + i * step_sec for i in range(n_rows)]
+    rng = np.random.default_rng(42)
+    prices = 2000.0 + np.cumsum(rng.normal(0, 2, n_rows))
+    df = pd.DataFrame({
+        "open_time": timestamps,
+        "open": prices,
+        "high": prices + 2.0,
+        "low": prices - 2.0,
+        "close": prices,
+        "volume": rng.uniform(10, 100, n_rows),
+        "close_time": [t + step_sec - 1 for t in timestamps],
+        "quote_volume": rng.uniform(20000, 200000, n_rows),
+        "count": rng.integers(50, 500, n_rows),
+        "taker_buy_volume": rng.uniform(5, 50, n_rows),
+        "taker_buy_quote_volume": rng.uniform(10000, 100000, n_rows),
+    })
+    feat_a, _, _ = build_features(df, feature_set="A")
+    feat_b, _, _ = build_features(df, feature_set="B")
+    snap = DatasetSnapshot.create(
+        timeframe=timeframe,
+        timestamps=df["open_time"].to_numpy(),
+        features_a=feat_a,
+        features_b=feat_b,
+    )
+    snap_dir = tmp_path / "ci_snapshots"
+    return snap.save(base_dir=snap_dir)
+
+
 def test_backtest_job_e2e_base_and_lora(temp_db_path: Path, tmp_path: Path):
     """Verifies that BACKTEST jobs execute cleanly via GPUWorker for both Base and LoRA models."""
     from paxg_lab.queue.worker import GPUWorker
 
     storage = GPUJobStorage(temp_db_path)
-
-    snap_4h_candidates = list(Path("var/paxg_lab/snapshots").glob("paxgusdt_4h_*"))
-    if not snap_4h_candidates:
-        pytest.skip("4h snapshot not found in var/paxg_lab/snapshots/")
-    snap_4h = snap_4h_candidates[0]
+    snap_4h = get_or_create_test_snapshot(tmp_path, timeframe="4h")
 
     # 1. Base model backtest (establishes base reference)
     job_id_base = "job_backtest_base_p4"
@@ -1568,10 +1606,7 @@ def test_train_spec_full_hyperparameters_and_history_all(temp_db_path: Path, tmp
     from paxg_lab.queue.worker import GPUWorker
 
     storage = GPUJobStorage(temp_db_path)
-    snap_4h_candidates = list(Path("var/paxg_lab/snapshots").glob("paxgusdt_4h_*"))
-    if not snap_4h_candidates:
-        pytest.skip("4h snapshot not found in var/paxg_lab/snapshots/")
-    snap_4h = snap_4h_candidates[0]
+    snap_4h = get_or_create_test_snapshot(tmp_path, timeframe="4h")
 
     adapter_store_dir = tmp_path / "adapters_custom_spec"
     job_id = "train_custom_spec_all"
@@ -1781,4 +1816,346 @@ def test_oom_retry_boundaries_batch_1_and_accum_16(temp_db_path: Path):
     validated_spec = TrainSpec.from_dict(retry_spec_d)
     assert validated_spec.batch_size == 1
     assert validated_spec.gradient_accumulation_steps == 16
+
+
+# ---------------------------------------------------------------------------
+# 11. Review Round 4: Durable Checkpoints, Safe Stop & Strict Verification Tests
+# ---------------------------------------------------------------------------
+
+
+def test_train_stop_preserves_durable_checkpoint_and_loadable_adapter(temp_db_path: Path, tmp_path: Path):
+    """Verifies that stopping a training job preserves a durable checkpoint and loadable adapter."""
+    from paxg_lab.queue.checkpoint import TrainingCheckpointManager
+    from paxg_lab.queue.worker import GPUWorker
+
+    storage = GPUJobStorage(temp_db_path)
+    snap_path = get_or_create_test_snapshot(tmp_path, timeframe="4h")
+    ckpt_dir = tmp_path / "checkpoints_stop_test"
+    adapter_dir = tmp_path / "adapters_stop_test"
+    job_id = "train_stop_preservation_job"
+
+    storage.submit_job(
+        JobSpec(
+            job_id=job_id,
+            job_type=JobType.TRAIN.value,
+            timeframe="4h",
+            priority=JobPriority.MANUAL.value,
+            payload={
+                "snapshot_path": str(snap_path),
+                "checkpoint_dir": str(ckpt_dir),
+                "adapter_store_dir": str(adapter_dir),
+                "train_spec": {
+                    "timeframe": "4h",
+                    "horizon": 6,
+                    "max_epochs": 3,
+                    "batch_size": 2,
+                    "gradient_accumulation_steps": 2,
+                    "max_samples_per_epoch": 8,
+                },
+            },
+        )
+    )
+
+    worker = GPUWorker(job_id=job_id, db_path=temp_db_path)
+
+    # Set stop event during progress callback
+    orig_dispatch = worker._dispatch
+
+    def stopping_dispatch(job):
+        worker.stop_event.set()
+        return orig_dispatch(job)
+
+    worker._dispatch = stopping_dispatch
+    exit_code = worker.run()
+    assert exit_code == 0
+
+    # Verify job status in storage is CANCELLED
+    finished_job = storage.get_job(job_id)
+    assert finished_job is not None
+    assert finished_job.status == JobStatus.CANCELLED.value
+
+    # Verify durable checkpoint was saved and can be loaded
+    ckpt_mgr = TrainingCheckpointManager(ckpt_dir)
+    ckpt = ckpt_mgr.load_checkpoint(job_id)
+    assert ckpt is not None
+    assert ckpt.epoch >= 1
+    assert ckpt.metadata["status"] in ("STOPPED", "IN_PROGRESS")
+    assert ckpt.weights_path.exists()
+    assert ckpt.manifest_path.exists()
+
+    # Verify loadable adapter was also persisted to adapter store
+    adapter_subdirs = list(adapter_dir.glob("paxg_*"))
+    assert len(adapter_subdirs) >= 1
+    saved_adapter_manifest = adapter_subdirs[0] / "paxg_manifest.json"
+    assert saved_adapter_manifest.exists()
+
+
+def test_scheduler_and_trainer_reconcile_durable_checkpoint_on_restart(temp_db_path: Path, tmp_path: Path):
+    """Verifies that scheduler reconciles durable checkpoints on restart and trainer resumes from reconciled epoch."""
+    from paxg_lab.constants import MODEL_REPO, MODEL_REVISION
+    from paxg_lab.data.features import FEATURE_SPECS
+    from paxg_lab.data.snapshot import DatasetSnapshot
+    from paxg_lab.model.manifest import AdapterManifest
+    from paxg_lab.model.train_spec import TrainSpec
+    from paxg_lab.model.trainer import LoRATrainer
+    from paxg_lab.queue.checkpoint import TrainingCheckpointManager
+    from timesfm3 import TimesFM3Torch
+
+    storage = GPUJobStorage(temp_db_path)
+    ckpt_dir = tmp_path / "checkpoints_reconcile_test"
+    ckpt_mgr = TrainingCheckpointManager(ckpt_dir)
+    job_id = "interrupted_reconcile_job"
+
+    # Create dummy base model and attach lora to build initial checkpoint
+    base_model = TimesFM3Torch.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
+    trainer = LoRATrainer(base_model=base_model, spec=TrainSpec(timeframe="4h", horizon=6, max_epochs=3, max_samples_per_epoch=8))
+    from paxg_lab.model.lora import build_lora_timesfm3
+
+    peft_model = build_lora_timesfm3(base_model, lora_r=4, lora_alpha=8)
+
+    f_spec = FEATURE_SPECS["B"]
+    manifest = AdapterManifest(
+        adapter_id=f"ckpt_{job_id}_1_4",
+        timeframe="4h",
+        horizon=6,
+        context_len=256,
+        feature_set="B",
+        feature_columns=list(f_spec.columns),
+        base_model_repo=MODEL_REPO,
+        base_model_revision=MODEL_REVISION,
+        train_spec=trainer.spec.to_dict(),
+        snapshot_hash="fakehash123",
+        best_epoch=1,
+        best_val_loss=0.042,
+    )
+    ckpt_mgr.save_checkpoint(
+        job_id=job_id,
+        peft_model=peft_model,
+        manifest=manifest,
+        epoch=1,
+        step=4,
+        best_val_loss=0.042,
+        status="IN_PROGRESS",
+    )
+
+    # Simulate crashed job in DB
+    dead_pid = 99999999
+    storage.submit_job(
+        JobSpec(
+            job_id=job_id,
+            job_type=JobType.TRAIN.value,
+            timeframe="4h",
+            priority=JobPriority.MANUAL.value,
+            payload={"checkpoint_dir": str(ckpt_dir)},
+        )
+    )
+    storage.acquire_next_job()
+    storage.register_worker(job_id, dead_pid, time.time() - 100)
+
+    # 1. Scheduler recovery on startup
+    import paxg_lab.queue.checkpoint
+
+    orig_dir = paxg_lab.queue.checkpoint.DEFAULT_CHECKPOINT_DIR
+    paxg_lab.queue.checkpoint.DEFAULT_CHECKPOINT_DIR = ckpt_dir
+    try:
+        scheduler = GPUScheduler(
+            db_path=temp_db_path,
+            acquire_coordinator_lock=False,
+        )
+        recovered = scheduler.recovered_on_startup
+    finally:
+        paxg_lab.queue.checkpoint.DEFAULT_CHECKPOINT_DIR = orig_dir
+
+    assert job_id in recovered
+    recovered_job = storage.get_job(job_id)
+    assert recovered_job.status == JobStatus.INTERRUPTED.value
+    assert "Reconciled durable checkpoint: epoch=1, step=4" in recovered_job.error_message
+
+    # 2. Resumed training starts from epoch 2 (start_epoch = ckpt.epoch + 1)
+    snap_path = get_or_create_test_snapshot(tmp_path, timeframe="4h")
+    snapshot = DatasetSnapshot.load(snap_path)
+    features_df = snapshot.to_dataframe("B")
+
+    epochs_trained = []
+
+    def progress_cb(info):
+        if "epoch" in info:
+            epochs_trained.append(info["epoch"])
+        return True
+
+    res = trainer.train(
+        features_df=features_df,
+        snapshot_hash=snapshot.metadata.sha256,
+        progress_callback=progress_cb,
+        checkpoint_manager=ckpt_mgr,
+        job_id=job_id,
+    )
+    # Verify epoch 1 was skipped / not rerun
+    assert 1 not in epochs_trained
+    assert all(e >= 2 for e in epochs_trained)
+
+
+def test_checkpoint_atomic_write_preserves_valid_checkpoint_on_crash(tmp_path: Path):
+    """Verifies that atomic write guarantees pre-existing valid checkpoint is unharmed if crash occurs during write."""
+    from paxg_lab.constants import MODEL_REPO, MODEL_REVISION
+    from paxg_lab.data.features import FEATURE_SPECS
+    from paxg_lab.model.lora import build_lora_timesfm3
+    from paxg_lab.model.manifest import AdapterManifest
+    from paxg_lab.queue.checkpoint import TrainingCheckpointManager
+    from timesfm3 import TimesFM3Torch
+
+    ckpt_dir = tmp_path / "checkpoints_atomic_test"
+    ckpt_mgr = TrainingCheckpointManager(ckpt_dir)
+    job_id = "atomic_crash_test_job"
+
+    base_model = TimesFM3Torch.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
+    peft_model = build_lora_timesfm3(base_model, lora_r=4, lora_alpha=8)
+    f_spec = FEATURE_SPECS["B"]
+
+    manifest1 = AdapterManifest(
+        adapter_id="ckpt_atomic_1",
+        timeframe="4h",
+        horizon=6,
+        context_len=256,
+        feature_set="B",
+        feature_columns=list(f_spec.columns),
+        base_model_repo=MODEL_REPO,
+        base_model_revision=MODEL_REVISION,
+        train_spec={"timeframe": "4h", "horizon": 6},
+        snapshot_hash="hash_v1",
+        best_epoch=1,
+        best_val_loss=0.050,
+    )
+
+    # 1. Save valid checkpoint 1
+    ckpt_mgr.save_checkpoint(
+        job_id=job_id,
+        peft_model=peft_model,
+        manifest=manifest1,
+        epoch=1,
+        step=5,
+        best_val_loss=0.050,
+    )
+    loaded1 = ckpt_mgr.load_checkpoint(job_id)
+    assert loaded1 is not None
+    assert loaded1.epoch == 1
+    assert loaded1.best_val_loss == 0.050
+
+    # 2. Simulate crash during checkpoint 2 write before atomic replace
+    manifest2 = AdapterManifest(
+        adapter_id="ckpt_atomic_2",
+        timeframe="4h",
+        horizon=6,
+        context_len=256,
+        feature_set="B",
+        feature_columns=list(f_spec.columns),
+        base_model_repo=MODEL_REPO,
+        base_model_revision=MODEL_REVISION,
+        train_spec={"timeframe": "4h", "horizon": 6},
+        snapshot_hash="hash_v2",
+        best_epoch=2,
+        best_val_loss=0.030,
+    )
+
+    with pytest.raises(RuntimeError, match="Simulated crash"):
+        ckpt_mgr.save_checkpoint(
+            job_id=job_id,
+            peft_model=peft_model,
+            manifest=manifest2,
+            epoch=2,
+            step=10,
+            best_val_loss=0.030,
+            simulate_crash_before_replace=True,
+        )
+
+    # 3. Verify checkpoint 1 remains completely intact and valid
+    loaded_after_crash = ckpt_mgr.load_checkpoint(job_id)
+    assert loaded_after_crash is not None
+    assert loaded_after_crash.epoch == 1
+    assert loaded_after_crash.global_step == 5
+    assert loaded_after_crash.best_val_loss == 0.050
+
+
+def test_safe_terminate_refuses_when_create_time_none():
+    """Verifies that safe_terminate_process strictly refuses termination when expected_create_time is None (fail closed)."""
+    current_pid = os.getpid()
+    # Should refuse to terminate even for valid PID because expected_create_time is None
+    result = safe_terminate_process(current_pid, expected_create_time=None)
+    assert result is False
+
+
+def test_spawn_worker_retries_and_terminates_if_create_time_fails(temp_db_path: Path, tmp_path: Path, monkeypatch):
+    """Verifies that failure to obtain create_time after spawn retries 5x, terminates child, and rejects startup."""
+    scheduler = GPUScheduler(db_path=temp_db_path, acquire_coordinator_lock=False)
+    storage = scheduler.storage
+
+    job_id = "test_create_time_fail_job"
+    job = JobSpec(
+        job_id=job_id,
+        job_type=JobType.DUMMY.value,
+        timeframe="1h",
+        priority=JobPriority.MANUAL.value,
+    )
+    storage.submit_job(job)
+    acquired = storage.acquire_next_job()
+    assert acquired is not None
+
+    # Mock psutil.Process.create_time to always raise an exception
+    attempt_count = [0]
+    orig_process = psutil.Process
+
+    class MockProcess(orig_process):
+        def create_time(self):
+            attempt_count[0] += 1
+            raise RuntimeError("Access denied reading process start time")
+
+    monkeypatch.setattr(psutil, "Process", MockProcess)
+
+    success = scheduler._spawn_worker(acquired)
+    assert success is False
+    assert attempt_count[0] >= 5  # Retried up to 5 times
+
+    # Worker was not allowed to start up
+    assert scheduler.active_worker is None
+    job_status = storage.get_job(job_id).status
+    assert job_status == JobStatus.FAILED.value
+
+
+def test_access_denied_process_state_prevents_unsafe_worker_dispatch(temp_db_path: Path, monkeypatch):
+    """Verifies that AccessDenied on process inspection is treated as ALIVE and prevents unsafe second worker dispatch."""
+    # 1. is_process_alive returns True on AccessDenied (fail-safe)
+    orig_process = psutil.Process
+
+    def mock_process_access_denied(pid):
+        if pid == 12345:
+            raise psutil.AccessDenied()
+        return orig_process(pid)
+
+    monkeypatch.setattr(psutil, "Process", mock_process_access_denied)
+    assert is_process_alive(12345, 1000.0) is True
+
+    # 2. Scheduler tick does not conclude worker is dead and does not dispatch a second worker
+    scheduler = GPUScheduler(db_path=temp_db_path, acquire_coordinator_lock=False)
+    storage = scheduler.storage
+
+    job1 = JobSpec(job_id="job_active", job_type=JobType.DUMMY.value, timeframe="1h", priority=JobPriority.MANUAL.value)
+    job2 = JobSpec(job_id="job_queued", job_type=JobType.DUMMY.value, timeframe="1h", priority=JobPriority.MANUAL.value)
+    storage.submit_job(job1)
+    storage.submit_job(job2)
+
+    # Set active worker in scheduler
+    scheduler.active_job_id = "job_active"
+    scheduler.active_worker_pid = 12345
+    scheduler.active_worker_create_time = 1000.0
+    storage.acquire_next_job()
+    storage.register_worker("job_active", 12345, 1000.0)
+
+    # Tick: is_process_alive returns True (AccessDenied treated as ALIVE)
+    scheduler.tick()
+
+    # Worker should still be active, job2 should NOT be dispatched
+    assert scheduler.active_job_id == "job_active"
+    queued = storage.get_job("job_queued")
+    assert queued.status == JobStatus.QUEUED.value
+
 

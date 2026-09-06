@@ -43,8 +43,16 @@ def is_process_alive(pid: int | None, expected_create_time: float | None = None)
                 return False
 
         return True
-    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
         return False
+    except psutil.AccessDenied:
+        # Fail-closed/safe: cannot inspect process permissions, so treat as ALIVE
+        # to prevent scheduler from prematurely concluding worker is dead and dispatching a 2nd GPU worker.
+        logger.warning("Access denied inspecting process PID %d. Treating as ALIVE for GPU safety.", pid)
+        return True
+    except Exception as exc:
+        logger.warning("Unexpected error inspecting process PID %d: %s. Treating as ALIVE for GPU safety.", pid, exc)
+        return True
 
 
 def safe_terminate_process(
@@ -54,17 +62,28 @@ def safe_terminate_process(
 ) -> bool:
     """Safely terminates a process after strictly verifying PID and creation time.
     
+    FAIL-CLOSED: If expected_create_time is None, termination is strictly REFUSED.
+
     Args:
         pid: The process ID to terminate.
-        expected_create_time: Recorded creation time of the process.
+        expected_create_time: Recorded creation time of the process (required).
         timeout: Maximum seconds to wait after terminate() before issuing kill().
         
     Returns:
         True if process was successfully terminated or was already dead.
-        False if PID verification failed (e.g. recycled PID).
+        False if PID verification failed (e.g. recycled PID or missing expected_create_time).
     """
     if pid is None or pid <= 0:
         return True
+
+    # Fail closed: expected_create_time is strictly required
+    if expected_create_time is None:
+        logger.error(
+            "REFUSING TO TERMINATE PID %d: expected_create_time is None (fail-closed policy). "
+            "P4 requires strict verification of both PID and creation time.",
+            pid,
+        )
+        return False
 
     try:
         proc = psutil.Process(pid)
@@ -75,20 +94,22 @@ def safe_terminate_process(
         return False
 
     # Strict creation time verification
-    if expected_create_time is not None:
-        try:
-            actual_time = proc.create_time()
-            if abs(actual_time - expected_create_time) > 2.0:
-                logger.error(
-                    "REFUSING TO TERMINATE PID %d: create_time mismatch! "
-                    "Expected %.2f, actual %.2f. This PID belongs to an unrelated recycled process.",
-                    pid,
-                    expected_create_time,
-                    actual_time,
-                )
-                return False
-        except (psutil.NoSuchProcess, psutil.ZombieProcess):
-            return True
+    try:
+        actual_time = proc.create_time()
+        if abs(actual_time - expected_create_time) > 2.0:
+            logger.error(
+                "REFUSING TO TERMINATE PID %d: create_time mismatch! "
+                "Expected %.2f, actual %.2f. This PID belongs to an unrelated recycled process.",
+                pid,
+                expected_create_time,
+                actual_time,
+            )
+            return False
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return True
+    except psutil.AccessDenied:
+        logger.error("Access denied inspecting create_time for PID %d", pid)
+        return False
 
     logger.info("Terminating worker process PID %d (grace timeout=%.1fs)...", pid, timeout)
 

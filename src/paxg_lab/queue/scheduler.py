@@ -117,6 +117,26 @@ class GPUScheduler:
 
             # If worker is not alive (or belongs to recycled process)
             if not is_process_alive(pid, ctime):
+                from paxg_lab.queue.checkpoint import TrainingCheckpointManager
+
+                ckpt_dir = running_job.payload.get("checkpoint_dir") if running_job.payload else None
+                ckpt_mgr = TrainingCheckpointManager(ckpt_dir) if ckpt_dir else TrainingCheckpointManager()
+                ckpt = ckpt_mgr.load_checkpoint(running_job.job_id)
+
+                reconcile_msg = "Recovered on application restart: worker process died during previous session."
+                if ckpt is not None:
+                    reconcile_msg += (
+                        f" Reconciled durable checkpoint: epoch={ckpt.epoch}, step={ckpt.global_step}, "
+                        f"best_val_loss={ckpt.best_val_loss:.6f}. Checkpoint is intact and ready for resumption."
+                    )
+                    logger.info(
+                        "Crash Recovery: Reconciled durable checkpoint for job '%s' (epoch %d, step %d, best_val_loss=%.6f)",
+                        running_job.job_id,
+                        ckpt.epoch,
+                        ckpt.global_step,
+                        ckpt.best_val_loss,
+                    )
+
                 logger.warning(
                     "Crash Recovery: Job '%s' was RUNNING but worker PID %s is dead. Marking INTERRUPTED.",
                     running_job.job_id,
@@ -124,7 +144,7 @@ class GPUScheduler:
                 )
                 self.storage.mark_interrupted(
                     running_job.job_id,
-                    "Recovered on application restart: worker process died during previous session.",
+                    reconcile_msg,
                 )
                 recovered_ids.append(running_job.job_id)
             else:
@@ -312,10 +332,23 @@ class GPUScheduler:
                 stderr=subprocess.STDOUT,
             )
             spawned_pid = proc.pid
-            try:
-                spawned_create_time = psutil.Process(proc.pid).create_time()
-            except Exception:
-                spawned_create_time = None
+            # Retry acquiring create_time up to 5 times (0.05s interval) to prevent startup race
+            for _ in range(5):
+                try:
+                    p = psutil.Process(proc.pid)
+                    if p.is_running():
+                        spawned_create_time = p.create_time()
+                        if spawned_create_time is not None:
+                            break
+                except Exception:
+                    pass
+                time.sleep(0.05)
+
+            if spawned_create_time is None:
+                raise RuntimeError(
+                    f"Failed to acquire create_time for worker process PID {spawned_pid} after 5 attempts. "
+                    "Cannot verify process creation identity; rejecting worker startup per P4 safety contract."
+                )
 
             # Register PID and create_time in storage
             self.storage.register_worker(job.job_id, proc.pid, spawned_create_time)
@@ -330,8 +363,19 @@ class GPUScheduler:
             if proc is not None and spawned_pid is not None:
                 # Subprocess was already created by Popen! Safely terminate child to prevent orphan GPU process
                 logger.warning("Terminating newly spawned child process PID %s after post-spawn failure...", spawned_pid)
-                term_ok = safe_terminate_process(spawned_pid, spawned_create_time, timeout=5.0)
-                if not term_ok or is_process_alive(spawned_pid, spawned_create_time):
+                try:
+                    proc.kill()
+                    proc.wait(timeout=3.0)
+                except Exception:
+                    pass
+
+                if spawned_create_time is not None:
+                    safe_terminate_process(spawned_pid, spawned_create_time, timeout=2.0)
+
+                # Strictly verify whether child is still alive
+                still_alive = is_process_alive(spawned_pid, spawned_create_time)
+
+                if still_alive:
                     # Child cannot be killed! Block queue to preserve single GPU process invariant
                     logger.critical(
                         "CRITICAL: Failed to kill newly spawned child process PID %s after startup exception! "

@@ -44,6 +44,7 @@ class TrainingResult:
     train_spec: TrainSpec
     training_range: dict[str, Any]
     total_training_time_sec: float
+    total_steps: int = 0
 
 
 class LoRATrainer:
@@ -227,6 +228,8 @@ class LoRATrainer:
         fold_id: int = 1,
         adapter_id: str | None = None,
         progress_callback: Any | None = None,
+        checkpoint_manager: Any | None = None,
+        job_id: str | None = None,
     ) -> TrainingResult:
         """Runs the complete training loop, early stopping, and best checkpoint restoration."""
         start_wall_time = time.time()
@@ -290,12 +293,41 @@ class LoRATrainer:
         history: list[dict[str, Any]] = []
         global_step = 0
         final_train_loss = 0.0
+        start_epoch = 1
+
+        # Check for pre-existing durable checkpoint to reconcile / resume
+        if checkpoint_manager is not None and job_id is not None:
+            existing_ckpt = checkpoint_manager.load_checkpoint(job_id)
+            if existing_ckpt is not None:
+                logger.info(
+                    "Reconciling durable checkpoint for job '%s': resuming from epoch %d, step %d (best_val_loss=%.6f)",
+                    job_id,
+                    existing_ckpt.epoch,
+                    existing_ckpt.global_step,
+                    existing_ckpt.best_val_loss,
+                )
+                try:
+                    from safetensors.torch import load_file
+                    saved_weights = load_file(str(existing_ckpt.weights_path))
+                except Exception:
+                    saved_weights = torch.load(str(existing_ckpt.weights_path), map_location=self.device)
+
+                peft_model.load_state_dict(saved_weights, strict=False)
+                start_epoch = existing_ckpt.epoch + 1
+                global_step = existing_ckpt.global_step
+                best_val_loss = existing_ckpt.best_val_loss
+                best_epoch = existing_ckpt.epoch
+                best_lora_state = {
+                    k: v.cpu().clone()
+                    for k, v in peft_model.state_dict().items()
+                    if "lora" in k.lower()
+                }
 
         rng = np.random.default_rng(self.spec.seed)
 
         logger.info(
             "Starting LoRA training: max_epochs=%d, batch_size=%d, grad_accum=%d (effective=%d), "
-            "minibatches_per_epoch=%d, total_optimizer_steps=%d, warmup_optimizer_steps=%d",
+            "minibatches_per_epoch=%d, total_optimizer_steps=%d, warmup_optimizer_steps=%d, start_epoch=%d",
             self.spec.max_epochs,
             self.spec.batch_size,
             self.spec.gradient_accumulation_steps,
@@ -303,10 +335,11 @@ class LoRATrainer:
             minibatches_per_epoch,
             total_optimizer_steps,
             warmup_optimizer_steps,
+            start_epoch,
         )
 
         stop_requested = False
-        for epoch in range(1, self.spec.max_epochs + 1):
+        for epoch in range(start_epoch, self.spec.max_epochs + 1):
             epoch_start = time.time()
             peft_model.train()
 
@@ -389,6 +422,34 @@ class LoRATrainer:
                         for k, v in peft_model.state_dict().items()
                         if "lora" in k.lower()
                     }
+                if checkpoint_manager is not None and job_id is not None:
+                    try:
+                        f_spec = FEATURE_SPECS[self.spec.feature_set]
+                        ckpt_manifest = AdapterManifest(
+                            adapter_id=f"ckpt_{job_id}_{epoch}_{global_step}",
+                            timeframe=self.spec.timeframe,
+                            horizon=self.spec.horizon,
+                            context_len=self.spec.context_len,
+                            feature_set=self.spec.feature_set,
+                            feature_columns=list(f_spec.columns),
+                            base_model_repo=MODEL_REPO,
+                            base_model_revision=MODEL_REVISION,
+                            train_spec=self.spec.to_dict(),
+                            snapshot_hash=snapshot_hash,
+                            best_epoch=best_epoch,
+                            best_val_loss=best_val_loss,
+                        )
+                        checkpoint_manager.save_checkpoint(
+                            job_id=job_id,
+                            peft_model=peft_model,
+                            manifest=ckpt_manifest,
+                            epoch=epoch,
+                            step=global_step,
+                            best_val_loss=best_val_loss,
+                            status="STOPPED",
+                        )
+                    except Exception as ckpt_err:
+                        logger.warning("Failed to save stopped checkpoint: %s", ckpt_err)
                 break
 
             avg_train_loss = epoch_loss_sum / max(1, epoch_loss_batches)
@@ -461,13 +522,53 @@ class LoRATrainer:
                 )
                 if patience_counter >= self.spec.early_stopping_patience:
                     logger.info("Early stopping triggered at epoch %d.", epoch)
-                    break
+            if checkpoint_manager is not None and job_id is not None:
+                try:
+                    f_spec = FEATURE_SPECS[self.spec.feature_set]
+                    ckpt_manifest = AdapterManifest(
+                        adapter_id=f"ckpt_{job_id}_{epoch}_{global_step}",
+                        timeframe=self.spec.timeframe,
+                        horizon=self.spec.horizon,
+                        context_len=self.spec.context_len,
+                        feature_set=self.spec.feature_set,
+                        feature_columns=list(f_spec.columns),
+                        base_model_repo=MODEL_REPO,
+                        base_model_revision=MODEL_REVISION,
+                        train_spec=self.spec.to_dict(),
+                        snapshot_hash=snapshot_hash,
+                        best_epoch=best_epoch,
+                        best_val_loss=best_val_loss,
+                    )
+                    checkpoint_manager.save_checkpoint(
+                        job_id=job_id,
+                        peft_model=peft_model,
+                        manifest=ckpt_manifest,
+                        epoch=epoch,
+                        step=global_step,
+                        best_val_loss=best_val_loss,
+                        status="IN_PROGRESS",
+                    )
+                except Exception as ckpt_err:
+                    logger.warning("Failed to save epoch checkpoint: %s", ckpt_err)
 
             if progress_callback is not None:
                 try:
                     should_continue = progress_callback(epoch_record)
                     if should_continue is False:
                         logger.info("Training stopped gracefully by progress_callback after epoch %d.", epoch)
+                        if checkpoint_manager is not None and job_id is not None:
+                            try:
+                                checkpoint_manager.save_checkpoint(
+                                    job_id=job_id,
+                                    peft_model=peft_model,
+                                    manifest=ckpt_manifest,
+                                    epoch=epoch,
+                                    step=global_step,
+                                    best_val_loss=best_val_loss,
+                                    status="STOPPED",
+                                )
+                            except Exception as ckpt_err:
+                                logger.warning("Failed to save stopped checkpoint: %s", ckpt_err)
                         break
                 except Exception as cb_exc:
                     logger.warning("progress_callback raised exception: %s", cb_exc)
@@ -543,4 +644,5 @@ class LoRATrainer:
             train_spec=self.spec,
             training_range=data_meta,
             total_training_time_sec=total_elapsed,
+            total_steps=global_step,
         )

@@ -318,21 +318,44 @@ class GPUWorker:
             # Check for cancellation
             return not self.stop_event.is_set()
 
+        checkpoint_dir = payload.get("checkpoint_dir", "var/paxg_lab/checkpoints")
+        from paxg_lab.queue.checkpoint import TrainingCheckpointManager
+        checkpoint_manager = TrainingCheckpointManager(checkpoint_dir)
+        resume_job_id = payload.get("resume_from_job_id") or job.job_id
+
         trainer = LoRATrainer(base_model=base_model, spec=spec)
         train_result = trainer.train(
             features_df=features_df,
             snapshot_hash=snapshot_hash,
             fold_id=int(payload.get("fold_id", 1)),
             progress_callback=progress_cb,
+            checkpoint_manager=checkpoint_manager,
+            job_id=resume_job_id,
         )
 
-        if self.stop_event.is_set():
-            return {"status": "cancelled", "best_val_loss": train_result.best_val_loss}
-
-        # Save to store
         store_dir = payload.get("adapter_store_dir", "var/paxg_lab/adapters")
         store = AdapterStore(store_dir)
         smoke_test = bool(payload.get("smoke_test", True))
+
+        if self.stop_event.is_set():
+            # Stop preservation: persist loadable adapter artifact before worker exits
+            saved_dir = store.save_adapter(
+                peft_model=train_result.trained_model,
+                manifest=train_result.manifest,
+                base_model=base_model,
+                smoke_test=False,
+            )
+            ckpt_dir = checkpoint_manager.get_checkpoint_dir(resume_job_id)
+            return {
+                "status": "cancelled",
+                "best_epoch": train_result.best_epoch,
+                "best_val_loss": train_result.best_val_loss,
+                "checkpoint_path": str(ckpt_dir) if ckpt_dir.exists() else None,
+                "adapter_path": str(saved_dir),
+                "total_steps": train_result.total_steps,
+            }
+
+        # Save to store
         saved_dir = store.save_adapter(
             peft_model=train_result.trained_model,
             manifest=train_result.manifest,
@@ -346,6 +369,7 @@ class GPUWorker:
             "best_epoch": train_result.best_epoch,
             "best_val_loss": train_result.best_val_loss,
             "training_time_sec": train_result.total_training_time_sec,
+            "total_steps": train_result.total_steps,
         }
 
     def _handle_backtest_job(self, job: JobSpec) -> dict[str, Any]:
