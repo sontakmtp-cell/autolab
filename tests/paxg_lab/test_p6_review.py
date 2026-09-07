@@ -4,6 +4,7 @@ import time
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import optuna
 import pytest
 
 from paxg_lab.data.snapshot import DatasetSnapshot
@@ -80,6 +81,24 @@ def test_second_cycle_training_uses_selected_fold(tmp_path):
         call = trainer.return_value.train.call_args.kwargs
         assert call["explicit_train_range"] == (fold.train_start, fold.train_end)
         assert call["explicit_val_range"] == (fold.val_early_stop_start, fold.val_early_stop_end)
+
+
+def test_bounded_trials_finish_in_real_optuna_storage(tmp_path):
+    protocol = AutonomousTuningProtocol("1h", snapshot(), db_path=tmp_path / "jobs.db",
+        optuna_db_path=tmp_path / "optuna.db", adapter_store_dir=tmp_path / "adapters", max_trials=2)
+    with patch.object(protocol, "get_or_compute_base_report"), \
+         patch.object(protocol, "run_trial_fold_evaluation", return_value=(0.95, 1, 0.1)) as evaluate:
+        protocol.execute_step()  # BASELINE
+        for _ in range(6):
+            state = protocol.execute_step()
+    assert state["phase"] == "MULTI_SEED"
+    assert evaluate.call_count == 6
+    study = optuna.load_study(study_name=f"study_1h_{protocol.snapshot.metadata.sha256[:8]}",
+                             storage=f"sqlite:///{tmp_path / 'optuna.db'}")
+    assert len(study.trials) == 2
+    assert all(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials)
+    assert all(t.value == pytest.approx(5.0) for t in study.trials)
+    assert all(t.user_attrs["snapshot_sha256"] == protocol.snapshot.metadata.sha256 for t in study.trials)
 
 
 @pytest.mark.parametrize("broken", [False, True])

@@ -686,6 +686,8 @@ class AutonomousTuningProtocol:
             if inter_data is None or inter_data.get("spec") is None:
                 trial = study.ask()
                 trial_num = trial.number
+                trial.set_user_attr("timeframe", self.timeframe)
+                trial.set_user_attr("snapshot_sha256", self.snapshot.metadata.sha256)
                 spec = suggest_trial_spec(trial, timeframe=self.timeframe, seed=optimizer.seed)
                 inter_data = {
                     "trial_number": trial_num,
@@ -741,11 +743,7 @@ class AutonomousTuningProtocol:
                 # Fold 3 complete -> finish trial in Optuna
                 score_v1 = float(compute_score_v1(inter_data["fold_losses"]))
                 t_num = int(inter_data["trial_number"])
-                trial = [t for t in study.trials if t.number == t_num][0]
-                study.tell(trial, score_v1)
-                trial.set_user_attr("timeframe", self.timeframe)
-                trial.set_user_attr("snapshot_sha256", self.snapshot.metadata.sha256)
-                trial.set_user_attr("score_v1", score_v1)
+                study.tell(t_num, score_v1)
                 early_stop_cb.sync_from_study(study)
                 new_completed = len([t for t in study.trials if t.state == TrialState.COMPLETE])
 
