@@ -147,17 +147,17 @@ class OptunaTPEOptimizer:
 
     def create_or_load_study(self, repropose_prior: bool = True) -> optuna.Study:
         """Initializes or resumes persistent Optuna study, re-proposing prior top params on new snapshots."""
-        sampler = TPESampler(
-            n_startup_trials=self.startup_trials,
-            seed=self.seed,
-            multivariate=True,
-        )
         study = optuna.create_study(
             study_name=self.study_name,
             storage=self.storage_url,
             load_if_exists=True,
             direction="maximize",
-            sampler=sampler,
+        )
+        # Bounded jobs reconstruct the sampler; advance its deterministic seed per trial.
+        study.sampler = TPESampler(
+            n_startup_trials=self.startup_trials,
+            seed=self.seed + len(study.trials),
+            multivariate=True,
         )
         if repropose_prior and len(study.trials) == 0:
             try:

@@ -96,6 +96,7 @@ def test_bounded_trials_finish_in_real_optuna_storage(tmp_path):
     study = optuna.load_study(study_name=f"study_1h_{protocol.snapshot.metadata.sha256[:8]}",
                              storage=f"sqlite:///{tmp_path / 'optuna.db'}")
     assert len(study.trials) == 2
+    assert study.trials[0].params != study.trials[1].params
     assert all(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials)
     assert all(t.value == pytest.approx(5.0) for t in study.trials)
     assert all(t.user_attrs["snapshot_sha256"] == protocol.snapshot.metadata.sha256 for t in study.trials)
