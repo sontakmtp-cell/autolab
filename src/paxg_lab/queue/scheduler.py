@@ -570,19 +570,18 @@ class GPUScheduler:
                     # Subsequent cycle: check candles strictly after last_end_time_ms
                     _, last_end_ms = last_range
                     from ..data.snapshot import DatasetSnapshot
-                    from ..data.split import extract_windows
+                    from ..data.split import eligible_origins_from_timestamps
                     import numpy as np
-                    snapshot = DatasetSnapshot.load(latest_snap)
-                    start = int(np.searchsorted(snapshot.timestamps, last_end_ms))
-                    after_count = len(snapshot.timestamps) - start
+                    timestamps = DatasetSnapshot.load_timestamps(latest_snap)
+                    start = int(np.searchsorted(timestamps, last_end_ms))
+                    after_count = len(timestamps) - start
                     if after_count < min_exam_candles:
                         continue
                     # Use the maximum searchable context so every proposed config fits.
-                    _, _, origins = extract_windows(
-                        snapshot.features_a, snapshot.features_a[:, 0],
+                    origins = eligible_origins_from_timestamps(
+                        timestamps=timestamps,
                         context_len=512, horizon=candles_per_24h,
-                        start_idx=start, end_idx=len(snapshot.timestamps),
-                        timestamps=snapshot.timestamps, timeframe=tf,
+                        start_idx=start, end_idx=len(timestamps), timeframe=tf,
                     )
                     if len(origins[::candles_per_24h]) < 20:
                         continue

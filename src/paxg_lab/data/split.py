@@ -118,6 +118,61 @@ def calculate_split_plan(
     )
 
 
+def _resolve_interval_ms(timeframe: str | None, expected_interval_ms: int | None) -> int:
+    if expected_interval_ms is not None:
+        return int(expected_interval_ms)
+    if timeframe is None:
+        raise ValueError(
+            "extract_windows requires either 'timeframe' ('1h', '4h') or 'expected_interval_ms' "
+            "to validate interval continuity."
+        )
+    if timeframe == "1h":
+        return 3600 * 1000
+    if timeframe == "4h":
+        return 4 * 3600 * 1000
+    raise ValueError(f"Unsupported timeframe '{timeframe}'. Expected '1h' or '4h'.")
+
+
+def eligible_origins_from_timestamps(
+    timestamps: np.ndarray | list[int],
+    context_len: int,
+    horizon: int,
+    start_idx: int,
+    end_idx: int,
+    step: int = 1,
+    timeframe: str | None = None,
+    expected_interval_ms: int | None = None,
+) -> list[int]:
+    """Return origins whose full context and target windows are timestamp-contiguous.
+
+    This mirrors ``extract_windows``' first-target bounds and gap filtering without
+    reading feature or target arrays, so callers can preflight a locked interval.
+    """
+    ts_array = np.asarray(timestamps, dtype=np.int64)
+    total_len = len(ts_array)
+
+    min_origin = max(context_len - 1, start_idx - 1)
+    max_origin = min(end_idx - horizon - 1, total_len - horizon - 1)
+    if min_origin > max_origin or total_len < context_len + horizon:
+        return []
+
+    step_ms = _resolve_interval_ms(timeframe, expected_interval_ms)
+    bad_gap_indices: np.ndarray | None = None
+    if len(ts_array) > 1:
+        bad_gap_indices = np.where(np.diff(ts_array) != step_ms)[0]
+
+    origins: list[int] = []
+    for origin in range(min_origin, max_origin + 1, step):
+        window_start = origin - context_len + 1
+        window_end = origin + 1 + horizon
+        if bad_gap_indices is not None and len(bad_gap_indices) > 0:
+            gap_idx = np.searchsorted(bad_gap_indices, window_start)
+            if gap_idx < len(bad_gap_indices) and bad_gap_indices[gap_idx] < window_end - 1:
+                continue
+        origins.append(origin)
+    return origins
+
+
 def extract_windows(
     features: np.ndarray,
     targets: np.ndarray,
@@ -177,44 +232,29 @@ def extract_windows(
             "Cannot extract windows without timestamp continuity validation."
         )
 
-    if timeframe is None and expected_interval_ms is None:
-        raise ValueError(
-            "extract_windows requires either 'timeframe' ('1h', '4h') or 'expected_interval_ms' "
-            "to validate interval continuity."
-        )
-
-    if expected_interval_ms is not None:
-        step_ms = expected_interval_ms
-    elif timeframe == "1h":
-        step_ms = 3600 * 1000
-    elif timeframe == "4h":
-        step_ms = 4 * 3600 * 1000
-    else:
-        raise ValueError(f"Unsupported timeframe '{timeframe}'. Expected '1h' or '4h'.")
-
     ts_array = np.asarray(timestamps, dtype=np.int64)
     if len(ts_array) != total_len:
         raise ValueError(f"timestamps length ({len(ts_array)}) must match features length ({total_len})")
 
-    bad_gap_indices: np.ndarray | None = None
-    if len(ts_array) > 1:
-        diffs = np.diff(ts_array)
-        bad_gap_indices = np.where(diffs != step_ms)[0]
+    origins = eligible_origins_from_timestamps(
+        timestamps=ts_array,
+        context_len=context_len,
+        horizon=horizon,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        step=step,
+        timeframe=timeframe,
+        expected_interval_ms=expected_interval_ms,
+    )
 
     contexts = []
     futures = []
+    eligible_origins = origins
     origins = []
 
-    for origin in range(min_origin, max_origin + 1, step):
+    for origin in eligible_origins:
         w_start = origin - context_len + 1
         w_end = origin + 1 + horizon
-
-        # Check timestamp continuity across full window (context + horizon)
-        if ts_array is not None and step_ms is not None and bad_gap_indices is not None and len(bad_gap_indices) > 0:
-            # Check if any gap transition falls within [w_start, w_end - 1)
-            idx = np.searchsorted(bad_gap_indices, w_start)
-            if idx < len(bad_gap_indices) and bad_gap_indices[idx] < w_end - 1:
-                continue
 
         ctx_slice = features[w_start : origin + 1]
         fut_slice = targets_1d[origin + 1 : w_end]

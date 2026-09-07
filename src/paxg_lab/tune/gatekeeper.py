@@ -100,6 +100,8 @@ class LoRAGatekeeper:
         tf = candidate_manifest.timeframe
         cid = candidate_manifest.adapter_id
         current_rec_id = self.store.get_recommended(tf)
+        original_manifest_verified = candidate_manifest.is_verified
+        original_manifest_hashes = dict(candidate_manifest.file_hashes)
 
         if locked_report is not None:
             # 1. Direct locked verification metrics (Zero Leakage)
@@ -219,6 +221,9 @@ class LoRAGatekeeper:
         # 6. Check smoke test and backup
         check_smoke_backup = False
         backup_path_str: str | None = None
+        backup_zip_path: Path | None = None
+        verification_stage_dir: Path | None = None
+        verification_rollback_dir: Path | None = None
 
         all_numerical_passed = (
             check_score
@@ -246,30 +251,32 @@ class LoRAGatekeeper:
                     if not tensors:
                         raise ValueError("adapter_model.safetensors contains 0 weight tensors.")
 
+                # Build a complete verified artifact without touching the
+                # candidate.  It is promoted only after its backup is valid.
+                verification_stage_dir = self.store.stage_verified_adapter(cid)
+
                 if perform_backup:
                     import zipfile
-                    from ..model.store import compute_file_sha256, CHECKSUMS_FILENAME
 
-                    # Ensure sidecar checksums file exists before backup export
-                    checksums_file = cand_path / CHECKSUMS_FILENAME
-                    if not checksums_file.exists():
-                        with open(checksums_file, "w", encoding="utf-8") as cs_f:
-                            for item in sorted(cand_path.iterdir()):
-                                if item.is_file() and item.name != CHECKSUMS_FILENAME:
-                                    digest = compute_file_sha256(item)
-                                    cs_f.write(f"{digest}  {item.name}\n")
-
-                    backup_zip = self.backup_dir / f"recommended_{tf}_{cid}_{int(time.time())}.zip"
-                    self.store.export_adapter_zip(cid, backup_zip)
-                    backup_path_str = str(backup_zip)
+                    backup_zip_path = self.backup_dir / f"recommended_{tf}_{cid}_{int(time.time())}.zip"
+                    self.store.export_adapter_zip(verification_stage_dir, backup_zip_path)
+                    backup_path_str = str(backup_zip_path)
 
                     # Reopen and strictly verify backup zip integrity, checksums sidecar, and files
                     import hashlib
-                    with zipfile.ZipFile(backup_zip, "r") as zf:
+                    with zipfile.ZipFile(backup_zip_path, "r") as zf:
                         bad_file = zf.testzip()
                         if bad_file is not None:
                             raise ValueError(f"Corrupted file in backup zip: {bad_file}")
                         names = set(zf.namelist())
+                        expected_names = {
+                            item.name for item in verification_stage_dir.iterdir() if item.is_file()
+                        }
+                        if names != expected_names:
+                            raise ValueError(
+                                f"Backup zip contents differ from staged adapter: "
+                                f"expected={sorted(expected_names)}, got={sorted(names)}"
+                            )
                         if "paxg_manifest.json" not in names:
                             raise FileNotFoundError("Backup zip missing paxg_manifest.json")
                         if "checksums.sha256" not in names:
@@ -282,6 +289,7 @@ class LoRAGatekeeper:
                         # Parse checksums.sha256 and verify every entry against archived bytes
                         cs_content = zf.read("checksums.sha256").decode("utf-8")
                         verified_count = 0
+                        checksum_names: set[str] = set()
                         for line in cs_content.splitlines():
                             line = line.strip()
                             if not line or line.startswith("#"):
@@ -291,6 +299,9 @@ class LoRAGatekeeper:
                                 exp_hash, item_name = parts[0].strip(), parts[1].strip()
                                 if item_name not in names:
                                     raise FileNotFoundError(f"File '{item_name}' in checksums.sha256 missing from backup zip.")
+                                if item_name in checksum_names:
+                                    raise ValueError(f"Duplicate checksum entry for '{item_name}' in backup zip.")
+                                checksum_names.add(item_name)
                                 file_bytes = zf.read(item_name)
                                 actual_hash = hashlib.sha256(file_bytes).hexdigest()
                                 if actual_hash != exp_hash:
@@ -301,9 +312,29 @@ class LoRAGatekeeper:
                                 verified_count += 1
                         if verified_count == 0:
                             raise ValueError("checksums.sha256 in backup zip contained 0 valid checksum entries.")
+                        if checksum_names != names - {"checksums.sha256"}:
+                            raise ValueError("Backup zip checksums do not cover exactly the archived files.")
+                        for item_name in names:
+                            if zf.read(item_name) != (verification_stage_dir / item_name).read_bytes():
+                                raise ValueError(f"Backup zip bytes differ from staged file '{item_name}'.")
 
+                verification_rollback_dir = self.store.promote_staged_adapter(cid, verification_stage_dir)
+                verification_stage_dir = None
                 check_smoke_backup = True
             except Exception as exc:
+                if verification_stage_dir is not None:
+                    self.store.discard_verification_backup(verification_stage_dir)
+                    verification_stage_dir = None
+                if verification_rollback_dir is not None:
+                    try:
+                        self.store.rollback_verified_adapter(cid, verification_rollback_dir)
+                    except Exception as rollback_exc:
+                        logger.error("Failed rolling back candidate '%s': %s", cid, rollback_exc)
+                        reasons.append(f"Candidate rollback failed: {rollback_exc}")
+                    verification_rollback_dir = None
+                if backup_zip_path is not None and backup_zip_path.exists():
+                    backup_zip_path.unlink()
+                    backup_path_str = None
                 reasons.append(f"Smoke test load or backup export failed: {exc}")
                 check_smoke_backup = False
 
@@ -316,7 +347,7 @@ class LoRAGatekeeper:
             "score_diff": score_diff,
             "candidate_mae": cand_mae,
             "base_mae": base_mae,
-            "naive_test_mae": naive_test_mae,
+            "naive_test_mae": naive_mae_val,
             "mae_vs_base_ratio": mae_vs_base_ratio,
             "mae_vs_naive_ratio": mae_vs_naive_ratio,
             "worst_segment_mae_ratio": worst_fold_ratio,
@@ -349,13 +380,43 @@ class LoRAGatekeeper:
             audit_report_path=str(audit_file),
         )
 
-        # If accepted, mark manifest verified and set recommended in store
+        # If accepted, the staged manifest and sidecar are already final.  The
+        # registry is updated last so a failed backup or database write cannot
+        # replace the current recommendation.
         if accepted:
             logger.info("Candidate '%s' passed all criteria! Setting as RECOMMENDED adapter for %s.", cid, tf)
-            candidate_manifest.is_verified = True
-            cand_path = self.store.get_adapter_path(cid)
-            candidate_manifest.save_json(cand_path / "paxg_manifest.json")
-            self.store.set_recommended(cid, tf)
+            try:
+                final_manifest = AdapterManifest.load_json(
+                    self.store.get_adapter_path(cid) / "paxg_manifest.json"
+                )
+                if not final_manifest.is_verified:
+                    raise RuntimeError("Promoted adapter manifest is not marked verified")
+                candidate_manifest.is_verified = final_manifest.is_verified
+                candidate_manifest.file_hashes = final_manifest.file_hashes
+                self.store.set_recommended(cid, tf)
+            except Exception as exc:
+                accepted = False
+                decision.accepted = False
+                decision.verdict = "REJECTED_PRESERVE_CURRENT"
+                decision.check_smoke_test_and_backup = False
+                decision.reasons.append(f"Recommendation update failed: {exc}")
+                candidate_manifest.is_verified = original_manifest_verified
+                candidate_manifest.file_hashes = original_manifest_hashes
+                if verification_rollback_dir is not None:
+                    try:
+                        self.store.rollback_verified_adapter(cid, verification_rollback_dir)
+                    except Exception as rollback_exc:
+                        logger.error("Failed rolling back candidate '%s': %s", cid, rollback_exc)
+                        decision.reasons.append(f"Candidate rollback failed: {rollback_exc}")
+                    verification_rollback_dir = None
+                if backup_zip_path is not None and backup_zip_path.exists():
+                    backup_zip_path.unlink()
+                    backup_path_str = None
+                decision.backup_zip_path = None
+            else:
+                if verification_rollback_dir is not None:
+                    self.store.discard_verification_backup(verification_rollback_dir)
+                    verification_rollback_dir = None
         else:
             logger.warning(
                 "Candidate '%s' REJECTED. Preserving current recommended '%s' for %s. Reasons:\n%s",

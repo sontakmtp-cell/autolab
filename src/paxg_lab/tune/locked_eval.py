@@ -23,7 +23,12 @@ import numpy as np
 
 from ..constants import get_horizon_for_timeframe, get_horizon_weights
 from ..data.snapshot import DatasetSnapshot
-from ..data.split import SplitPlan, calculate_split_plan, extract_windows
+from ..data.split import (
+    SplitPlan,
+    calculate_split_plan,
+    eligible_origins_from_timestamps,
+    extract_windows,
+)
 from ..eval.metrics import (
     calculate_coverage_80,
     calculate_directional_accuracy,
@@ -116,28 +121,29 @@ def run_locked_verification(
                     pass
 
         split_plan = calculate_split_plan(
-            total_candles=len(snapshot.features_a),
+            total_candles=len(snapshot.timestamps),
             timeframe=timeframe,
             custom_test_start=custom_test_start,
             custom_test_end=custom_test_end,
         )
     test_start = split_plan.test_start
     test_end = split_plan.test_end
+    timestamps = np.asarray(snapshot.timestamps, dtype=np.int64)
     snapshot_hash = ""
     if hasattr(snapshot, "metadata") and hasattr(snapshot.metadata, "sha256"):
         snapshot_hash = str(snapshot.metadata.sha256)
 
-    if len(snapshot.timestamps) > 1:
-        candle_step_ms = int(snapshot.timestamps[1] - snapshot.timestamps[0])
+    if len(timestamps) > 1:
+        candle_step_ms = int(timestamps[1] - timestamps[0])
     else:
         from ..constants import timeframe_to_seconds
         candle_step_ms = int(timeframe_to_seconds(timeframe) * 1000)
 
-    test_start_time_ms = int(snapshot.timestamps[test_start])
-    if test_end < len(snapshot.timestamps):
-        test_end_time_ms = int(snapshot.timestamps[test_end])
+    test_start_time_ms = int(timestamps[test_start])
+    if test_end < len(timestamps):
+        test_end_time_ms = int(timestamps[test_end])
     else:
-        test_end_time_ms = int(snapshot.timestamps[test_end - 1]) + candle_step_ms
+        test_end_time_ms = int(timestamps[test_end - 1]) + candle_step_ms
 
     # 1. Enforce statistical lock via SQLite audit ledger
     if storage is not None:
@@ -155,6 +161,77 @@ def run_locked_verification(
                 "Refusing to reuse locked exam for another candidate."
             )
 
+    current_rec_id = store.get_recommended(timeframe) if store else None
+    rec_path = None
+    rec_manifest = None
+    if current_rec_id and store:
+        try:
+            rec_path = store.get_adapter_path(current_rec_id)
+            rec_manifest = AdapterManifest.load_json(rec_path / "paxg_manifest.json")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Fail-closed: Failed preparing incumbent recommended adapter '{current_rec_id}' for contemporaneous evaluation: {exc}"
+            ) from exc
+
+    # 2. Preflight common timestamp-contiguous origins before opening any labels.
+    candidate_origins = eligible_origins_from_timestamps(
+        timestamps=timestamps,
+        context_len=candidate_manifest.context_len,
+        horizon=horizon,
+        start_idx=test_start,
+        end_idx=test_end,
+        timeframe=timeframe,
+    )
+    base_origins = eligible_origins_from_timestamps(
+        timestamps=timestamps,
+        context_len=256,
+        horizon=horizon,
+        start_idx=test_start,
+        end_idx=test_end,
+        timeframe=timeframe,
+    )
+    incumbent_origins = (
+        eligible_origins_from_timestamps(
+            timestamps=timestamps,
+            context_len=rec_manifest.context_len,
+            horizon=horizon,
+            start_idx=test_start,
+            end_idx=test_end,
+            timeframe=timeframe,
+        )
+        if rec_manifest is not None
+        else None
+    )
+
+    common_set = set(candidate_origins) & set(base_origins)
+    if incumbent_origins is not None:
+        common_set &= set(incumbent_origins)
+
+    preflight_origins = sorted(common_set)
+    if len(preflight_origins) == 0:
+        raise ValueError(
+            f"No common forecast origins across candidate, base, and recommended models in [{test_start}, {test_end})."
+        )
+
+    # Check the same independent origins used by bootstrap before opening any labels.
+    if len(preflight_origins[::block_len]) < 20:
+        raise ValueError("Insufficient independent 24-hour blocks before locked consumption")
+    if is_cancelled_func is not None and is_cancelled_func():
+        raise InterruptedError("Locked verification cancelled before consumption.")
+    if storage is not None:
+        # Atomically mark consumption before inference begins
+        storage.record_locked_consumption(
+            timeframe=timeframe,
+            test_start_idx=test_start,
+            test_end_idx=test_end,
+            test_start_time_ms=test_start_time_ms,
+            test_end_time_ms=test_end_time_ms,
+            snapshot_hash=snapshot_hash,
+            candidate_id=candidate_manifest.adapter_id,
+            verdict="IN_PROGRESS",
+            details="Locked verification initiated.",
+        )
+
     logger.info(
         "Starting locked test verification for %s [%d, %d) on candidate '%s'...",
         timeframe,
@@ -166,9 +243,8 @@ def run_locked_verification(
     features = snapshot.get_features(candidate_manifest.feature_set)
     base_features = snapshot.get_features("A")
     targets = snapshot.features_a[:, 0]
-    timestamps = snapshot.timestamps
 
-    # 2. Partition locked test set into 3 consecutive stability segments
+    # 3. Partition locked test set into 3 consecutive stability segments
     total_test_candles = test_end - test_start
     seg_size = total_test_candles // 3
     segments = [
@@ -177,7 +253,7 @@ def run_locked_verification(
         ("seg3", test_start + 2 * seg_size, test_end),
     ]
 
-    # 3. Extract candidate & base raw test sliding windows
+    # 4. Extract candidate & base raw test sliding windows
     cand_ctx_raw, cand_fut_raw, cand_origins = extract_windows(
         features=features,
         targets=targets,
@@ -201,16 +277,12 @@ def run_locked_verification(
         timeframe=timeframe,
     )
 
-    # 4. Extract current recommended adapter windows if present in store
-    current_rec_id = store.get_recommended(timeframe) if store else None
+    # 5. Extract current recommended adapter windows if present in store
     rec_ctx_raw = None
     rec_fut_raw = None
     rec_origins = None
-    rec_path = None
-    if current_rec_id and store:
+    if current_rec_id and store and rec_manifest is not None:
         try:
-            rec_path = store.get_adapter_path(current_rec_id)
-            rec_manifest = AdapterManifest.load_json(rec_path / "paxg_manifest.json")
             rec_feat = snapshot.get_features(rec_manifest.feature_set)
             rec_ctx_raw, rec_fut_raw, rec_origins = extract_windows(
                 features=rec_feat,
@@ -228,37 +300,18 @@ def run_locked_verification(
                 f"Fail-closed: Failed preparing incumbent recommended adapter '{current_rec_id}' for contemporaneous evaluation: {exc}"
             ) from exc
 
-    # 5. Intersect common forecast origins across candidate, base, and current recommended
+    # Re-intersect extracted windows after the ledger mark; preflight already
+    # established eligibility from timestamps and manifests only.
     common_set = set(cand_origins) & set(base_origins)
     if rec_origins is not None:
-        common_set = common_set & set(rec_origins)
-
+        common_set &= set(rec_origins)
     common_origins = sorted(common_set)
     if len(common_origins) == 0:
         raise ValueError(
             f"No common forecast origins across candidate, base, and recommended models in [{test_start}, {test_end})."
         )
 
-    # Check the same independent origins used by bootstrap before opening any labels.
-    if len(common_origins[::block_len]) < 20:
-        raise ValueError("Insufficient independent 24-hour blocks before locked consumption")
-    if is_cancelled_func is not None and is_cancelled_func():
-        raise InterruptedError("Locked verification cancelled before consumption.")
-    if storage is not None:
-        # Atomically mark consumption before inference begins
-        storage.record_locked_consumption(
-            timeframe=timeframe,
-            test_start_idx=test_start,
-            test_end_idx=test_end,
-            test_start_time_ms=test_start_time_ms,
-            test_end_time_ms=test_end_time_ms,
-            snapshot_hash=snapshot_hash,
-            candidate_id=candidate_manifest.adapter_id,
-            verdict="IN_PROGRESS",
-            details="Locked verification initiated.",
-        )
-
-    # Filter all context and target arrays strictly to common origins
+    # 6. Filter all context and target arrays strictly to common origins
     cand_orig_to_idx = {orig: i for i, orig in enumerate(cand_origins)}
     base_orig_to_idx = {orig: i for i, orig in enumerate(base_origins)}
     cand_indices = [cand_orig_to_idx[orig] for orig in common_origins]

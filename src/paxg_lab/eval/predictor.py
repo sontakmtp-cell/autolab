@@ -75,7 +75,7 @@ class TimesFM3Predictor:
             self.unload_adapter()
 
         logger.info("Loading verified adapter with manifest from %s...", p)
-        store = AdapterStore(base_dir=p.parent)
+        store = AdapterStore(base_dir=p.parent, db_path=None)
         self.lora_model, self.manifest = store.load_adapter(
             adapter_id_or_path=p,
             base_model=self.base_model,

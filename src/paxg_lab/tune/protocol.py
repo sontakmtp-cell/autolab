@@ -128,7 +128,7 @@ class AutonomousTuningProtocol:
         self.snapshot = snapshot
         self.job_storage = GPUJobStorage(db_path)
         self.optuna_db_path = Path(optuna_db_path)
-        self.store = AdapterStore(adapter_store_dir)
+        self.store = AdapterStore(adapter_store_dir, db_path=db_path)
         self.gatekeeper = LoRAGatekeeper(store=self.store, audit_dir=audit_dir, backup_dir=backup_dir)
         self.max_trials = max_trials
         self.startup_trials = startup_trials
@@ -969,6 +969,7 @@ class AutonomousTuningProtocol:
                         best_epoch=best_epoch,
                         best_score=winner["median_score"],
                         multi_seed_results_json=json.dumps(multi_seed_summary.to_dict()),
+                        multi_seed_evaluations_json=json.dumps(evals),
                     )
             return self.job_storage.get_auto_tune_run(self.timeframe) or {}
 
