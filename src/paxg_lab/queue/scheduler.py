@@ -185,7 +185,7 @@ class GPUScheduler:
                         payload=resumed_payload,
                         timeout_seconds=running_job.timeout_seconds,
                     )
-                    self.storage.submit_job(resumed_spec)
+                    self.storage.submit_job(resumed_spec, reject_if_stopped=True)
                     logger.info(
                         "Crash Recovery: Automatically requeued resumed job '%s' from durable checkpoint of '%s' (epoch %d, step %d)",
                         resumed_job_id,
@@ -224,9 +224,11 @@ class GPUScheduler:
                         recent = self.storage.list_recent_jobs(job_type=JobType.AUTO_TRIAL.value, timeframe=tf, limit=5)
                         has_active = any(j.status in (JobStatus.QUEUED.value, JobStatus.RUNNING.value) for j in recent)
                         if not has_active:
-                            snap_dir = Path("var/paxg_lab/snapshots")
-                            candidates = sorted(snap_dir.glob(f"paxgusdt_{tf}_*"))
-                            snap_path = str(candidates[-1]) if candidates else ""
+                            from ..data.snapshot import DatasetSnapshot
+                            snap_path = run_state["snapshot_path"]
+                            snapshot = DatasetSnapshot.load(snap_path)
+                            if snapshot.metadata.sha256 != run_state["snapshot_hash"]:
+                                raise ValueError("Persisted auto snapshot hash mismatch")
                             resume_job_id = f"auto_step_{tf}_resume_{int(time.time() * 1000)}"
                             resumed_spec = JobSpec(
                                 job_id=resume_job_id,
@@ -236,7 +238,7 @@ class GPUScheduler:
                                 payload={"timeframe": tf, "snapshot_path": snap_path},
                                 timeout_seconds=1200.0,
                             )
-                            self.storage.submit_job(resumed_spec)
+                            self.storage.submit_job(resumed_spec, reject_if_stopped=True)
                             logger.info(
                                 "Startup Recovery: Auto mode was in %s for %s. Enqueued resumption job '%s'.",
                                 auto_state.value,
@@ -244,6 +246,8 @@ class GPUScheduler:
                                 resume_job_id,
                             )
             except Exception as exc:
+                self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
+                self.storage.set_state(f"auto_error_{tf}", str(exc))
                 logger.warning("Error in auto tune startup recovery for %s: %s", tf, exc)
 
         return recovered_ids
@@ -547,7 +551,6 @@ class GPUScheduler:
                     continue
                 latest_snap = candidates[-1]
                 meta_file = latest_snap / "metadata.json"
-                ts_file = latest_snap / "timestamps.npy"
                 if not meta_file.exists():
                     continue
 
@@ -566,17 +569,22 @@ class GPUScheduler:
                 if last_range is not None:
                     # Subsequent cycle: check candles strictly after last_end_time_ms
                     _, last_end_ms = last_range
-                    if ts_file.exists():
-                        import numpy as np
-                        ts = np.load(ts_file)
-                        after_count = int(np.sum(ts >= last_end_ms))
-                    else:
-                        # Fallback estimate from candle count difference
-                        diff = curr_candles - (last_consumed or 0)
-                        after_count = diff
-
+                    from ..data.snapshot import DatasetSnapshot
+                    from ..data.split import extract_windows
+                    import numpy as np
+                    snapshot = DatasetSnapshot.load(latest_snap)
+                    start = int(np.searchsorted(snapshot.timestamps, last_end_ms))
+                    after_count = len(snapshot.timestamps) - start
                     if after_count < min_exam_candles:
-                        # Not enough unseen data for >= 20 24h blocks yet; remain in WAITING_DATA
+                        continue
+                    # Use the maximum searchable context so every proposed config fits.
+                    _, _, origins = extract_windows(
+                        snapshot.features_a, snapshot.features_a[:, 0],
+                        context_len=512, horizon=candles_per_24h,
+                        start_idx=start, end_idx=len(snapshot.timestamps),
+                        timestamps=snapshot.timestamps, timeframe=tf,
+                    )
+                    if len(origins[::candles_per_24h]) < 20:
                         continue
 
                     logger.info(
@@ -592,7 +600,7 @@ class GPUScheduler:
 
                 # Trigger new cycle
                 self.storage.reset_auto_tune_run(tf)
-                self.storage.set_auto_run_state(tf, AutoRunState.SEARCHING, allow_unstop=True)
+                self.storage.set_auto_run_state(tf, AutoRunState.SEARCHING)
                 auto_job = JobSpec(
                     job_id=f"auto_step_{tf}_{int(time.time() * 1000)}",
                     job_type=JobType.AUTO_TRIAL.value,
@@ -604,7 +612,7 @@ class GPUScheduler:
                     },
                     timeout_seconds=1200.0,
                 )
-                self.storage.submit_job(auto_job)
+                self.storage.submit_job(auto_job, reject_if_stopped=True)
                 logger.info("Auto wake-up: enqueued fresh auto-tune job '%s' for %s.", auto_job.job_id, tf)
             except Exception as exc:
                 logger.warning("Error checking auto wake-up for %s: %s", tf, exc)
@@ -696,7 +704,7 @@ class GPUScheduler:
                 payload=retry_payload,
                 timeout_seconds=job.timeout_seconds,
             )
-            self.storage.submit_job(retry_spec)
+            self.storage.submit_job(retry_spec, reject_if_stopped=True)
             logger.info(
                 "CUDA OOM detected on BACKTEST job '%s' (batch=%d->%d). Dispatched OOM retry job '%s'.",
                 job.job_id,
@@ -797,7 +805,7 @@ class GPUScheduler:
             payload=retry_payload,
             timeout_seconds=job.timeout_seconds,
         )
-        self.storage.submit_job(retry_spec)
+        self.storage.submit_job(retry_spec, reject_if_stopped=True)
         logger.info(
             "CUDA OOM detected on job '%s' (batch=%d->%d, accum=%d->%d). Dispatched OOM retry job '%s'.",
             job.job_id,

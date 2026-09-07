@@ -187,19 +187,20 @@ class GPUJobStorage:
 
     def submit_job(self, job_spec: JobSpec, reject_if_stopped: bool = False) -> str:
         """Submits a job to the queue, enforcing atomic idempotency deduplication on active jobs."""
-        if reject_if_stopped and job_spec.priority == JobPriority.AUTO.value:
-            tf = job_spec.timeframe or "1h"
-            if self.get_auto_run_state(tf) == AutoRunState.STOPPED:
-                raise ValueError(
-                    f"Cannot submit AUTO job for timeframe '{tf}': auto-run is currently STOPPED."
-                )
-
         now = time.time()
         payload_json = json.dumps(job_spec.payload, default=str)
         result_json = json.dumps(job_spec.result, default=str) if job_spec.result is not None else None
 
         with self.get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE;")
+
+            if reject_if_stopped and job_spec.priority == JobPriority.AUTO.value:
+                row = conn.execute(
+                    "SELECT value FROM scheduler_state WHERE key = ?",
+                    (f"auto_run_state_{job_spec.timeframe or '1h'}",),
+                ).fetchone()
+                if row and row["value"] == AutoRunState.STOPPED.value:
+                    raise ValueError("Cannot submit AUTO job: auto-run is currently STOPPED.")
 
             # Check idempotency: if job with same key is QUEUED or RUNNING, return existing job_id
             if job_spec.idempotency_key:
@@ -637,7 +638,7 @@ class GPUJobStorage:
         val = self.get_state(key, AutoRunState.SEARCHING.value)
         return AutoRunState(val)
 
-    def set_auto_run_state(self, timeframe: str, state: AutoRunState, allow_unstop: bool = True) -> None:
+    def set_auto_run_state(self, timeframe: str, state: AutoRunState, allow_unstop: bool = False) -> None:
         """Sets current AutoRunState for timeframe, protecting STOPPED as a sticky user-owned state."""
         key = f"auto_run_state_{timeframe}"
         with self.get_connection() as conn:

@@ -200,10 +200,13 @@ class DatasetSnapshot:
         features_b = data["features_b"]
         features_c = data["features_c"] if "features_c" in data else None
 
-        return cls(
+        snapshot = cls(
             metadata=metadata,
             timestamps=timestamps,
             features_a=features_a,
             features_b=features_b,
             features_c=features_c,
         )
+
+        snapshot.source_path = str(s_dir.resolve())
+        return snapshot

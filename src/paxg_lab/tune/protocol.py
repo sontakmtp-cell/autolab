@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import hashlib
 import logging
 from pathlib import Path
 import time
@@ -121,6 +122,7 @@ class AutonomousTuningProtocol:
         max_trials: int = 30,
         startup_trials: int = 10,
         patience: int = 12,
+        max_epochs_cap: int | None = None,
     ):
         self.timeframe = str(timeframe).lower().strip()
         self.snapshot = snapshot
@@ -131,6 +133,15 @@ class AutonomousTuningProtocol:
         self.max_trials = max_trials
         self.startup_trials = startup_trials
         self.patience = patience
+        # Optional upper bound on training epochs. Default None keeps the value carried
+        # by TrainSpec. Bounded evidence cycles (PLAN P6: "một đợt nhỏ thật đủ chu trình")
+        # set this to keep wall-clock affordable; the cap is always recorded where used.
+        self.max_epochs_cap = int(max_epochs_cap) if max_epochs_cap is not None else None
+
+        # Populated by the LOCKED_VERIFICATION step so callers (evidence runners, UI)
+        # receive the real production verdict instead of re-reading audit files.
+        self.last_locked_report: LockedVerificationReport | None = None
+        self.last_decision: GatekeeperDecision | None = None
 
         # Check if there is a previously consumed verification range
         last_range = self.job_storage.get_latest_consumed_locked_range(self.timeframe)
@@ -186,6 +197,8 @@ class AutonomousTuningProtocol:
         base_model = TimesFM3Torch.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
 
         eval_spec = TrainSpec.from_dict(spec.to_dict())
+        if self.max_epochs_cap is not None:
+            eval_spec.max_epochs = min(eval_spec.max_epochs, self.max_epochs_cap)
         if fast_dev_mode:
             eval_spec.max_epochs = 1
             eval_spec.max_samples_per_epoch = 64
@@ -200,6 +213,8 @@ class AutonomousTuningProtocol:
             features_df=features_df,
             snapshot_hash=self.snapshot.metadata.sha256,
             fold_id=fold.fold_id,
+            explicit_train_range=(fold.train_start, fold.train_end),
+            explicit_val_range=(fold.val_early_stop_start, fold.val_early_stop_end),
             progress_callback=check_cancel,
         )
 
@@ -376,6 +391,8 @@ class AutonomousTuningProtocol:
 
         cand_spec = TrainSpec.from_dict(candidate_spec.to_dict())
         cand_spec.max_epochs = max(1, best_epoch)
+        if self.max_epochs_cap is not None:
+            cand_spec.max_epochs = min(cand_spec.max_epochs, self.max_epochs_cap)
         if fast_dev_mode:
             cand_spec.max_samples_per_epoch = 128
 
@@ -483,8 +500,9 @@ class AutonomousTuningProtocol:
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> ScoreReport:
         """Retrieves cached Base reference report or computes it."""
-        snap_hash = self.snapshot.metadata.sha256[:8]
-        cache_path = Path("var/paxg_lab") / f"base_ref_{self.timeframe}_{snap_hash}.json"
+        cache_key = json.dumps([self.snapshot.metadata.sha256, asdict(self.split_plan)], sort_keys=True)
+        cache_hash = hashlib.sha256(cache_key.encode()).hexdigest()
+        cache_path = self.optuna_db_path.parent / f"base_ref_{self.timeframe}_{cache_hash}.json"
         if cache_path.exists():
             try:
                 with open(cache_path, "r", encoding="utf-8") as f:
@@ -507,6 +525,7 @@ class AutonomousTuningProtocol:
             context_len=256,
             batch_size=16,
             model_name="TimesFM3-Base-Ref",
+            split_plan=self.split_plan,
             is_base_reference=True,
             include_locked_test=False,
         )
@@ -1026,6 +1045,8 @@ class AutonomousTuningProtocol:
                 custom_test_eval_fn=custom_test_eval_fn,
                 is_cancelled_func=is_cancelled_func,
             )
+            self.last_locked_report = locked_report
+            self.last_decision = decision
 
             if is_cancelled_func is not None and is_cancelled_func():
                 raise InterruptedError(f"Step execution in phase '{phase}' cancelled by user request.")
@@ -1097,16 +1118,29 @@ class AutonomousTuningProtocol:
         final_st = self.job_storage.get_auto_tune_run(self.timeframe) or {}
         multi_seed_data = json.loads(final_st.get("multi_seed_results_json") or "{}")
 
-        # Load audit decision if exists
-        audit_dir = Path("var/paxg_lab/audit_reports")
-        audits = sorted(audit_dir.glob(f"audit_{self.timeframe}_*"))
-        dec_data = {}
-        if audits:
+        # Prefer the decision produced by the production LOCKED_VERIFICATION step.
+        dec_data: dict[str, Any] = {}
+        if self.last_decision is not None:
+            dec_data = self.last_decision.to_dict()
+        else:
+            # Fallback: latest persisted audit report for this timeframe.
+            audit_dir = Path(self.gatekeeper.audit_dir)
+            audits = sorted(audit_dir.glob(f"audit_{self.timeframe}_*")) if audit_dir.exists() else []
+            if audits:
+                try:
+                    with open(audits[-1], "r", encoding="utf-8") as af:
+                        dec_data = json.load(af)
+                except Exception:
+                    pass
+
+        # Locked verification metrics produced by the production path (may be a stub in unit tests).
+        test_report_data: dict[str, Any] = {}
+        if self.last_locked_report is not None:
             try:
-                with open(audits[-1], "r", encoding="utf-8") as af:
-                    dec_data = json.load(af)
-            except Exception:
-                pass
+                test_report_data = self.last_locked_report.to_dict()
+            except Exception as exc:  # pragma: no cover - defensive for stubbed reports
+                logger.warning("Could not serialize locked verification report: %s", exc)
+                test_report_data = {}
 
         return P6RunResult(
             timeframe=self.timeframe,
@@ -1117,7 +1151,7 @@ class AutonomousTuningProtocol:
             best_trial_params=best_t.params if best_t else {},
             multi_seed_summary=multi_seed_data,
             final_candidate_id=final_st.get("final_candidate_id", ""),
-            test_score_report={},
+            test_score_report=test_report_data,
             decision=dec_data,
             resulting_auto_state=AutoRunState.WAITING_DATA.value,
         )

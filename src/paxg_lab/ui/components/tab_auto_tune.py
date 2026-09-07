@@ -126,7 +126,7 @@ def render_auto_tune_tab(timeframe: str, db_path: Path = DEFAULT_DB_PATH) -> Non
     with col_btn_start:
         st.markdown("<div style='height: 0.8rem;'></div>", unsafe_allow_html=True)
         if st.button("▶ Bật Tự động", use_container_width=True, disabled=(current_state == AutoRunState.SEARCHING)):
-            storage.set_auto_run_state(timeframe, AutoRunState.SEARCHING)
+            storage.set_auto_run_state(timeframe, AutoRunState.SEARCHING, allow_unstop=True)
             recent_auto = list_recent_jobs(job_type=JobType.AUTO_TRIAL.value, timeframe=timeframe, limit=5, db_path=db_path)
             has_pending = any(j.status in (JobStatus.QUEUED.value, JobStatus.RUNNING.value) for j in recent_auto)
             if not has_pending:

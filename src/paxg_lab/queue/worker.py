@@ -388,7 +388,7 @@ class GPUWorker:
         payload = job.payload
         timeframe = payload.get("timeframe", job.timeframe or "1h")
         snapshot_path = payload.get("snapshot_path")
-        if not snapshot_path or not Path(snapshot_path).exists():
+        if not snapshot_path:
             raise FileNotFoundError(f"Snapshot path required for backtest, got '{snapshot_path}'")
 
         snapshot = DatasetSnapshot.load(snapshot_path)
@@ -496,6 +496,9 @@ class GPUWorker:
             snapshot_path = str(candidates[-1])
 
         snapshot = DatasetSnapshot.load(snapshot_path)
+        persisted = self.storage.get_auto_tune_run(timeframe)
+        if persisted and persisted.get("phase") != "WAITING_DATA" and persisted["snapshot_hash"] != snapshot.metadata.sha256:
+            raise ValueError("Cannot resume auto run with a different snapshot")
         max_trials = int(payload.get("max_trials", 30))
         fast_dev_mode = bool(payload.get("fast_dev_mode", False))
 
@@ -552,7 +555,7 @@ class GPUWorker:
                         },
                         timeout_seconds=1200.0,
                     )
-                    self.storage.submit_job(next_spec)
+                    self.storage.submit_job(next_spec, reject_if_stopped=True)
                     logger.info("Submitted next bounded auto job '%s' (phase=%s, priority=%d)", next_job_id, current_phase, next_spec.priority)
 
                 return step_res

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import logging
+import json
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,7 +23,7 @@ import numpy as np
 
 from ..constants import get_horizon_for_timeframe, get_horizon_weights
 from ..data.snapshot import DatasetSnapshot
-from ..data.split import calculate_split_plan, extract_windows
+from ..data.split import SplitPlan, calculate_split_plan, extract_windows
 from ..eval.metrics import (
     calculate_coverage_80,
     calculate_directional_accuracy,
@@ -103,12 +104,14 @@ def run_locked_verification(
     if split_plan is None:
         # Check if storage has persisted selected_test_range or prior consumed range
         custom_test_start = None
+        custom_test_end = None
         if storage is not None and hasattr(storage, "get_auto_tune_run"):
             run_st = storage.get_auto_tune_run(timeframe)
             if run_st and run_st.get("selected_test_range_json"):
                 try:
                     s_data = json.loads(run_st["selected_test_range_json"])
                     custom_test_start = s_data.get("test_start_idx")
+                    custom_test_end = s_data.get("test_end_idx")
                 except Exception:
                     pass
 
@@ -116,6 +119,7 @@ def run_locked_verification(
             total_candles=len(snapshot.features_a),
             timeframe=timeframe,
             custom_test_start=custom_test_start,
+            custom_test_end=custom_test_end,
         )
     test_start = split_plan.test_start
     test_end = split_plan.test_end
@@ -150,18 +154,6 @@ def run_locked_verification(
                 f"for timeframe '{timeframe}' overlaps previously consumed test data in ledger. "
                 "Refusing to reuse locked exam for another candidate."
             )
-        # Atomically mark consumption before inference begins
-        storage.record_locked_consumption(
-            timeframe=timeframe,
-            test_start_idx=test_start,
-            test_end_idx=test_end,
-            test_start_time_ms=test_start_time_ms,
-            test_end_time_ms=test_end_time_ms,
-            snapshot_hash=snapshot_hash,
-            candidate_id=candidate_manifest.adapter_id,
-            verdict="IN_PROGRESS",
-            details="Locked verification initiated.",
-        )
 
     logger.info(
         "Starting locked test verification for %s [%d, %d) on candidate '%s'...",
@@ -245,6 +237,25 @@ def run_locked_verification(
     if len(common_origins) == 0:
         raise ValueError(
             f"No common forecast origins across candidate, base, and recommended models in [{test_start}, {test_end})."
+        )
+
+    # Check the same independent origins used by bootstrap before opening any labels.
+    if len(common_origins[::block_len]) < 20:
+        raise ValueError("Insufficient independent 24-hour blocks before locked consumption")
+    if is_cancelled_func is not None and is_cancelled_func():
+        raise InterruptedError("Locked verification cancelled before consumption.")
+    if storage is not None:
+        # Atomically mark consumption before inference begins
+        storage.record_locked_consumption(
+            timeframe=timeframe,
+            test_start_idx=test_start,
+            test_end_idx=test_end,
+            test_start_time_ms=test_start_time_ms,
+            test_end_time_ms=test_end_time_ms,
+            snapshot_hash=snapshot_hash,
+            candidate_id=candidate_manifest.adapter_id,
+            verdict="IN_PROGRESS",
+            details="Locked verification initiated.",
         )
 
     # Filter all context and target arrays strictly to common origins

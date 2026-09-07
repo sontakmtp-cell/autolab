@@ -647,7 +647,7 @@ def test_auto_tune_stop_and_resume_recovery(temp_dir: Path):
     assert storage.get_auto_run_state("1h") == AutoRunState.STOPPED
 
     # Start auto-run: transitions to SEARCHING
-    storage.set_auto_run_state("1h", AutoRunState.SEARCHING)
+    storage.set_auto_run_state("1h", AutoRunState.SEARCHING, allow_unstop=True)
     assert storage.get_auto_run_state("1h") == AutoRunState.SEARCHING
 
     # Enqueue an auto trial job
@@ -671,7 +671,7 @@ def test_auto_tune_stop_and_resume_recovery(temp_dir: Path):
     assert j.status == "CANCELLED"
 
     # Resume auto-run: transitions back to SEARCHING without data loss
-    storage.set_auto_run_state("1h", AutoRunState.SEARCHING)
+    storage.set_auto_run_state("1h", AutoRunState.SEARCHING, allow_unstop=True)
     assert storage.get_auto_run_state("1h") == AutoRunState.SEARCHING
 
 
@@ -1235,7 +1235,7 @@ def test_forecast_priority_interleaving_between_auto_steps(temp_dir: Path):
     assert next_auto.timeframe == "4h"
 
 
-def test_continuous_auto_recovery_and_data_wakeup(temp_dir: Path, monkeypatch):
+def test_continuous_auto_recovery_and_data_wakeup(temp_dir: Path, monkeypatch, mock_snapshot):
     """Item 2: Verifies startup auto recovery from SQLite state and 7-day new data wake-up."""
     from paxg_lab.queue.scheduler import GPUScheduler
     from paxg_lab.queue.types import JobStatus
@@ -1243,12 +1243,14 @@ def test_continuous_auto_recovery_and_data_wakeup(temp_dir: Path, monkeypatch):
     db_path = temp_dir / "recovery.db"
     scheduler = GPUScheduler(db_path=db_path, acquire_coordinator_lock=False)
 
+    real_snapshot = DatasetSnapshot.create("1h", mock_snapshot.timestamps, mock_snapshot.features_a, mock_snapshot.features_b)
+    real_path = real_snapshot.save(temp_dir / "snapshots")
     # 1. Startup recovery when state is SEARCHING but no active queued job
     scheduler.storage.set_auto_run_state("1h", AutoRunState.SEARCHING)
     scheduler.storage.save_auto_tune_run(
         timeframe="1h",
-        snapshot_path=str(temp_dir / "snapshots" / "dummy_1h"),
-        snapshot_hash="hash123",
+        snapshot_path=str(real_path),
+        snapshot_hash=real_snapshot.metadata.sha256,
         phase="TRIAL",
         current_trial=2,
     )
@@ -2014,12 +2016,8 @@ def test_cross_cycle_fresh_verification_interval_and_20_block_requirement(temp_d
     scheduler = GPUScheduler(db_path=db_path, acquire_coordinator_lock=False, snapshots_dir=snap_dir)
 
     # 2. Case A: Only +7 days (168 candles < 480 candles = 20 blocks) arrive
-    snap2_dir = snap_dir / "paxgusdt_1h_snap2"
-    snap2_dir.mkdir(parents=True, exist_ok=True)
     ts_2 = np.arange(t0, c1_test_end_ms + 168 * step_ms, step_ms, dtype=np.int64)
-    np.save(snap2_dir / "timestamps.npy", ts_2)
-    with open(snap2_dir / "metadata.json", "w", encoding="utf-8") as f:
-        json.dump({"snapshot_id": "snap2", "timeframe": "1h", "total_candles": len(ts_2)}, f)
+    DatasetSnapshot.create("1h", ts_2, np.ones((len(ts_2), 1)), np.ones((len(ts_2), 9))).save(snap_dir)
 
     scheduler._check_auto_tune_data_wakeup()
 
@@ -2027,12 +2025,8 @@ def test_cross_cycle_fresh_verification_interval_and_20_block_requirement(temp_d
     assert storage.get_auto_run_state("1h") == AutoRunState.WAITING_DATA
 
     # 3. Case B: +25 days (600 candles >= 480 candles = 20 blocks) arrive
-    snap3_dir = snap_dir / "paxgusdt_1h_snap3"
-    snap3_dir.mkdir(parents=True, exist_ok=True)
     ts_3 = np.arange(t0, c1_test_end_ms + 600 * step_ms, step_ms, dtype=np.int64)
-    np.save(snap3_dir / "timestamps.npy", ts_3)
-    with open(snap3_dir / "metadata.json", "w", encoding="utf-8") as f:
-        json.dump({"snapshot_id": "snap3", "timeframe": "1h", "total_candles": len(ts_3)}, f)
+    DatasetSnapshot.create("1h", ts_3, np.ones((len(ts_3), 1)), np.ones((len(ts_3), 9))).save(snap_dir)
 
     scheduler._check_auto_tune_data_wakeup()
 
