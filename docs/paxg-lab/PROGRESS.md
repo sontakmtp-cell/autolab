@@ -218,15 +218,13 @@ Tài liệu này theo dõi tiến độ thực hiện 8 giai đoạn (P0 đến 
 9. **Tích hợp Giao diện Web Thẻ 4 (`tab_auto_tune.py`):**
    - Hiển thị trực quan dữ liệu trials thật từ `var/paxg_lab/optuna_studies.db`.
    - Hiển thị bảng tổng hợp trials, biểu đồ tiến trình tối ưu hóa và nhật ký kiểm toán (Audit Trail) từ `var/paxg_lab/audit_reports/`.
-10. **Bằng chứng Thực nghiệm Thực tế trên NVIDIA RTX 5060 Ti:**
-    - Kịch bản `scripts/run_p6_tune.py` đã thực thi thành công một đợt tự tối ưu thật trên dữ liệu 1h của Binance PAXGUSDT (12,651 nến).
-    - Quá trình chạy qua 3 trials TPE, chọn cấu hình tốt nhất, đánh giá 3 seeds [42, 123, 2026], huấn luyện lại từ Base, phân chia 90 khối kiểm chứng 24h, tính Bootstrap 1,000 mẫu, và kích hoạt Gatekeeper đánh giá 7 tiêu chí.
-    - Kết quả: Gatekeeper từ chối chính xác ứng viên (Score v1 = 0.44 < 2.0 ngưỡng yêu cầu, CI 95% chạm âm), bảo toàn adapter hiện tại, chuyển an toàn sang `WAITING_DATA`.
-    - Bằng chứng JSON: `docs/paxg-lab/phases/p6_evidence/p6_real_run_evidence.json`.
-    - Báo cáo kiểm toán: `var/paxg_lab/audit_reports/audit_1h_paxg_1h_r8_optuna_1788690790_1788690880.json`.
-11. **Kiểm thử Tự động & Toàn vẹn Hệ thống:**
-    - Bộ 15 bài kiểm thử đơn vị & tích hợp `tests/paxg_lab/test_p6_tune.py` đạt **15/15 passed (100%)**.
-    - Toàn bộ 137 bài kiểm thử hệ thống `tests/paxg_lab/` đạt **137/137 passed (100%)** với 0 cảnh báo lỗi.
+10. **Kiểm chứng lại sau review PR #6 (07/09/2026):**
+    - Đã sửa Base/candidate dùng sai split ở vòng sau, race STOPPED, phục hồi sai snapshot, preflight gap trước khi tiêu thụ kiểm chứng và nhánh đọc JSON locked range.
+    - Chạy thật phát hiện và sửa thêm hoàn thành Optuna trial sai kiểu đối tượng, cùng lỗi sampler lặp đề xuất giữa các job.
+    - Mã nguồn `d802a42`: **223/223 test PAXG Lab + TimesFM3 qua**, CI GitHub xanh.
+    - GPU RTX 5060 Ti chạy trọn protocol: 2 cấu hình khác nhau, 3 seed × 3 fold mỗi cấu hình, final fit, 90 khối locked verification. Score -1,929513; bootstrap CI [-1,442044; 0,366126]; từ chối ứng viên đúng và về WAITING_DATA.
+    - Đây là replay lịch sử trong kho riêng với ngân sách học giảm, không cập nhật winner của ứng dụng. Không chứng minh cải thiện dự báo hoặc vận hành dài ngày.
+    - Bằng chứng cũ đã được thay thế; xem `phases/P6.md` và `phases/p6_evidence/p6_real_run_evidence.json`, kèm audit và ledger. P7 chưa thực hiện; PR chưa merge.
 
 ---
 

@@ -1,0 +1,59 @@
+{
+  "candidate_id": "paxg_1h_r16_1788776855",
+  "timeframe": "1h",
+  "current_recommended_id": null,
+  "accepted": false,
+  "verdict": "REJECTED_PRESERVE_CURRENT",
+  "check_score_improvement": false,
+  "check_mae_vs_base_and_naive": false,
+  "check_no_segment_worse_5pct": false,
+  "check_coverage_80_range": true,
+  "check_min_independent_blocks": true,
+  "check_bootstrap_ci_positive": false,
+  "check_smoke_test_and_backup": false,
+  "criteria_details": {
+    "candidate_score": -1.9295131455012937,
+    "current_recommended_score": 0.0,
+    "score_diff": -1.9295131455012937,
+    "candidate_mae": 22.23624210357666,
+    "base_mae": 21.939999643961585,
+    "naive_test_mae": null,
+    "mae_vs_base_ratio": 1.0135023912681151,
+    "mae_vs_naive_ratio": 1.127945310811226,
+    "worst_segment_mae_ratio": 1.0669983329616206,
+    "fold_ratios": {
+      "seg1": 0.9803142715799267,
+      "seg2": 0.9895915122726047,
+      "seg3": 1.0669983329616206
+    },
+    "coverage_80": 0.7332124473561067,
+    "independent_24h_blocks": 90,
+    "bootstrap_ci_95": [
+      -1.4420440730342154,
+      0.3661260421187779
+    ]
+  },
+  "reasons": [
+    "Score v1 improvement insufficient: candidate score -1.93 vs current 0.00 (diff -1.93 < +2.0 required).",
+    "MAE improvement insufficient (< 1% better): vs base=1.014 (req <= 0.99), vs naive=1.128 (req <= 0.99).",
+    "One or more validation segments worse than base by > 5%: max ratio=1.067 > 1.05.",
+    "95% block bootstrap CI lower bound not strictly positive: -1.4420 <= 0."
+  ],
+  "bootstrap_summary": {
+    "timeframe": "1h",
+    "block_size_candles": 24,
+    "num_blocks": 90,
+    "candidate_weighted_mae": 24.929603633174192,
+    "baseline_weighted_mae": 24.402952293113426,
+    "baseline_name": "TimesFM3-Base",
+    "mean_improvement_usdt": -0.5266513400607639,
+    "relative_improvement_pct": -2.1581460051839145,
+    "ci_95_lower": -1.4420440730342154,
+    "ci_95_upper": 0.3661260421187779,
+    "is_significant_positive": false,
+    "num_resamples": 1000
+  },
+  "backup_zip_path": null,
+  "audit_report_path": "D:\\AI\\timesfm_b\\var\\paxg_lab\\p6_review_1788776346390792900\\audit_reports\\audit_1h_paxg_1h_r16_1788776855_1788776899.json",
+  "evaluated_at": 1788776899.6914148
+}

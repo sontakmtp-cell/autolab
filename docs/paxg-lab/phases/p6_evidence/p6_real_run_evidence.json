@@ -1,8 +1,20 @@
 {
   "phase": "P6",
   "timeframe": "1h",
-  "timestamp": 1788690451.3568065,
+  "timestamp": 1788776899.819216,
   "device": "NVIDIA GeForce RTX 5060 Ti",
+  "source_head_commit": "d802a42bff7fd57d7d4294dcbf8c47d84279562a",
+  "pipeline": "AutonomousTuningProtocol.run_tuning_cycle",
+  "run_budget": {
+    "max_trials": 2,
+    "max_epochs_cap": 2,
+    "fast_dev_mode": true,
+    "trial_epochs": 1,
+    "trial_samples_per_epoch": 64,
+    "final_samples_per_epoch": 128
+  },
+  "scope": "Real GPU historical replay in isolated storage; not a new live verification or production recommendation",
+  "run_directory": "D:\\AI\\timesfm_b\\var\\paxg_lab\\p6_review_1788776346390792900",
   "steps": {
     "step1_snapshot": {
       "snapshot_id": "paxgusdt_1h_1743073200000_1788613200000_837c9ee8",
@@ -18,181 +30,259 @@
       "test_candles": 2160,
       "eval_folds_count": 3
     },
-    "step3_base_reference": {
-      "overall_weighted_mae": 25.017024278640747,
-      "overall_weighted_pinball": 10.333677859855074,
-      "coverage_80": 0.7593456081619641
-    },
-    "step4_optuna_search": {
+    "step3_protocol_run": {
       "study_name": "study_1h_837c9ee8",
-      "total_trials": 4,
-      "best_trial_number": 3,
-      "best_trial_score": 0.43969474639857786,
-      "best_params": {
+      "total_trials": 2,
+      "best_trial_number": 1,
+      "best_trial_params": {
         "context_len": 256,
-        "lora_r": 8,
-        "learning_rate": 6.373925021896197e-05,
-        "lora_dropout": 0.05,
-        "weight_decay": 0.02,
+        "lora_r": 16,
+        "learning_rate": 7.355350065310278e-05,
+        "lora_dropout": 0.1,
+        "weight_decay": 0.0,
         "feature_set": "B",
-        "history_days": 365,
+        "history_days": 180,
         "target_modules_group": "setB"
       },
-      "trials_log": [
+      "multi_seed_summary": {
+        "seeds": [
+          42,
+          123,
+          2026
+        ],
+        "scores": [
+          0.44130031167902706,
+          0.4364002250190735,
+          0.4320936072688797
+        ],
+        "best_epochs": [
+          1,
+          1,
+          1
+        ],
+        "median_score": 0.4364002250190735,
+        "median_best_epoch": 1
+      },
+      "top_configs": [
         {
-          "trial_number": 0,
-          "score_v1": 0.4295138508416674,
-          "weighted_mae": 24.746854321161905,
-          "coverage_80": 0.7746293639406981,
+          "timeframe": "1h",
+          "horizon": 24,
+          "feature_set": "B",
+          "context_len": 256,
+          "lora_r": 16,
+          "lora_alpha": 32,
+          "lora_dropout": 0.1,
+          "learning_rate": 7.355350065310278e-05,
+          "max_epochs": 10,
+          "batch_size": 2,
+          "gradient_accumulation_steps": 8,
+          "weight_decay": 0.0,
+          "early_stopping_patience": 3,
+          "grad_clip_norm": 1.0,
+          "history_days": 180,
+          "seed": 42,
+          "extended_targets": false,
+          "custom_targets": null,
+          "max_samples_per_epoch": 1024,
+          "warmup_ratio": 0.1
+        },
+        {
+          "timeframe": "1h",
+          "horizon": 24,
+          "feature_set": "B",
+          "context_len": 256,
           "lora_r": 4,
-          "lr": 1.1900590783184243e-05,
-          "context_len": 256
-        },
-        {
-          "trial_number": 1,
-          "score_v1": 0.43162146736822615,
-          "weighted_mae": 24.746066856384275,
-          "coverage_80": 0.7746692172804082,
-          "lora_r": 8,
-          "lr": 2.3993242906812688e-05,
-          "context_len": 256
-        },
-        {
-          "trial_number": 2,
-          "score_v1": 0.4300627761822051,
-          "weighted_mae": 24.746637725830077,
-          "coverage_80": 0.7746293639406981,
-          "lora_r": 8,
-          "lr": 1.5817992118051935e-05,
-          "context_len": 256
-        },
-        {
-          "trial_number": 3,
-          "score_v1": 0.43969474639857786,
-          "weighted_mae": 24.74309962590535,
-          "coverage_80": 0.7747887772995377,
-          "lora_r": 8,
-          "lr": 6.373925021896197e-05,
-          "context_len": 256
-        },
-        {
-          "trial_number": 3,
-          "score_v1": 0.43969474639857786,
-          "weighted_mae": 24.74309962590535,
-          "coverage_80": 0.7747887772995377,
-          "lora_r": 8,
-          "lr": 6.373925021896197e-05,
-          "context_len": 256
-        },
-        {
-          "trial_number": 3,
-          "score_v1": 0.43566002934581904,
-          "weighted_mae": 24.744562800725298,
-          "coverage_80": 0.7746492906105532,
-          "lora_r": 8,
-          "lr": 6.373925021896197e-05,
-          "context_len": 256
-        },
-        {
-          "trial_number": 3,
-          "score_v1": 0.43525658340339834,
-          "weighted_mae": 24.745128313700356,
-          "coverage_80": 0.774669217280408,
-          "lora_r": 8,
-          "lr": 6.373925021896197e-05,
-          "context_len": 256
+          "lora_alpha": 8,
+          "lora_dropout": 0.2,
+          "learning_rate": 1.1900590783184243e-05,
+          "max_epochs": 10,
+          "batch_size": 2,
+          "gradient_accumulation_steps": 8,
+          "weight_decay": 0.03,
+          "early_stopping_patience": 3,
+          "grad_clip_norm": 1.0,
+          "history_days": 180,
+          "seed": 42,
+          "extended_targets": true,
+          "custom_targets": null,
+          "max_samples_per_epoch": 1024,
+          "warmup_ratio": 0.1
         }
-      ]
-    },
-    "step5_multi_seed": {
-      "seeds": [
-        42,
-        123,
-        2026
       ],
-      "scores": [
-        0.43969474639857786,
-        0.43566002934581904,
-        0.43525658340339834
-      ],
-      "median_score": 0.43566002934581904
-    },
-    "step6_final_candidate": {
-      "adapter_id": "paxg_1h_r8_optuna_1788690790",
-      "path": "D:\\AI\\timesfm_b\\var\\paxg_lab\\adapters\\paxg_1h_r8_optuna_1788690790",
-      "train_candles": 10467,
-      "is_verified_initial": false
-    },
-    "step8_bootstrap": {
-      "timeframe": "1h",
-      "block_size_candles": 24,
-      "num_blocks": 89,
-      "candidate_weighted_mae": 22.23520552242516,
-      "baseline_weighted_mae": 21.94685225599491,
-      "mean_improvement_usdt": -0.2883532664302577,
-      "relative_improvement_pct": -1.3138707230850948,
-      "ci_95_lower": -0.7896800969541067,
-      "ci_95_upper": 0.21461418760905587,
-      "is_significant_positive": false,
-      "num_resamples": 1000
-    },
-    "step9_gatekeeper": {
-      "candidate_id": "paxg_1h_r8_optuna_1788690790",
-      "timeframe": "1h",
-      "current_recommended_id": null,
-      "accepted": false,
-      "verdict": "REJECTED_PRESERVE_CURRENT",
-      "check_score_improvement": false,
-      "check_mae_vs_base_and_naive": false,
-      "check_no_segment_worse_5pct": true,
-      "check_coverage_80_range": true,
-      "check_min_independent_blocks": true,
-      "check_bootstrap_ci_positive": false,
-      "check_smoke_test_and_backup": false,
-      "criteria_details": {
-        "candidate_score": 0.4404003227303721,
-        "current_recommended_score": 0.0,
-        "score_diff": 0.4404003227303721,
-        "candidate_mae": 24.743115139007568,
-        "base_mae": 25.017024278640747,
-        "naive_test_mae": 19.71393638543007,
-        "mae_vs_base_ratio": 0.9890510903062504,
-        "mae_vs_naive_ratio": 1.2551077905118126,
-        "worst_segment_mae_ratio": 1.0086339954495023,
-        "fold_ratios": {
-          "1": 0.9746229219046336,
-          "2": 1.0086339954495023,
-          "3": 0.9961732463476397,
-          "test_locked": 1.0
+      "multi_seed_evaluations": [
+        {
+          "config_idx": 0,
+          "seed_scores": {
+            "42": 0.44130031167902706,
+            "123": 0.4364002250190735,
+            "2026": 0.4320936072688797
+          },
+          "seed_best_epochs": {
+            "42": 1,
+            "123": 1,
+            "2026": 1
+          },
+          "current_fold_losses": [],
+          "current_best_epochs": [],
+          "current_val_losses": []
         },
-        "coverage_80": 0.7747688506296827,
-        "independent_24h_blocks": 89,
-        "bootstrap_ci_95": [
-          -0.7896800969541067,
-          0.21461418760905587
-        ]
-      },
-      "reasons": [
-        "Score v1 improvement insufficient: candidate score 0.44 vs current 0.00 (diff +0.44 < +2.0 required).",
-        "MAE improvement insufficient (< 1% better): vs base=0.989 (req <= 0.99), vs naive=1.255 (req <= 0.99).",
-        "95% block bootstrap CI lower bound not strictly positive: -0.7897 <= 0."
+        {
+          "config_idx": 1,
+          "seed_scores": {
+            "42": 0.4281193545675577,
+            "123": 0.42795033949198924
+          },
+          "seed_best_epochs": {
+            "42": 1,
+            "123": 1
+          },
+          "current_fold_losses": [
+            0.975446908274485,
+            1.0060433560041935
+          ],
+          "current_best_epochs": [
+            1,
+            1
+          ],
+          "current_val_losses": [
+            0.01169302687048912,
+            0.01247587955491971
+          ]
+        }
       ],
-      "bootstrap_summary": {
+      "selected_spec": {
         "timeframe": "1h",
-        "block_size_candles": 24,
-        "num_blocks": 89,
-        "candidate_weighted_mae": 22.23520552242516,
-        "baseline_weighted_mae": 21.94685225599491,
-        "mean_improvement_usdt": -0.2883532664302577,
-        "relative_improvement_pct": -1.3138707230850948,
-        "ci_95_lower": -0.7896800969541067,
-        "ci_95_upper": 0.21461418760905587,
-        "is_significant_positive": false,
-        "num_resamples": 1000
+        "horizon": 24,
+        "feature_set": "B",
+        "context_len": 256,
+        "lora_r": 16,
+        "lora_alpha": 32,
+        "lora_dropout": 0.1,
+        "learning_rate": 7.355350065310278e-05,
+        "max_epochs": 10,
+        "batch_size": 2,
+        "gradient_accumulation_steps": 8,
+        "weight_decay": 0.0,
+        "early_stopping_patience": 3,
+        "grad_clip_norm": 1.0,
+        "history_days": 180,
+        "seed": 42,
+        "extended_targets": false,
+        "custom_targets": null,
+        "max_samples_per_epoch": 1024,
+        "warmup_ratio": 0.1
       },
-      "backup_zip_path": null,
-      "audit_report_path": "D:\\AI\\timesfm_b\\var\\paxg_lab\\audit_reports\\audit_1h_paxg_1h_r8_optuna_1788690790_1788690880.json",
-      "evaluated_at": 1788690880.592867
+      "final_candidate_id": "paxg_1h_r16_1788776855",
+      "test_score_report": {
+        "timeframe": "1h",
+        "candidate_id": "paxg_1h_r16_1788776855",
+        "test_start_idx": 10491,
+        "test_end_idx": 12651,
+        "score_v1": -1.9295131455012937,
+        "current_recommended_score": 0.0,
+        "score_diff": -1.9295131455012937,
+        "candidate_weighted_mae": 22.23624210357666,
+        "base_weighted_mae": 21.939999643961585,
+        "naive_weighted_mae": 19.71393638543007,
+        "baseline_weighted_mae": 21.939999643961585,
+        "baseline_name": "TimesFM3-Base",
+        "mae_vs_base_ratio": 1.0135023912681151,
+        "mae_vs_naive_ratio": 1.127945310811226,
+        "segment_mae_ratios": {
+          "seg1": 0.9803142715799267,
+          "seg2": 0.9895915122726047,
+          "seg3": 1.0669983329616206
+        },
+        "worst_segment_ratio": 1.0669983329616206,
+        "coverage_80": 0.7332124473561067,
+        "mean_width_80": 84.18521118164062,
+        "directional_accuracy": 0.4791369715903544,
+        "independent_24h_blocks": 90,
+        "bootstrap_result": {
+          "timeframe": "1h",
+          "block_size_candles": 24,
+          "num_blocks": 90,
+          "candidate_weighted_mae": 24.929603633174192,
+          "baseline_weighted_mae": 24.402952293113426,
+          "baseline_name": "TimesFM3-Base",
+          "mean_improvement_usdt": -0.5266513400607639,
+          "relative_improvement_pct": -2.1581460051839145,
+          "ci_95_lower": -1.4420440730342154,
+          "ci_95_upper": 0.3661260421187779,
+          "is_significant_positive": false,
+          "num_resamples": 1000
+        },
+        "step_maes": {
+          "1": 6.9886274337768555,
+          "6": 19.087631225585938,
+          "12": 29.344133377075195,
+          "24": 47.719688415527344
+        },
+        "num_windows": 2137,
+        "candidate_predictions_count": 2137,
+        "targets_count": 2137
+      },
+      "decision": {
+        "candidate_id": "paxg_1h_r16_1788776855",
+        "timeframe": "1h",
+        "current_recommended_id": null,
+        "accepted": false,
+        "verdict": "REJECTED_PRESERVE_CURRENT",
+        "check_score_improvement": false,
+        "check_mae_vs_base_and_naive": false,
+        "check_no_segment_worse_5pct": false,
+        "check_coverage_80_range": true,
+        "check_min_independent_blocks": true,
+        "check_bootstrap_ci_positive": false,
+        "check_smoke_test_and_backup": false,
+        "criteria_details": {
+          "candidate_score": -1.9295131455012937,
+          "current_recommended_score": 0.0,
+          "score_diff": -1.9295131455012937,
+          "candidate_mae": 22.23624210357666,
+          "base_mae": 21.939999643961585,
+          "naive_test_mae": null,
+          "mae_vs_base_ratio": 1.0135023912681151,
+          "mae_vs_naive_ratio": 1.127945310811226,
+          "worst_segment_mae_ratio": 1.0669983329616206,
+          "fold_ratios": {
+            "seg1": 0.9803142715799267,
+            "seg2": 0.9895915122726047,
+            "seg3": 1.0669983329616206
+          },
+          "coverage_80": 0.7332124473561067,
+          "independent_24h_blocks": 90,
+          "bootstrap_ci_95": [
+            -1.4420440730342154,
+            0.3661260421187779
+          ]
+        },
+        "reasons": [
+          "Score v1 improvement insufficient: candidate score -1.93 vs current 0.00 (diff -1.93 < +2.0 required).",
+          "MAE improvement insufficient (< 1% better): vs base=1.014 (req <= 0.99), vs naive=1.128 (req <= 0.99).",
+          "One or more validation segments worse than base by > 5%: max ratio=1.067 > 1.05.",
+          "95% block bootstrap CI lower bound not strictly positive: -1.4420 <= 0."
+        ],
+        "bootstrap_summary": {
+          "timeframe": "1h",
+          "block_size_candles": 24,
+          "num_blocks": 90,
+          "candidate_weighted_mae": 24.929603633174192,
+          "baseline_weighted_mae": 24.402952293113426,
+          "baseline_name": "TimesFM3-Base",
+          "mean_improvement_usdt": -0.5266513400607639,
+          "relative_improvement_pct": -2.1581460051839145,
+          "ci_95_lower": -1.4420440730342154,
+          "ci_95_upper": 0.3661260421187779,
+          "is_significant_positive": false,
+          "num_resamples": 1000
+        },
+        "backup_zip_path": null,
+        "audit_report_path": "D:\\AI\\timesfm_b\\var\\paxg_lab\\p6_review_1788776346390792900\\audit_reports\\audit_1h_paxg_1h_r16_1788776855_1788776899.json",
+        "evaluated_at": 1788776899.6914148
+      },
+      "resulting_auto_state": "WAITING_DATA",
+      "finished_at": 1788776899.8063293
     }
   }
 }
