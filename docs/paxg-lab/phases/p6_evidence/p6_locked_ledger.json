@@ -1,0 +1,15 @@
+[
+  {
+    "id": 1,
+    "timeframe": "1h",
+    "test_start_idx": 10491,
+    "test_end_idx": 12651,
+    "test_start_time_ms": 1780840800000,
+    "test_end_time_ms": 1788616800000,
+    "snapshot_hash": "837c9ee88b61494ff9512561051092ec53f22e07008b9bea4b6ac16af7dabff0",
+    "candidate_id": "paxg_1h_r16_1788787228",
+    "consumed_at": 1788787239.3304,
+    "verdict": "REJECTED_PRESERVE_CURRENT",
+    "details": "Gatekeeper verdict: REJECTED_PRESERVE_CURRENT. Reasons: Score v1 improvement insufficient: candidate score -1.93 vs current 0.00 (diff -1.93 < +2.0 required).; MAE improvement insufficient (< 1% better): vs base=1.014 (req <= 0.99), vs naive=1.128 (req <= 0.99).; One or more validation segments worse than base by > 5%: max ratio=1.067 > 1.05.; 95% block bootstrap CI lower bound not strictly positive: -1.4420 <= 0."
+  }
+]

@@ -16,7 +16,7 @@ from ..constants import (
 )
 from ..data.features import FEATURE_SPECS
 from ..data.snapshot import DatasetSnapshot
-from ..data.split import calculate_split_plan, extract_windows
+from ..data.split import SplitPlan, calculate_split_plan, extract_windows
 from ..model.manifest import AdapterManifest
 from .metrics import (
     calculate_coverage_80,
@@ -271,6 +271,7 @@ class BacktestEngine:
         custom_predictor_fn: Callable[[np.ndarray, int], tuple[np.ndarray, np.ndarray]] | None = None,
         adapter_manifest: AdapterManifest | None = None,
         progress_callback: Callable[[dict[str, Any]], bool | None] | None = None,
+        split_plan: SplitPlan | None = None,
     ) -> ScoreReport:
         """Runs backtest across evaluation folds (and optionally test lock set).
 
@@ -310,7 +311,8 @@ class BacktestEngine:
         targets = snapshot.features_a[:, 0]
         timestamps = snapshot.timestamps
 
-        split_plan = calculate_split_plan(total_candles=len(features), timeframe=timeframe)
+        if split_plan is None:
+            split_plan = calculate_split_plan(total_candles=len(features), timeframe=timeframe)
 
         logger.info("Running backtest for %s on %s (%d total candles)...", model_name, timeframe, len(features))
 

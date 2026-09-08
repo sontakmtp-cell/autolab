@@ -279,9 +279,11 @@ class AdapterStore:
                 if item.is_file():
                     file_hashes[item.name] = compute_file_sha256(item)
 
-            # 3. Update manifest with hashes and save paxg_manifest.json
+            # 3. Update manifest with hashes and save paxg_manifest.json.
+            # `is_verified` is a statistical acceptance flag, so preserve the
+            # caller's value here.  A candidate is only verified by the
+            # gatekeeper after it passes the locked test.
             manifest.file_hashes = file_hashes
-            manifest.is_verified = True
             manifest_path = temp_dir / "paxg_manifest.json"
             manifest.save_json(manifest_path)
 
@@ -306,7 +308,7 @@ class AdapterStore:
             logger.info("Atomically promoting %s to %s...", temp_dir.name, target_dir.name)
             # On Windows, os.replace performs atomic replace on same volume
             os.replace(temp_dir, target_dir)
-            logger.info("Successfully saved and verified adapter '%s'.", adapter_id)
+            logger.info("Successfully saved adapter '%s'.", adapter_id)
             return target_dir
 
         except Exception as exc:
@@ -314,6 +316,145 @@ class AdapterStore:
             if temp_dir.exists():
                 shutil.rmtree(temp_dir, ignore_errors=True)
             raise
+
+    def stage_verified_adapter(self, adapter_id: str) -> Path:
+        """Build and validate a verified adapter copy without touching the candidate."""
+        target_dir = self.get_adapter_path(adapter_id)
+        if not target_dir.is_dir():
+            raise FileNotFoundError(f"Adapter '{adapter_id}' not found at {target_dir}")
+
+        stamp = time.time_ns()
+        staged_dir = self.base_dir / f".tmp_verify_{adapter_id}_{stamp}"
+
+        try:
+            # Existing checksums are part of the candidate's immutable input.
+            # A corrupt sidecar must fail closed; only a missing sidecar is
+            # tolerated for legacy test fixtures and is generated in the stage.
+            if (target_dir / CHECKSUMS_FILENAME).is_file():
+                self._verify_checksum_sidecar(target_dir)
+            shutil.copytree(target_dir, staged_dir)
+            manifest_path = staged_dir / "paxg_manifest.json"
+            manifest = AdapterManifest.load_json(manifest_path)
+            manifest.is_verified = True
+
+            file_hashes: dict[str, str] = {}
+            for item in sorted(staged_dir.iterdir()):
+                if item.is_file() and item.name not in ("paxg_manifest.json", CHECKSUMS_FILENAME):
+                    file_hashes[item.name] = compute_file_sha256(item)
+            manifest.file_hashes = file_hashes
+            manifest.save_json(manifest_path)
+
+            checksums_path = staged_dir / CHECKSUMS_FILENAME
+            with open(checksums_path, "w", encoding="utf-8") as f:
+                for item in sorted(staged_dir.iterdir()):
+                    if item.is_file() and item.name != CHECKSUMS_FILENAME:
+                        f.write(f"{compute_file_sha256(item)}  {item.name}\n")
+
+            # Verify the staged artifact before changing the canonical path.
+            self._verify_checksum_sidecar(staged_dir)
+            return staged_dir
+        except Exception:
+            if staged_dir.exists():
+                shutil.rmtree(staged_dir, ignore_errors=True)
+            raise
+
+    def promote_staged_adapter(self, adapter_id: str, staged_dir: str | Path) -> Path:
+        """Swap a previously validated stage into place and return old contents."""
+        target_dir = self.get_adapter_path(adapter_id)
+        stage_path = Path(staged_dir)
+        if not stage_path.is_dir():
+            raise FileNotFoundError(f"Verification stage not found: {stage_path}")
+
+        rollback_dir = self.base_dir / f".tmp_verify_old_{adapter_id}_{time.time_ns()}"
+        moved_target = False
+        try:
+            os.replace(target_dir, rollback_dir)
+            moved_target = True
+            try:
+                os.replace(stage_path, target_dir)
+            except Exception:
+                os.replace(rollback_dir, target_dir)
+                moved_target = False
+                raise
+            return rollback_dir
+        except Exception:
+            if stage_path.exists():
+                shutil.rmtree(stage_path, ignore_errors=True)
+            if moved_target and rollback_dir.exists() and not target_dir.exists():
+                os.replace(rollback_dir, target_dir)
+            elif rollback_dir.exists() and target_dir.exists():
+                # Keep the old candidate recoverable if the swap failed after
+                # the target path was restored.
+                logger.error("Verification promotion failed; old adapter remains at %s", rollback_dir)
+            raise
+
+    def rollback_verified_adapter(self, adapter_id: str, rollback_dir: str | Path) -> None:
+        """Restore the adapter saved by :meth:`promote_staged_adapter`."""
+        target_dir = self.get_adapter_path(adapter_id)
+        rollback_path = Path(rollback_dir)
+        if not rollback_path.is_dir():
+            raise FileNotFoundError(f"Verification rollback directory not found: {rollback_path}")
+
+        failed_dir = self.base_dir / f".tmp_verify_failed_{adapter_id}_{time.time_ns()}"
+        try:
+            if target_dir.exists():
+                os.replace(target_dir, failed_dir)
+            os.replace(rollback_path, target_dir)
+        except Exception:
+            # Keep both copies if recovery itself fails; a later operator can
+            # restore the exact old directory instead of losing it.
+            if failed_dir.exists() and not target_dir.exists():
+                try:
+                    os.replace(failed_dir, target_dir)
+                except Exception:
+                    logger.error("Could not restore candidate from %s", failed_dir)
+            raise
+        if failed_dir.exists():
+            shutil.rmtree(failed_dir, ignore_errors=True)
+
+    @staticmethod
+    def discard_verification_backup(rollback_dir: str | Path) -> None:
+        """Remove a successful promotion's temporary rollback copy."""
+        backup_path = Path(rollback_dir)
+        if backup_path.exists():
+            shutil.rmtree(backup_path, ignore_errors=True)
+
+    @staticmethod
+    def _verify_checksum_sidecar(adapter_dir: Path) -> None:
+        checksums_path = adapter_dir / CHECKSUMS_FILENAME
+        verified_count = 0
+        listed_names: set[str] = set()
+        with open(checksums_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split(maxsplit=1)
+                if len(parts) != 2:
+                    continue
+                expected_hash, file_name = parts
+                relative_name = Path(file_name)
+                if relative_name.is_absolute() or ".." in relative_name.parts or relative_name.name != file_name:
+                    raise RuntimeError(f"Invalid checksum filename '{file_name}'")
+                if file_name in listed_names:
+                    raise RuntimeError(f"Duplicate checksum entry for '{file_name}'")
+                listed_names.add(file_name)
+                file_path = adapter_dir / relative_name
+                if not file_path.is_file():
+                    raise FileNotFoundError(f"Checksum entry references missing file '{file_name}'")
+                if compute_file_sha256(file_path) != expected_hash:
+                    raise RuntimeError(f"Checksum mismatch for '{file_name}'")
+                verified_count += 1
+        if verified_count == 0:
+            raise RuntimeError(f"Checksum sidecar '{checksums_path}' contains no entries")
+        actual_names = {
+            item.name
+            for item in adapter_dir.iterdir()
+            if item.is_file() and item.name != CHECKSUMS_FILENAME
+        }
+        if listed_names != actual_names:
+            missing = sorted(actual_names - listed_names)
+            uncovered = sorted(listed_names - actual_names)
+            raise RuntimeError(
+                f"Checksum sidecar coverage mismatch: missing={missing}, uncovered={uncovered}"
+            )
 
     def _run_smoke_test(
         self,
@@ -593,6 +734,10 @@ class AdapterStore:
         """
         if self.db_path is None:
             return
+        # Auto-detect parameter order if passed as (timeframe, adapter_id)
+        if adapter_id.lower().strip() in ("1h", "4h") and timeframe.lower().strip() not in ("1h", "4h"):
+            adapter_id, timeframe = timeframe, adapter_id
+
         tf = timeframe.lower().strip()
         now = time.time()
         with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
@@ -688,9 +833,15 @@ class AdapterStore:
                 items.append(d.name)
         return items
 
-    def export_adapter_zip(self, adapter_id: str, export_zip_path: str | Path) -> Path:
+    def export_adapter_zip(self, adapter_id: str | Path, export_zip_path: str | Path) -> Path:
         """Safely exports adapter files to a zip archive, strictly excluding any executable code."""
-        target = self.get_adapter_path(adapter_id)
+        if isinstance(adapter_id, Path):
+            target = adapter_id.resolve()
+            base_dir = self.base_dir.resolve()
+            if target.parent != base_dir or not target.name.startswith(".tmp_verify_"):
+                raise ValueError("Staged export path must be a direct verification child of the adapter store")
+        else:
+            target = self.get_adapter_path(adapter_id)
         if not target.is_dir():
             raise FileNotFoundError(f"Adapter '{adapter_id}' not found at {target}")
 

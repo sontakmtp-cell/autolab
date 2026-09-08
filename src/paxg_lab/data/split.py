@@ -36,35 +36,50 @@ class SplitPlan:
 def calculate_split_plan(
     total_candles: int,
     timeframe: str = "1h",
+    custom_test_start: int | None = None,
+    custom_test_end: int | None = None,
 ) -> SplitPlan:
     """Calculates leak-free temporal split boundaries according to plan specification.
 
     Specification:
-      - 90 days test (locked verification)
-      - 90 days prior split into 3 evaluation folds (30 days each)
+      - 90 days test (locked verification) or custom fresh interval (>= 20 blocks)
+      - Evaluation history prior to test split into 3 evaluation folds
       - Prior to each evaluation fold is training, with last 14 days for early stopping
       - Purge buffer between segments equals the timeframe horizon (24 for 1h, 6 for 4h)
     """
     horizon = get_horizon_for_timeframe(timeframe)
     candles_per_day = 24 if timeframe == "1h" else 6
 
-    test_len = 90 * candles_per_day
-    eval_fold_len = 30 * candles_per_day
-    early_stop_len = 14 * candles_per_day
-    total_eval_len = 3 * eval_fold_len  # 90 days
+    if custom_test_start is not None:
+        test_start = int(custom_test_start)
+        test_end = int(custom_test_end) if custom_test_end is not None else total_candles
+        eval_fold_len = 30 * candles_per_day
+        early_stop_len = 14 * candles_per_day
+        total_eval_len = 3 * eval_fold_len
+        eval_available = test_start - horizon
+        if eval_available < total_eval_len + early_stop_len:
+            scale_ratio = max(eval_available / (total_eval_len + early_stop_len + horizon), 0.2)
+            eval_fold_len = max(int(eval_fold_len * scale_ratio), 5 * candles_per_day)
+            early_stop_len = max(int(early_stop_len * scale_ratio), 2 * candles_per_day)
+            total_eval_len = 3 * eval_fold_len
+        eval_total_start = max(0, test_start - total_eval_len)
+    else:
+        test_len = 90 * candles_per_day
+        eval_fold_len = 30 * candles_per_day
+        early_stop_len = 14 * candles_per_day
+        total_eval_len = 3 * eval_fold_len  # 90 days
 
-    min_required = test_len + total_eval_len + early_stop_len + 2 * horizon
-    if total_candles < min_required:
-        # If total history is shorter, scale proportionally while preserving rules
-        scale_ratio = total_candles / min_required
-        test_len = max(int(test_len * scale_ratio), 30 * candles_per_day)
-        eval_fold_len = max(int(eval_fold_len * scale_ratio), 10 * candles_per_day)
-        early_stop_len = max(int(early_stop_len * scale_ratio), 5 * candles_per_day)
+        min_required = test_len + total_eval_len + early_stop_len + 2 * horizon
+        if total_candles < min_required:
+            # If total history is shorter, scale proportionally while preserving rules
+            scale_ratio = total_candles / min_required
+            test_len = max(int(test_len * scale_ratio), 30 * candles_per_day)
+            eval_fold_len = max(int(eval_fold_len * scale_ratio), 10 * candles_per_day)
+            early_stop_len = max(int(early_stop_len * scale_ratio), 5 * candles_per_day)
 
-    test_start = total_candles - test_len
-    test_end = total_candles
-
-    eval_total_start = test_start - (3 * eval_fold_len)
+        test_start = total_candles - test_len
+        test_end = total_candles
+        eval_total_start = test_start - (3 * eval_fold_len)
 
     folds = []
     for f in range(3):
@@ -101,6 +116,61 @@ def calculate_split_plan(
         test_start=test_start,
         test_end=test_end,
     )
+
+
+def _resolve_interval_ms(timeframe: str | None, expected_interval_ms: int | None) -> int:
+    if expected_interval_ms is not None:
+        return int(expected_interval_ms)
+    if timeframe is None:
+        raise ValueError(
+            "extract_windows requires either 'timeframe' ('1h', '4h') or 'expected_interval_ms' "
+            "to validate interval continuity."
+        )
+    if timeframe == "1h":
+        return 3600 * 1000
+    if timeframe == "4h":
+        return 4 * 3600 * 1000
+    raise ValueError(f"Unsupported timeframe '{timeframe}'. Expected '1h' or '4h'.")
+
+
+def eligible_origins_from_timestamps(
+    timestamps: np.ndarray | list[int],
+    context_len: int,
+    horizon: int,
+    start_idx: int,
+    end_idx: int,
+    step: int = 1,
+    timeframe: str | None = None,
+    expected_interval_ms: int | None = None,
+) -> list[int]:
+    """Return origins whose full context and target windows are timestamp-contiguous.
+
+    This mirrors ``extract_windows``' first-target bounds and gap filtering without
+    reading feature or target arrays, so callers can preflight a locked interval.
+    """
+    ts_array = np.asarray(timestamps, dtype=np.int64)
+    total_len = len(ts_array)
+
+    min_origin = max(context_len - 1, start_idx - 1)
+    max_origin = min(end_idx - horizon - 1, total_len - horizon - 1)
+    if min_origin > max_origin or total_len < context_len + horizon:
+        return []
+
+    step_ms = _resolve_interval_ms(timeframe, expected_interval_ms)
+    bad_gap_indices: np.ndarray | None = None
+    if len(ts_array) > 1:
+        bad_gap_indices = np.where(np.diff(ts_array) != step_ms)[0]
+
+    origins: list[int] = []
+    for origin in range(min_origin, max_origin + 1, step):
+        window_start = origin - context_len + 1
+        window_end = origin + 1 + horizon
+        if bad_gap_indices is not None and len(bad_gap_indices) > 0:
+            gap_idx = np.searchsorted(bad_gap_indices, window_start)
+            if gap_idx < len(bad_gap_indices) and bad_gap_indices[gap_idx] < window_end - 1:
+                continue
+        origins.append(origin)
+    return origins
 
 
 def extract_windows(
@@ -162,44 +232,29 @@ def extract_windows(
             "Cannot extract windows without timestamp continuity validation."
         )
 
-    if timeframe is None and expected_interval_ms is None:
-        raise ValueError(
-            "extract_windows requires either 'timeframe' ('1h', '4h') or 'expected_interval_ms' "
-            "to validate interval continuity."
-        )
-
-    if expected_interval_ms is not None:
-        step_ms = expected_interval_ms
-    elif timeframe == "1h":
-        step_ms = 3600 * 1000
-    elif timeframe == "4h":
-        step_ms = 4 * 3600 * 1000
-    else:
-        raise ValueError(f"Unsupported timeframe '{timeframe}'. Expected '1h' or '4h'.")
-
     ts_array = np.asarray(timestamps, dtype=np.int64)
     if len(ts_array) != total_len:
         raise ValueError(f"timestamps length ({len(ts_array)}) must match features length ({total_len})")
 
-    bad_gap_indices: np.ndarray | None = None
-    if len(ts_array) > 1:
-        diffs = np.diff(ts_array)
-        bad_gap_indices = np.where(diffs != step_ms)[0]
+    origins = eligible_origins_from_timestamps(
+        timestamps=ts_array,
+        context_len=context_len,
+        horizon=horizon,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        step=step,
+        timeframe=timeframe,
+        expected_interval_ms=expected_interval_ms,
+    )
 
     contexts = []
     futures = []
+    eligible_origins = origins
     origins = []
 
-    for origin in range(min_origin, max_origin + 1, step):
+    for origin in eligible_origins:
         w_start = origin - context_len + 1
         w_end = origin + 1 + horizon
-
-        # Check timestamp continuity across full window (context + horizon)
-        if ts_array is not None and step_ms is not None and bad_gap_indices is not None and len(bad_gap_indices) > 0:
-            # Check if any gap transition falls within [w_start, w_end - 1)
-            idx = np.searchsorted(bad_gap_indices, w_start)
-            if idx < len(bad_gap_indices) and bad_gap_indices[idx] < w_end - 1:
-                continue
 
         ctx_slice = features[w_start : origin + 1]
         fut_slice = targets_1d[origin + 1 : w_end]

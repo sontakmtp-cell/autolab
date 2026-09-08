@@ -200,10 +200,39 @@ class DatasetSnapshot:
         features_b = data["features_b"]
         features_c = data["features_c"] if "features_c" in data else None
 
-        return cls(
+        snapshot = cls(
             metadata=metadata,
             timestamps=timestamps,
             features_a=features_a,
             features_b=features_b,
             features_c=features_c,
         )
+
+        snapshot.source_path = str(s_dir.resolve())
+        return snapshot
+
+    @classmethod
+    def load_timestamps(cls, snapshot_dir: str | Path, verify_hash: bool = True) -> np.ndarray:
+        """Loads only timestamps while preserving the snapshot hash check."""
+        s_dir = Path(snapshot_dir)
+        meta_path = s_dir / "metadata.json"
+        npz_path = s_dir / "data.npz"
+
+        if not meta_path.exists() or not npz_path.exists():
+            raise FileNotFoundError(f"Snapshot directory incomplete at {s_dir}")
+
+        with open(meta_path, "r", encoding="utf-8") as f:
+            metadata = SnapshotMetadata(**json.load(f))
+
+        with open(npz_path, "rb") as f:
+            npz_bytes = f.read()
+
+        if verify_hash:
+            actual_hash = hashlib.sha256(npz_bytes).hexdigest()
+            if actual_hash != metadata.sha256:
+                raise RuntimeError(
+                    f"Snapshot integrity violation! Expected SHA-256 {metadata.sha256}, got {actual_hash}."
+                )
+
+        with np.load(io.BytesIO(npz_bytes)) as data:
+            return np.asarray(data["timestamps"])

@@ -13,6 +13,7 @@ Enforces:
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 from pathlib import Path
@@ -41,8 +42,10 @@ class GPUScheduler:
         heartbeat_timeout: float = 30.0,
         poll_interval: float = 0.5,
         acquire_coordinator_lock: bool = True,
+        snapshots_dir: Path | str | None = None,
     ):
         self.db_path = Path(db_path)
+        self.snapshots_dir = Path(snapshots_dir) if snapshots_dir is not None else None
         self.storage = GPUJobStorage(self.db_path)
         self.heartbeat_timeout = heartbeat_timeout
         self.poll_interval = poll_interval
@@ -182,7 +185,7 @@ class GPUScheduler:
                         payload=resumed_payload,
                         timeout_seconds=running_job.timeout_seconds,
                     )
-                    self.storage.submit_job(resumed_spec)
+                    self.storage.submit_job(resumed_spec, reject_if_stopped=True)
                     logger.info(
                         "Crash Recovery: Automatically requeued resumed job '%s' from durable checkpoint of '%s' (epoch %d, step %d)",
                         resumed_job_id,
@@ -211,6 +214,41 @@ class GPUScheduler:
                 self.active_job_id = running_job.job_id
                 self.active_worker_pid = pid
                 self.active_worker_create_time = ctime
+        # Check active auto run recovery on startup (PLAN 4.2 & P6)
+        for tf in ("1h", "4h"):
+            try:
+                run_state = self.storage.get_auto_tune_run(tf)
+                if run_state is not None:
+                    auto_state = self.storage.get_auto_run_state(tf)
+                    if auto_state in (AutoRunState.SEARCHING, AutoRunState.VALIDATING):
+                        recent = self.storage.list_recent_jobs(job_type=JobType.AUTO_TRIAL.value, timeframe=tf, limit=5)
+                        has_active = any(j.status in (JobStatus.QUEUED.value, JobStatus.RUNNING.value) for j in recent)
+                        if not has_active:
+                            from ..data.snapshot import DatasetSnapshot
+                            snap_path = run_state["snapshot_path"]
+                            snapshot = DatasetSnapshot.load(snap_path)
+                            if snapshot.metadata.sha256 != run_state["snapshot_hash"]:
+                                raise ValueError("Persisted auto snapshot hash mismatch")
+                            resume_job_id = f"auto_step_{tf}_resume_{int(time.time() * 1000)}"
+                            resumed_spec = JobSpec(
+                                job_id=resume_job_id,
+                                job_type=JobType.AUTO_TRIAL.value,
+                                timeframe=tf,
+                                priority=JobPriority.AUTO.value,
+                                payload={"timeframe": tf, "snapshot_path": snap_path},
+                                timeout_seconds=1200.0,
+                            )
+                            self.storage.submit_job(resumed_spec, reject_if_stopped=True)
+                            logger.info(
+                                "Startup Recovery: Auto mode was in %s for %s. Enqueued resumption job '%s'.",
+                                auto_state.value,
+                                tf,
+                                resume_job_id,
+                            )
+            except Exception as exc:
+                self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
+                self.storage.set_state(f"auto_error_{tf}", str(exc))
+                logger.warning("Error in auto tune startup recovery for %s: %s", tf, exc)
 
         return recovered_ids
 
@@ -265,8 +303,17 @@ class GPUScheduler:
 
                 # Check if job failed with CUDA OOM for automatic single retry
                 refreshed_job = self.storage.get_job(self.active_job_id)
-                if refreshed_job and refreshed_job.status == JobStatus.FAILED.value:
-                    self._handle_oom_retry_if_needed(refreshed_job)
+                if refreshed_job and refreshed_job.status in (JobStatus.FAILED.value, JobStatus.INTERRUPTED.value):
+                    retry_id = self._handle_oom_retry_if_needed(refreshed_job)
+                    if retry_id is None and (refreshed_job.job_type == JobType.AUTO_TRIAL.value or refreshed_job.priority == JobPriority.AUTO.value):
+                        tf = refreshed_job.timeframe or "1h"
+                        logger.error(
+                            "AUTO job '%s' ended in status '%s': %s. Transitioning auto run state to PAUSED_ERROR.",
+                            refreshed_job.job_id,
+                            refreshed_job.status,
+                            refreshed_job.error_message,
+                        )
+                        self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
 
                 self.active_worker = None
                 self.active_job_id = None
@@ -303,6 +350,11 @@ class GPUScheduler:
                             self.active_job_id,
                             f"Heartbeat timed out after {self.heartbeat_timeout}s without response (process hung).",
                         )
+                        if job.job_type == JobType.AUTO_TRIAL.value or job.priority == JobPriority.AUTO.value:
+                            tf = job.timeframe or "1h"
+                            logger.error("Heartbeat timed out on AUTO job '%s'. Setting PAUSED_ERROR.", self.active_job_id)
+                            self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
+
                         self.active_worker = None
                         self.active_job_id = None
                         self.active_worker_pid = None
@@ -331,11 +383,19 @@ class GPUScheduler:
                             self.active_job_id,
                             f"Job exceeded max execution timeout of {job.timeout_seconds}s.",
                         )
+                        if job.job_type == JobType.AUTO_TRIAL.value or job.priority == JobPriority.AUTO.value:
+                            tf = job.timeframe or "1h"
+                            logger.error("Execution timeout exceeded on AUTO job '%s'. Setting PAUSED_ERROR.", self.active_job_id)
+                            self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
+
                         self.active_worker = None
                         self.active_job_id = None
                         self.active_worker_pid = None
                         self.active_worker_create_time = None
                         return
+
+        # Check auto wake-up for WAITING_DATA timeframes when >= 7 days of new data arrives
+        self._check_auto_tune_data_wakeup()
 
         # 2. Dispatch next job if no worker is active and scheduler is error-free
         if self.scheduler_error is None and self.active_worker is None and self.active_worker_pid is None:
@@ -450,6 +510,9 @@ class GPUScheduler:
             # Child was cleanly terminated or never spawned
             try:
                 self.storage.mark_failed(job.job_id, f"Failed to spawn worker subprocess: {exc}")
+                if job.job_type == JobType.AUTO_TRIAL.value or job.priority == JobPriority.AUTO.value:
+                    tf = job.timeframe or "1h"
+                    self.storage.set_auto_run_state(tf, AutoRunState.PAUSED_ERROR)
             except Exception:
                 pass
             self.active_worker = None
@@ -457,6 +520,101 @@ class GPUScheduler:
             self.active_worker_pid = None
             self.active_worker_create_time = None
             return False
+
+    def _check_auto_tune_data_wakeup(self) -> None:
+        """Checks if timeframes in WAITING_DATA have accumulated enough new data for a new cycle.
+
+        Per PLAN 3.5/3.6:
+        - First cycle can use standard 90-day test set.
+        - Subsequent cycles must verify on unseen post-lock data starting strictly after
+          the latest consumed verification end time, with >= 20 independent 24-hour blocks
+          (480 candles for 1h, 120 candles for 4h).
+        - 7 days (168 candles 1h / 42 candles 4h) is only the minimum wait before checking;
+          if < 20 blocks are available after the prior exam, the timeframe remains in WAITING_DATA.
+        """
+        snap_dir = self.snapshots_dir or Path("var/paxg_lab/snapshots")
+        if not snap_dir.exists():
+            return
+
+        for tf in ("1h", "4h"):
+            try:
+                auto_state = self.storage.get_auto_run_state(tf)
+                if auto_state != AutoRunState.WAITING_DATA:
+                    continue
+
+                recent = self.storage.list_recent_jobs(job_type=JobType.AUTO_TRIAL.value, timeframe=tf, limit=5)
+                if any(j.status in (JobStatus.QUEUED.value, JobStatus.RUNNING.value) for j in recent):
+                    continue
+
+                candidates = sorted(snap_dir.glob(f"paxgusdt_{tf}_*"))
+                if not candidates:
+                    continue
+                latest_snap = candidates[-1]
+                meta_file = latest_snap / "metadata.json"
+                if not meta_file.exists():
+                    continue
+
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                curr_candles = meta.get("total_candles", 0)
+
+                run_state = self.storage.get_auto_tune_run(tf)
+                last_consumed = run_state.get("last_consumed_candles") if run_state else None
+                last_range = self.storage.get_latest_consumed_locked_range(tf)
+
+                candles_per_24h = 24 if tf == "1h" else 6
+                min_exam_candles = 20 * candles_per_24h  # >= 20 independent 24h blocks (480 for 1h, 120 for 4h)
+                min_wait_candles = 7 * candles_per_24h   # 7-day minimum wait (168 for 1h, 42 for 4h)
+
+                if last_range is not None:
+                    # Subsequent cycle: check candles strictly after last_end_time_ms
+                    _, last_end_ms = last_range
+                    from ..data.snapshot import DatasetSnapshot
+                    from ..data.split import eligible_origins_from_timestamps
+                    import numpy as np
+                    timestamps = DatasetSnapshot.load_timestamps(latest_snap)
+                    start = int(np.searchsorted(timestamps, last_end_ms))
+                    after_count = len(timestamps) - start
+                    if after_count < min_exam_candles:
+                        continue
+                    # Use the maximum searchable context so every proposed config fits.
+                    origins = eligible_origins_from_timestamps(
+                        timestamps=timestamps,
+                        context_len=512, horizon=candles_per_24h,
+                        start_idx=start, end_idx=len(timestamps), timeframe=tf,
+                    )
+                    if len(origins[::candles_per_24h]) < 20:
+                        continue
+
+                    logger.info(
+                        "Auto wake-up: %s has %d unseen post-lock candles (>= required 20 blocks = %d). Requeuing auto tune.",
+                        tf, after_count, min_exam_candles,
+                    )
+                else:
+                    # First cycle without prior consumed range: check 7-day or standard threshold
+                    if last_consumed is not None:
+                        new_candles = curr_candles - last_consumed
+                        if new_candles < min_wait_candles:
+                            continue
+
+                # Trigger new cycle
+                self.storage.reset_auto_tune_run(tf)
+                self.storage.set_auto_run_state(tf, AutoRunState.SEARCHING)
+                auto_job = JobSpec(
+                    job_id=f"auto_step_{tf}_{int(time.time() * 1000)}",
+                    job_type=JobType.AUTO_TRIAL.value,
+                    timeframe=tf,
+                    priority=JobPriority.AUTO.value,
+                    payload={
+                        "timeframe": tf,
+                        "snapshot_path": str(latest_snap),
+                    },
+                    timeout_seconds=1200.0,
+                )
+                self.storage.submit_job(auto_job, reject_if_stopped=True)
+                logger.info("Auto wake-up: enqueued fresh auto-tune job '%s' for %s.", auto_job.job_id, tf)
+            except Exception as exc:
+                logger.warning("Error checking auto wake-up for %s: %s", tf, exc)
 
     def _handle_oom_retry_if_needed(self, job: JobSpec) -> str | None:
         """Handles CUDA OOM failures according to job-type and priority-specific policies.
@@ -545,7 +703,7 @@ class GPUScheduler:
                 payload=retry_payload,
                 timeout_seconds=job.timeout_seconds,
             )
-            self.storage.submit_job(retry_spec)
+            self.storage.submit_job(retry_spec, reject_if_stopped=True)
             logger.info(
                 "CUDA OOM detected on BACKTEST job '%s' (batch=%d->%d). Dispatched OOM retry job '%s'.",
                 job.job_id,
@@ -646,7 +804,7 @@ class GPUScheduler:
             payload=retry_payload,
             timeout_seconds=job.timeout_seconds,
         )
-        self.storage.submit_job(retry_spec)
+        self.storage.submit_job(retry_spec, reject_if_stopped=True)
         logger.info(
             "CUDA OOM detected on job '%s' (batch=%d->%d, accum=%d->%d). Dispatched OOM retry job '%s'.",
             job.job_id,
@@ -691,10 +849,10 @@ class GPUScheduler:
         """
         logger.info("Starting auto run for timeframe: %s", timeframe or "all")
         if timeframe in ("1h", "4h"):
-            self.storage.set_auto_run_state(timeframe, AutoRunState.SEARCHING)
+            self.storage.set_auto_run_state(timeframe, AutoRunState.SEARCHING, allow_unstop=True)
         else:
-            self.storage.set_auto_run_state("1h", AutoRunState.SEARCHING)
-            self.storage.set_auto_run_state("4h", AutoRunState.SEARCHING)
+            self.storage.set_auto_run_state("1h", AutoRunState.SEARCHING, allow_unstop=True)
+            self.storage.set_auto_run_state("4h", AutoRunState.SEARCHING, allow_unstop=True)
 
     def resume_auto_run(self, timeframe: str | None = None) -> None:
         """Alias for start_auto_run."""

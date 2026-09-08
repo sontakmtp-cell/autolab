@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 import sqlite3
 import time
@@ -10,6 +11,8 @@ from typing import Any
 import uuid
 
 from .types import AutoRunState, JobPriority, JobSpec, JobStatus
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path("var/paxg_lab/paxg_lab.db")
 
@@ -73,23 +76,131 @@ class GPUJobStorage:
                     value TEXT NOT NULL,
                     updated_at REAL NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS locked_verification_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timeframe TEXT NOT NULL,
+                    test_start_idx INTEGER NOT NULL,
+                    test_end_idx INTEGER NOT NULL,
+                    test_start_time_ms INTEGER NOT NULL DEFAULT 0,
+                    test_end_time_ms INTEGER NOT NULL DEFAULT 0,
+                    snapshot_hash TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    consumed_at REAL NOT NULL,
+                    verdict TEXT NOT NULL,
+                    details TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS auto_tune_runs (
+                    timeframe TEXT PRIMARY KEY,
+                    snapshot_path TEXT NOT NULL,
+                    snapshot_hash TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    current_trial INTEGER NOT NULL DEFAULT 0,
+                    max_trials INTEGER NOT NULL DEFAULT 30,
+                    best_trial_num INTEGER,
+                    best_score REAL,
+                    best_spec_json TEXT,
+                    best_epoch INTEGER,
+                    multi_seed_results_json TEXT,
+                    final_candidate_id TEXT,
+                    final_candidate_path TEXT,
+                    last_consumed_candles INTEGER,
+                    last_run_completed_at REAL,
+                    current_fold INTEGER NOT NULL DEFAULT 1,
+                    intermediate_fold_results_json TEXT,
+                    top_specs_json TEXT,
+                    multi_seed_config_idx INTEGER NOT NULL DEFAULT 0,
+                    multi_seed_seed_idx INTEGER NOT NULL DEFAULT 0,
+                    multi_seed_fold_idx INTEGER NOT NULL DEFAULT 1,
+                    multi_seed_evaluations_json TEXT,
+                    selected_test_range_json TEXT,
+                    updated_at REAL NOT NULL
+                );
             """)
+
+            # Safe migration for existing locked_verification_ledger tables
+            try:
+                cur = conn.execute("PRAGMA table_info(locked_verification_ledger);")
+                cols = [r["name"] for r in cur.fetchall()]
+                if "test_start_time_ms" not in cols:
+                    conn.execute("ALTER TABLE locked_verification_ledger ADD COLUMN test_start_time_ms INTEGER NOT NULL DEFAULT 0;")
+                if "test_end_time_ms" not in cols:
+                    conn.execute("ALTER TABLE locked_verification_ledger ADD COLUMN test_end_time_ms INTEGER NOT NULL DEFAULT 0;")
+                if "details" not in cols:
+                    conn.execute("ALTER TABLE locked_verification_ledger ADD COLUMN details TEXT NOT NULL DEFAULT '';")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_locked_ledger_tf_time ON locked_verification_ledger (timeframe, test_start_time_ms, test_end_time_ms);"
+                )
+
+                # Safe migration for auto_tune_runs sub-phase columns
+                cur = conn.execute("PRAGMA table_info(auto_tune_runs);")
+                run_cols = [r["name"] for r in cur.fetchall()]
+                for col_name, col_type in [
+                    ("current_fold", "INTEGER NOT NULL DEFAULT 1"),
+                    ("intermediate_fold_results_json", "TEXT"),
+                    ("top_specs_json", "TEXT"),
+                    ("multi_seed_config_idx", "INTEGER NOT NULL DEFAULT 0"),
+                    ("multi_seed_seed_idx", "INTEGER NOT NULL DEFAULT 0"),
+                    ("multi_seed_fold_idx", "INTEGER NOT NULL DEFAULT 1"),
+                    ("multi_seed_evaluations_json", "TEXT"),
+                    ("selected_test_range_json", "TEXT"),
+                ]:
+                    if col_name not in run_cols:
+                        conn.execute(f"ALTER TABLE auto_tune_runs ADD COLUMN {col_name} {col_type};")
+
+                # Backfill legacy rows in locked_verification_ledger with test_start_time_ms == 0
+                cur = conn.execute("SELECT rowid, timeframe, test_start_idx, test_end_idx, snapshot_hash FROM locked_verification_ledger WHERE test_start_time_ms = 0;")
+                zero_rows = cur.fetchall()
+                if zero_rows:
+                    snap_dir = Path("var/paxg_lab/snapshots")
+                    for zrow in zero_rows:
+                        shash = zrow["snapshot_hash"]
+                        s_idx = zrow["test_start_idx"]
+                        e_idx = zrow["test_end_idx"]
+                        tf = zrow["timeframe"]
+                        rid = zrow["rowid"]
+                        if snap_dir.exists() and shash:
+                            for spath in snap_dir.glob(f"*{tf}*"):
+                                mpath = spath / "metadata.json"
+                                tpath = spath / "timestamps.npy"
+                                if mpath.exists() and tpath.exists():
+                                    try:
+                                        with open(mpath, "r", encoding="utf-8") as mf:
+                                            mdata = json.load(mf)
+                                        if mdata.get("sha256") == shash:
+                                            import numpy as np
+                                            ts = np.load(tpath)
+                                            if s_idx < len(ts) and e_idx <= len(ts):
+                                                t_start = int(ts[s_idx])
+                                                step_ms = 3600 * 1000 if tf == "1h" else 4 * 3600 * 1000
+                                                t_end = int(ts[e_idx - 1]) + step_ms
+                                                conn.execute(
+                                                    "UPDATE locked_verification_ledger SET test_start_time_ms = ?, test_end_time_ms = ? WHERE rowid = ?;",
+                                                    (t_start, t_end, rid),
+                                                )
+                                                break
+                                    except Exception:
+                                        pass
+            except Exception:
+                pass
 
     def submit_job(self, job_spec: JobSpec, reject_if_stopped: bool = False) -> str:
         """Submits a job to the queue, enforcing atomic idempotency deduplication on active jobs."""
-        if reject_if_stopped and job_spec.priority == JobPriority.AUTO.value:
-            tf = job_spec.timeframe or "1h"
-            if self.get_auto_run_state(tf) == AutoRunState.STOPPED:
-                raise ValueError(
-                    f"Cannot submit AUTO job for timeframe '{tf}': auto-run is currently STOPPED."
-                )
-
         now = time.time()
         payload_json = json.dumps(job_spec.payload, default=str)
         result_json = json.dumps(job_spec.result, default=str) if job_spec.result is not None else None
 
         with self.get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE;")
+
+            if reject_if_stopped and job_spec.priority == JobPriority.AUTO.value:
+                row = conn.execute(
+                    "SELECT value FROM scheduler_state WHERE key = ?",
+                    (f"auto_run_state_{job_spec.timeframe or '1h'}",),
+                ).fetchone()
+                if row and row["value"] == AutoRunState.STOPPED.value:
+                    raise ValueError("Cannot submit AUTO job: auto-run is currently STOPPED.")
 
             # Check idempotency: if job with same key is QUEUED or RUNNING, return existing job_id
             if job_spec.idempotency_key:
@@ -207,6 +318,16 @@ class GPUJobStorage:
             cur = conn.execute(" ".join(query), params)
             rows = cur.fetchall()
             return [JobSpec.from_row(dict(r)) for r in rows]
+
+    def list_recent_jobs(
+        self,
+        status: str | None = None,
+        job_type: str | None = None,
+        timeframe: str | None = None,
+        limit: int = 50,
+    ) -> list[JobSpec]:
+        """Convenience alias for list_jobs."""
+        return self.list_jobs(status=status, job_type=job_type, timeframe=timeframe, limit=limit)
 
     def acquire_next_job(self, last_auto_timeframe: str | None = None) -> JobSpec | None:
         """Atomically selects and marks the next eligible job as RUNNING.
@@ -326,6 +447,10 @@ class GPUJobStorage:
             updated_row = cur.fetchone()
             return JobSpec.from_row(dict(updated_row))
 
+    def get_next_queued_job(self, last_auto_timeframe: str | None = None) -> JobSpec | None:
+        """Acquires the next eligible job from the queue."""
+        return self.acquire_next_job(last_auto_timeframe=last_auto_timeframe)
+
     def register_worker(self, job_id: str, pid: int, create_time: float) -> None:
         """Registers the subprocess PID and process creation timestamp to avoid PID recycling."""
         now = time.time()
@@ -419,6 +544,15 @@ class GPUJobStorage:
                 (JobStatus.SUCCEEDED.value, result_json, now, progress_message, job_id),
             )
 
+    def mark_finished(
+        self,
+        job_id: str,
+        result: dict[str, Any] | None = None,
+        progress_message: str = "Completed successfully",
+    ) -> None:
+        """Alias for mark_succeeded."""
+        self.mark_succeeded(job_id=job_id, result=result or {}, progress_message=progress_message)
+
     def mark_failed(self, job_id: str, error_message: str) -> None:
         """Marks a job as FAILED with error traceback or reason."""
         now = time.time()
@@ -504,10 +638,32 @@ class GPUJobStorage:
         val = self.get_state(key, AutoRunState.SEARCHING.value)
         return AutoRunState(val)
 
-    def set_auto_run_state(self, timeframe: str, state: AutoRunState) -> None:
-        """Sets current AutoRunState for timeframe."""
+    def set_auto_run_state(self, timeframe: str, state: AutoRunState, allow_unstop: bool = False) -> None:
+        """Sets current AutoRunState for timeframe, protecting STOPPED as a sticky user-owned state."""
         key = f"auto_run_state_{timeframe}"
-        self.set_state(key, state.value)
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            cur = conn.execute("SELECT value FROM scheduler_state WHERE key = ?;", (key,))
+            row = cur.fetchone()
+            curr_val = row["value"] if row else AutoRunState.SEARCHING.value
+            if curr_val == AutoRunState.STOPPED.value and state != AutoRunState.STOPPED and not allow_unstop:
+                logger.info(
+                    "Ignoring state change to %s for %s: auto-run is currently STOPPED by user.",
+                    state.value, timeframe,
+                )
+                conn.commit()
+                return
+
+            now = time.time()
+            conn.execute(
+                """
+                INSERT INTO scheduler_state (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;
+                """,
+                (key, state.value, now),
+            )
+            conn.commit()
 
     def try_acquire_coordinator_lease(
         self,
@@ -644,4 +800,222 @@ class GPUJobStorage:
                 except Exception:
                     return None
             return None
+
+    def get_latest_consumed_locked_range(self, timeframe: str) -> tuple[int, int] | None:
+        """Returns (test_start_time_ms, test_end_time_ms) of the latest consumed locked verification range."""
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT test_start_time_ms, test_end_time_ms
+                FROM locked_verification_ledger
+                WHERE timeframe = ? AND test_end_time_ms > 0
+                ORDER BY test_end_time_ms DESC
+                LIMIT 1;
+                """,
+                (timeframe,),
+            )
+            row = cur.fetchone()
+            if row:
+                return (int(row["test_start_time_ms"]), int(row["test_end_time_ms"]))
+            return None
+
+    def is_locked_range_consumed(
+        self,
+        timeframe: str,
+        test_start_time_ms: int = 0,
+        test_end_time_ms: int = 0,
+        snapshot_hash: str | None = None,
+        test_start_idx: int | None = None,
+        test_end_idx: int | None = None,
+    ) -> bool:
+        """Checks if a candidate's locked verification interval [test_start_time_ms, test_end_time_ms)
+        overlaps with ANY previously consumed interval for the given timeframe, or matches legacy unmigrated rows.
+        """
+        with self.get_connection() as conn:
+            if test_start_time_ms > 0 and test_end_time_ms > 0:
+                cur = conn.execute(
+                    """
+                    SELECT 1 FROM locked_verification_ledger
+                    WHERE timeframe = ?
+                      AND test_start_time_ms > 0
+                      AND test_start_time_ms < ?
+                      AND test_end_time_ms > ?;
+                    """,
+                    (timeframe, test_end_time_ms, test_start_time_ms),
+                )
+                if cur.fetchone() is not None:
+                    return True
+
+            # Fallback check on snapshot_hash + index interval overlap if timestamps were 0 or not provided
+            if snapshot_hash and test_start_idx is not None and test_end_idx is not None:
+                cur = conn.execute(
+                    """
+                    SELECT 1 FROM locked_verification_ledger
+                    WHERE timeframe = ?
+                      AND snapshot_hash = ?
+                      AND test_start_idx < ?
+                      AND test_end_idx > ?;
+                    """,
+                    (timeframe, snapshot_hash, test_end_idx, test_start_idx),
+                )
+                if cur.fetchone() is not None:
+                    return True
+
+            return False
+
+    def record_locked_consumption(
+        self,
+        timeframe: str,
+        test_start_idx: int,
+        test_end_idx: int,
+        snapshot_hash: str,
+        candidate_id: str,
+        test_start_time_ms: int = 0,
+        test_end_time_ms: int = 0,
+        verdict: str = "IN_PROGRESS",
+        details: str = "",
+    ) -> None:
+        """Atomically records consumption of a locked verification test range into the audit ledger."""
+        now = time.time()
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(
+                """
+                INSERT INTO locked_verification_ledger (
+                    timeframe, test_start_idx, test_end_idx, test_start_time_ms, test_end_time_ms,
+                    snapshot_hash, candidate_id, consumed_at, verdict, details
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    timeframe,
+                    test_start_idx,
+                    test_end_idx,
+                    test_start_time_ms,
+                    test_end_time_ms,
+                    snapshot_hash,
+                    candidate_id,
+                    now,
+                    verdict,
+                    details,
+                ),
+            )
+            conn.commit()
+
+    def update_locked_consumption_verdict(
+        self,
+        timeframe: str,
+        candidate_id: str,
+        verdict: str,
+        details: str = "",
+    ) -> None:
+        """Updates the audit verdict and details for an evaluated candidate in locked_verification_ledger."""
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(
+                """
+                UPDATE locked_verification_ledger
+                SET verdict = ?, details = ?
+                WHERE timeframe = ? AND candidate_id = ?;
+                """,
+                (verdict, details, timeframe, candidate_id),
+            )
+            conn.commit()
+
+    def get_auto_tune_run(self, timeframe: str) -> dict[str, Any] | None:
+        """Retrieves persistent state of an ongoing autonomous tuning run for timeframe."""
+        with self.get_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM auto_tune_runs WHERE timeframe = ?;
+                """,
+                (timeframe,),
+            )
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+            return None
+
+    def save_auto_tune_run(
+        self,
+        timeframe: str,
+        snapshot_path: str,
+        snapshot_hash: str,
+        phase: str,
+        current_trial: int = 0,
+        max_trials: int = 30,
+        best_trial_num: int | None = None,
+        best_score: float | None = None,
+        best_spec_json: str | None = None,
+        best_epoch: int | None = None,
+        multi_seed_results_json: str | None = None,
+        final_candidate_id: str | None = None,
+        final_candidate_path: str | None = None,
+        last_consumed_candles: int | None = None,
+        last_run_completed_at: float | None = None,
+        current_fold: int = 1,
+        intermediate_fold_results_json: str | None = None,
+        top_specs_json: str | None = None,
+        multi_seed_config_idx: int = 0,
+        multi_seed_seed_idx: int = 0,
+        multi_seed_fold_idx: int = 1,
+        multi_seed_evaluations_json: str | None = None,
+        selected_test_range_json: str | None = None,
+    ) -> None:
+        """Upserts persistent state of an autonomous tuning run."""
+        now = time.time()
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(
+                """
+                INSERT INTO auto_tune_runs (
+                    timeframe, snapshot_path, snapshot_hash, phase, current_trial, max_trials,
+                    best_trial_num, best_score, best_spec_json, best_epoch, multi_seed_results_json,
+                    final_candidate_id, final_candidate_path, last_consumed_candles, last_run_completed_at,
+                    current_fold, intermediate_fold_results_json, top_specs_json,
+                    multi_seed_config_idx, multi_seed_seed_idx, multi_seed_fold_idx,
+                    multi_seed_evaluations_json, selected_test_range_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(timeframe) DO UPDATE SET
+                    snapshot_path = excluded.snapshot_path,
+                    snapshot_hash = excluded.snapshot_hash,
+                    phase = excluded.phase,
+                    current_trial = excluded.current_trial,
+                    max_trials = excluded.max_trials,
+                    best_trial_num = COALESCE(excluded.best_trial_num, auto_tune_runs.best_trial_num),
+                    best_score = COALESCE(excluded.best_score, auto_tune_runs.best_score),
+                    best_spec_json = COALESCE(excluded.best_spec_json, auto_tune_runs.best_spec_json),
+                    best_epoch = COALESCE(excluded.best_epoch, auto_tune_runs.best_epoch),
+                    multi_seed_results_json = COALESCE(excluded.multi_seed_results_json, auto_tune_runs.multi_seed_results_json),
+                    final_candidate_id = COALESCE(excluded.final_candidate_id, auto_tune_runs.final_candidate_id),
+                    final_candidate_path = COALESCE(excluded.final_candidate_path, auto_tune_runs.final_candidate_path),
+                    last_consumed_candles = COALESCE(excluded.last_consumed_candles, auto_tune_runs.last_consumed_candles),
+                    last_run_completed_at = COALESCE(excluded.last_run_completed_at, auto_tune_runs.last_run_completed_at),
+                    current_fold = excluded.current_fold,
+                    intermediate_fold_results_json = excluded.intermediate_fold_results_json,
+                    top_specs_json = COALESCE(excluded.top_specs_json, auto_tune_runs.top_specs_json),
+                    multi_seed_config_idx = excluded.multi_seed_config_idx,
+                    multi_seed_seed_idx = excluded.multi_seed_seed_idx,
+                    multi_seed_fold_idx = excluded.multi_seed_fold_idx,
+                    multi_seed_evaluations_json = COALESCE(excluded.multi_seed_evaluations_json, auto_tune_runs.multi_seed_evaluations_json),
+                    selected_test_range_json = COALESCE(excluded.selected_test_range_json, auto_tune_runs.selected_test_range_json),
+                    updated_at = excluded.updated_at;
+                """,
+                (
+                    timeframe, snapshot_path, snapshot_hash, phase, current_trial, max_trials,
+                    best_trial_num, best_score, best_spec_json, best_epoch, multi_seed_results_json,
+                    final_candidate_id, final_candidate_path, last_consumed_candles, last_run_completed_at,
+                    current_fold, intermediate_fold_results_json, top_specs_json,
+                    multi_seed_config_idx, multi_seed_seed_idx, multi_seed_fold_idx,
+                    multi_seed_evaluations_json, selected_test_range_json, now,
+                ),
+            )
+            conn.commit()
+
+    def reset_auto_tune_run(self, timeframe: str) -> None:
+        """Resets the auto tune run state for a fresh tuning cycle."""
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute("DELETE FROM auto_tune_runs WHERE timeframe = ?;", (timeframe,))
+            conn.commit()
+
 

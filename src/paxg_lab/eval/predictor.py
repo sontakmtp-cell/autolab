@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -75,7 +75,7 @@ class TimesFM3Predictor:
             self.unload_adapter()
 
         logger.info("Loading verified adapter with manifest from %s...", p)
-        store = AdapterStore(base_dir=p.parent)
+        store = AdapterStore(base_dir=p.parent, db_path=None)
         self.lora_model, self.manifest = store.load_adapter(
             adapter_id_or_path=p,
             base_model=self.base_model,
@@ -173,6 +173,29 @@ class TimesFM3Predictor:
         point_predictions = sorted_quantiles[:, :, MEDIAN_QUANTILE_INDEX]
 
         return point_predictions, sorted_quantiles
+
+    def predict(
+        self,
+        contexts: np.ndarray,
+        horizon: int,
+        batch_size: int = 16,
+        is_cancelled_func: Callable[[], bool] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Runs batched inference over multiple contexts to avoid OOM."""
+        if len(contexts) == 0:
+            return np.empty((0, horizon), dtype=np.float32), np.empty((0, horizon, 9), dtype=np.float32)
+
+        point_preds = []
+        quantiles = []
+        for i in range(0, len(contexts), batch_size):
+            if is_cancelled_func is not None and is_cancelled_func():
+                raise InterruptedError("Inference batch loop cancelled by user request.")
+            batch = contexts[i : i + batch_size]
+            p, q = self.predict_batch(batch, horizon=horizon)
+            point_preds.append(p)
+            quantiles.append(q)
+
+        return np.concatenate(point_preds, axis=0), np.concatenate(quantiles, axis=0)
 
     def forecast_request(
         self,

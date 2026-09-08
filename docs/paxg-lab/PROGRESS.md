@@ -14,12 +14,12 @@ Tài liệu này theo dõi tiến độ thực hiện 8 giai đoạn (P0 đến 
 | **P3** | Huấn luyện thủ công LoRA, checkpoint tốt nhất và kho adapter | **HOÀN THÀNH** | [docs/paxg-lab/phases/P3.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P3.md) |
 | **P4** | Hàng đợi GPU một tiến trình, dừng, heartbeat, phục hồi | **HOÀN THÀNH** | [docs/paxg-lab/phases/P4.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P4.md) |
 | **P5** | Giao diện Streamlit tiếng Việt đủ 5 thẻ, biểu đồ và điều khiển | **HOÀN THÀNH** | [docs/paxg-lab/phases/P5.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P5.md) |
-| **P6** | Tự động tối ưu Optuna TPE, kiểm chứng kín, công nhận LoRA thắng | Chưa bắt đầu | [docs/paxg-lab/phases/P6.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P6.md) |
+| **P6** | Tự động tối ưu Optuna TPE, kiểm chứng kín, công nhận LoRA thắng | **HOÀN THÀNH** | [docs/paxg-lab/phases/P6.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P6.md) |
 | **P7** | Chạy dài (>6h), kiểm tra rò rỉ, xử lý sự cố, bàn giao hoàn chỉnh | Chưa bắt đầu | [docs/paxg-lab/phases/P7.md](file:///d:/AI/timesfm_b/docs/paxg-lab/phases/P7.md) |
 
 ---
 
-## 2. Quyết định kỹ thuật đã chốt tại P0, P1, P2 và P3
+## 2. Quyết định kỹ thuật đã chốt tại P0, P1, P2, P3, P4, P5 và P6
 
 ### Tại P0:
 1. **Quy ước Horizon bắt buộc:**
@@ -176,12 +176,63 @@ Tài liệu này theo dõi tiến độ thực hiện 8 giai đoạn (P0 đến 
    - Bộ 9 bài kiểm thử `tests/paxg_lab/test_p5_web.py` đạt **9/9 passed (100%)**.
    - Toàn bộ 102 bài kiểm thử hệ thống `tests/paxg_lab/` đạt **102/102 passed (100%)**.
 
+### Tại P6:
+1. **Không gian Tìm kiếm Siêu tham số & Bất biến PLAN 3.6 (`src/paxg_lab/tune/space.py`):**
+   - Không gian tìm kiếm Optuna TPE: `context_len` $\in [128, 256, 512]$, `lora_r` $\in [4, 8, 16]$, `lora_alpha = 2 * r` (bắt buộc), `learning_rate` $\in [1e-5, 2e-4]$ (log scale), `lora_dropout` $\in [0.0, 0.20]$, `weight_decay` $\in [0.0, 0.05]$, `history_days` $\in [180, 365, \text{"all"}]$, `feature_set` $\in [\text{"B"}, \text{"C"}]$, `modules` $\in [\text{"setB"}, \text{"all"}]$.
+   - Quy ước Horizon bắt buộc theo khung: 1h $\rightarrow$ 24 nến; 4h $\rightarrow$ 6 nến.
+   - Batch size hiệu dụng cố định = 16 (`batch_size=2`, `gradient_accumulation_steps=8`).
+   - Hàm kiểm tra bất biến `validate_train_spec_invariants(spec)` từ chối ngay lập tức bất kỳ cấu hình vi phạm.
+2. **Cơ sở dữ liệu Optuna Riêng biệt & Quy ước Tên Study (`src/paxg_lab/tune/optimizer.py`):**
+   - Lưu trữ riêng tại SQLite `var/paxg_lab/optuna_studies.db` (tách biệt hoàn toàn với `paxg_lab.db` của queue/data).
+   - Tên study gắn chặt theo timeframe và mã băm snapshot: `study_{timeframe}_{snapshot_hash[:8]}`.
+   - Sử dụng `TPESampler(seed=42)` với `n_startup_trials=10`.
+   - Giới hạn tối đa 30 trials mỗi đợt (`max_trials=30`).
+   - Dừng sớm khi đình trệ (`EarlyStoppingStagnationCallback`): Tự động dừng đợt tìm kiếm nếu sau 12 trials liên tiếp không cải thiện Score v1 tối thiểu 0.5 điểm.
+3. **Đánh giá Đa Hạt giống Lấy Trung vị (Multi-Seed Median):**
+   - Đánh giá top cấu hình qua 3 hạt giống ngẫu nhiên `seeds = [42, 123, 2026]`.
+   - Tính toán trung vị Score v1 và trung vị số epoch tối ưu qua 3 hạt giống, loại bỏ nhiễu ngẫu nhiên từ quá trình khởi tạo trọng số LoRA.
+4. **Huấn luyện Lại Từ Base Model Sạch (Retrain from Base):**
+   - Ứng viên chiến thắng được huấn luyện lại hoàn toàn từ mô hình Base TimesFM 3.0 với epoch tối ưu đã tìm được.
+   - Tuyệt đối không warm-start hay tái sử dụng adapter từ các trials thăm dò.
+5. **Bảo vệ Tuyệt đối Tập Kiểm chứng Kín (Zero Leakage):**
+   - Tập kiểm chứng khóa kín 90 ngày cuối `[test_start, test_end)` tuyệt đối không bao giờ được chạm tới trong toàn bộ quá trình tìm kiếm siêu tham số, huấn luyện hay dừng sớm.
+   - Chỉ được mở ra duy nhất một lần (`run_locked_verification`) trên ứng viên được khóa sau khi vượt qua vòng multi-seed median.
+6. **Phân vùng Khối Độc lập 24 Giờ & Block Bootstrap 1000 Mẫu (`src/paxg_lab/tune/bootstrap.py`):**
+   - Chia tập kiểm chứng kín thành các khối độc lập không chồng lấn dài 24 giờ:
+     - 1h: mỗi khối 24 nến.
+     - 4h: mỗi khối 6 nến.
+   - Kiểm tra ngưỡng an toàn thống kê: Bắt buộc tối thiểu 20 khối độc lập dài 24 giờ.
+   - Thực hiện 1,000 lần tái chọn mẫu khối ngẫu nhiên có hoàn lại (Block Bootstrap Resampling) để tính khoảng tin cậy 95% (CI 95%) của chênh lệch MAE so với Base: $\Delta_{\text{MAE}} = \text{MAE}_{\text{base}} - \text{MAE}_{\text{cand}}$.
+7. **Người Gác cổng Công nhận LoRA Thắng với 7 Tiêu chí Nghiêm ngặt (`src/paxg_lab/tune/gatekeeper.py`):**
+   - Tiêu chí 1: Score v1 $\ge$ điểm hiện tại + 2.0.
+   - Tiêu chí 2: MAE tổng thể $\le 0.99 \times \text{MAE}_{\text{base}}$ và $\le 0.99 \times \text{MAE}_{\text{naive}}$.
+   - Tiêu chí 3: Fold tệ nhất $\le 1.05 \times \text{MAE}_{\text{base}}$.
+   - Tiêu chí 4: Độ bao phủ dải bất định 80% $[q_{10}, q_{90}] \in [0.65, 0.95]$.
+   - Tiêu chí 5: Đủ tối thiểu 20 khối kiểm chứng độc lập dài 24 giờ.
+   - Tiêu chí 6: Cận dưới khoảng tin cậy 95% Bootstrap $> 0$ ($\Delta_{\text{MAE}} > 0$ có ý nghĩa thống kê).
+   - Tiêu chí 7: Adapter nạp thử thành công và bản sao lưu zip nguyên vẹn.
+   - Nếu bất kỳ tiêu chí nào thất bại: Từ chối thay thế, giữ nguyên bản adapter khuyến nghị hiện tại, ghi audit log chi tiết và tự động chuyển trạng thái sang `WAITING_DATA`.
+8. **Quy trình Tối ưu Tự động Hoàn chỉnh (`src/paxg_lab/tune/protocol.py`):**
+   - Điều phối tuần tự: `SEARCHING` $\rightarrow$ `VALIDATING` $\rightarrow$ `WAITING_DATA` (nếu từ chối) hoặc `WAITING_AUDIT` (nếu vượt qua kiểm chứng thành công).
+   - Hỗ trợ dừng an toàn (`is_cancelled_func`) tại ranh giới từng trial và từng fold.
+9. **Tích hợp Giao diện Web Thẻ 4 (`tab_auto_tune.py`):**
+   - Hiển thị trực quan dữ liệu trials thật từ `var/paxg_lab/optuna_studies.db`.
+   - Hiển thị bảng tổng hợp trials, biểu đồ tiến trình tối ưu hóa và nhật ký kiểm toán (Audit Trail) từ `var/paxg_lab/audit_reports/`.
+10. **Kiểm chứng lại sau review PR #6 (07/09/2026):**
+    - Đã sửa Base/candidate dùng sai split ở vòng sau, race STOPPED, phục hồi sai snapshot, preflight gap trước khi tiêu thụ kiểm chứng và nhánh đọc JSON locked range.
+    - Chạy thật phát hiện và sửa thêm hoàn thành Optuna trial sai kiểu đối tượng, cùng lỗi sampler lặp đề xuất giữa các job.
+    - Mã nguồn `8da4c83`: **239/239 test PAXG Lab + TimesFM3 qua**, CI GitHub xanh.
+    - GPU RTX 5060 Ti chạy trọn protocol: 2 cấu hình khác nhau, 3 seed × 3 fold mỗi cấu hình, final fit, 90 khối locked verification. Score -1,929513; bootstrap CI [-1,442044; 0,366126]; từ chối ứng viên đúng và về WAITING_DATA.
+    - Đây là replay lịch sử trong kho riêng với ngân sách học giảm, không cập nhật winner của ứng dụng. Không chứng minh cải thiện dự báo hoặc vận hành dài ngày.
+    - Review 5131070465: preflight chỉ dùng timestamp; ledger ghi trước đọc nhãn; trạng thái xác nhận và ZIP nhất quán; registry đúng database riêng; kết quả cuối đủ ba seed. Lượt GPU mới xác nhận ứng viên bị từ chối vẫn chưa được xác nhận và database chính không đổi.
+    - Bằng chứng cũ đã được thay thế; xem `phases/P6.md` và `phases/p6_evidence/p6_real_run_evidence.json`, kèm audit và ledger. P7 chưa thực hiện; PR chưa merge.
+
 ---
 
-## 3. Lệnh tiếp tục cho giai đoạn tiếp theo (P6)
+## 3. Lệnh tiếp tục cho giai đoạn tiếp theo (P7)
 
-Sau khi nghiệm thu P5, chuyển sang P6 bằng lệnh:
+Sau khi nghiệm thu P6, chuyển sang P7 bằng lệnh:
 
 ```text
-/goal Đọc bộ tài liệu docs/paxg-lab và thực hiện P6: tự tối ưu bằng Optuna TPE, backtest nhiều đoạn, kiểm chứng kín, công nhận LoRA thắng và chờ dữ liệu mới. Dùng horizon theo khung và tối thiểu 20 khối độc lập dài 24 giờ. Kiểm thử rò rỉ, phục hồi và chạy một đợt thật có giới hạn; chỉ hoàn thành P6.
+/goal Đọc bộ tài liệu docs/paxg-lab và thực hiện P7: kiểm tra chạy dài, rò rỉ bộ nhớ, lỗi mạng, dừng/phục hồi, bảo toàn LoRA thắng và khôi phục bản sao. Chạy soak test tối thiểu 6 giờ, sửa lỗi trong phạm vi, hoàn thiện hướng dẫn và báo cáo nghiệm thu cuối.
 ```
