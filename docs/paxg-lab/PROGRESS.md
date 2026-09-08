@@ -221,9 +221,10 @@ Tài liệu này theo dõi tiến độ thực hiện 8 giai đoạn (P0 đến 
 10. **Kiểm chứng lại sau review PR #6 (07/09/2026):**
     - Đã sửa Base/candidate dùng sai split ở vòng sau, race STOPPED, phục hồi sai snapshot, preflight gap trước khi tiêu thụ kiểm chứng và nhánh đọc JSON locked range.
     - Chạy thật phát hiện và sửa thêm hoàn thành Optuna trial sai kiểu đối tượng, cùng lỗi sampler lặp đề xuất giữa các job.
-    - Mã nguồn `d802a42`: **223/223 test PAXG Lab + TimesFM3 qua**, CI GitHub xanh.
+    - Mã nguồn `8da4c83`: **239/239 test PAXG Lab + TimesFM3 qua**, CI GitHub xanh.
     - GPU RTX 5060 Ti chạy trọn protocol: 2 cấu hình khác nhau, 3 seed × 3 fold mỗi cấu hình, final fit, 90 khối locked verification. Score -1,929513; bootstrap CI [-1,442044; 0,366126]; từ chối ứng viên đúng và về WAITING_DATA.
     - Đây là replay lịch sử trong kho riêng với ngân sách học giảm, không cập nhật winner của ứng dụng. Không chứng minh cải thiện dự báo hoặc vận hành dài ngày.
+    - Review 5131070465: preflight chỉ dùng timestamp; ledger ghi trước đọc nhãn; trạng thái xác nhận và ZIP nhất quán; registry đúng database riêng; kết quả cuối đủ ba seed. Lượt GPU mới xác nhận ứng viên bị từ chối vẫn chưa được xác nhận và database chính không đổi.
     - Bằng chứng cũ đã được thay thế; xem `phases/P6.md` và `phases/p6_evidence/p6_real_run_evidence.json`, kèm audit và ledger. P7 chưa thực hiện; PR chưa merge.
 
 ---

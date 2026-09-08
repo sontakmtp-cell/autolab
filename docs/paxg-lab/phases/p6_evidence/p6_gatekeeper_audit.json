@@ -1,5 +1,5 @@
 {
-  "candidate_id": "paxg_1h_r16_1788776855",
+  "candidate_id": "paxg_1h_r16_1788787228",
   "timeframe": "1h",
   "current_recommended_id": null,
   "accepted": false,
@@ -17,7 +17,7 @@
     "score_diff": -1.9295131455012937,
     "candidate_mae": 22.23624210357666,
     "base_mae": 21.939999643961585,
-    "naive_test_mae": null,
+    "naive_test_mae": 19.71393638543007,
     "mae_vs_base_ratio": 1.0135023912681151,
     "mae_vs_naive_ratio": 1.127945310811226,
     "worst_segment_mae_ratio": 1.0669983329616206,
@@ -54,6 +54,6 @@
     "num_resamples": 1000
   },
   "backup_zip_path": null,
-  "audit_report_path": "D:\\AI\\timesfm_b\\var\\paxg_lab\\p6_review_1788776346390792900\\audit_reports\\audit_1h_paxg_1h_r16_1788776855_1788776899.json",
-  "evaluated_at": 1788776899.6914148
+  "audit_report_path": "D:\\AI\\timesfm_b\\var\\paxg_lab\\p6_review_1788786721678758300\\audit_reports\\audit_1h_paxg_1h_r16_1788787228_1788787272.json",
+  "evaluated_at": 1788787272.4968712
 }
